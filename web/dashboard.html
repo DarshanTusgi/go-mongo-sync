@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud Sync Monitoring Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- Header -->
+        <header class="dashboard-header">
+            <h1>Cloud Sync Monitoring Dashboard</h1>
+            <div class="header-controls">
+                <button id="refreshBtn" class="btn btn-secondary">Manual Refresh</button>
+                <div class="auto-refresh-indicator">
+                    <span class="refresh-dot"></span>
+                    <span>Auto-refresh: 5s</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- High-Level Status Section -->
+        <section class="status-banner">
+            <h2>Pipeline Status</h2>
+            <div class="status-grid">
+                <div class="status-card" id="sourceMongo">
+                    <div class="status-icon"></div>
+                    <div class="status-info">
+                        <h3>Source Mongo</h3>
+                        <span class="status-text">Checking...</span>
+                    </div>
+                </div>
+                <div class="status-card" id="cloudSync">
+                    <div class="status-icon"></div>
+                    <div class="status-info">
+                        <h3>Cloud Sync</h3>
+                        <span class="status-text">Checking...</span>
+                    </div>
+                </div>
+                <div class="status-card" id="vmSync">
+                    <div class="status-icon"></div>
+                    <div class="status-info">
+                        <h3>VM Sync</h3>
+                        <span class="status-text">Checking...</span>
+                        <div class="vm-sync-details" id="vmSyncDetails" style="margin-top: 8px; font-size: 0.85em; color: #666;">
+                            <div id="vmSyncAddress"></div>
+                            <div id="vmSyncClients"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="status-card" id="targetMongo">
+                    <div class="status-icon"></div>
+                    <div class="status-info">
+                        <h3>Target Mongo</h3>
+                        <span class="status-text">Checking...</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Main Dashboard Grid -->
+        <div class="dashboard-grid">
+            <!-- Left Column: Statistics and Charts -->
+            <div class="left-column">
+                <!-- Statistics Panel -->
+                <section class="stats-panel">
+                    <h2>Key Metrics</h2>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon">📊</div>
+                            <div class="stat-content">
+                                <h3>Total Documents Synced</h3>
+                                <div class="stat-value" id="totalDocs">-</div>
+                                <div class="stat-subtitle">Today: <span id="todayDocs">-</span></div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">⚡</div>
+                            <div class="stat-content">
+                                <h3>Current Sync Rate</h3>
+                                <div class="stat-value" id="syncRate">-</div>
+                                <div class="stat-subtitle">docs/sec</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">📋</div>
+                            <div class="stat-content">
+                                <h3>Backlog Size</h3>
+                                <div class="stat-value" id="backlogSize">-</div>
+                                <div class="stat-subtitle">unsynced docs</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">⏱️</div>
+                            <div class="stat-content">
+                                <h3>Average Latency</h3>
+                                <div class="stat-value" id="avgLatency">-</div>
+                                <div class="stat-subtitle">ms</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">👁️</div>
+                            <div class="stat-content">
+                                <h3>Active Watchers</h3>
+                                <div class="stat-value" id="activeWatchers">-</div>
+                                <div class="stat-subtitle">change streams</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon">🔄</div>
+                            <div class="stat-content">
+                                <h3>Last Resume Token</h3>
+                                <div class="stat-value" id="lastResumeToken">-</div>
+                                <div class="stat-subtitle">timestamp</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+
+            </div>
+
+            <!-- Right Column: Logs and Controls -->
+            <div class="right-column">
+                <!-- Config & Control Section -->
+                <section class="control-panel">
+                    <h2>Sync Configuration & Controls</h2>
+                    <div class="config-info">
+                        <div class="config-section">
+                            <h4>🔄 Sync Configuration</h4>
+                            <div class="config-item">
+                                <label>Sync Mode:</label>
+                                <span id="syncMode" class="config-value">-</span>
+                            </div>
+                            <div class="config-item">
+                                <label>Databases Monitored:</label>
+                                <span class="config-value">sync-test-db, test_db</span>
+                            </div>
+                            <div class="config-item">
+                                <label>Collections Tracked:</label>
+                                <span class="config-value">products, users, orders, items, categories, failure_test</span>
+                            </div>
+                        </div>
+                        
+                        <div class="config-section">
+                            <h4>🔐 Security & Features</h4>
+                            <div class="config-item">
+                                <label>Encryption:</label>
+                                <span class="config-value">✅ AES-256-GCM Enabled</span>
+                            </div>
+                            <div class="config-item">
+                                <label>Transfer Tracking:</label>
+                                <span class="config-value">✅ Enabled (Duplicate Prevention)</span>
+                            </div>
+                            <div class="config-item">
+                                <label>Sequence Ordering:</label>
+                                <span class="config-value">✅ Enabled (Node: cloud-sync-node-001)</span>
+                            </div>
+                        </div>
+                        
+                        <div class="config-section">
+                            <h4>📊 Runtime Status</h4>
+                            <div class="config-item">
+                                <label>Last Checkpoint:</label>
+                                <span id="lastCheckpoint" class="config-value">-</span>
+                            </div>
+                            <div class="config-item">
+                                <label>Connected Clients:</label>
+                                <span id="connectedClients" class="config-value">-</span>
+                            </div>
+                            <div class="config-item">
+                                <label>Server Port:</label>
+                                <span class="config-value">8080 (HTTP + WebSocket)</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="control-buttons">
+                        <button id="restartBtn" class="btn btn-warning">Restart Sync</button>
+                        <button id="pauseBtn" class="btn btn-secondary">Pause</button>
+                        <button id="resumeBtn" class="btn btn-primary">Force Resume</button>
+                    </div>
+                </section>
+
+                <!-- Detailed Logs Table -->
+                <section class="logs-section">
+                    <div class="logs-header">
+                        <h2>Detailed Logs</h2>
+                        <div class="logs-controls">
+                            <input type="text" id="logSearch" placeholder="Search logs..." class="search-input">
+                            <select id="stageFilter" class="filter-select">
+                                <option value="">All Stages</option>
+                                <option value="cloud">Cloud Sync</option>
+                                <option value="vm">VM Sync</option>
+                                <option value="target">Target</option>
+                            </select>
+                            <select id="statusFilter" class="filter-select">
+                                <option value="">All Status</option>
+                                <option value="success">Success</option>
+                                <option value="error">Error</option>
+                                <option value="warning">Warning</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="logs-table-container">
+                        <table class="logs-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Stage</th>
+                                    <th>Action</th>
+                                    <th>Status</th>
+                                    <th>Message</th>
+                                </tr>
+                            </thead>
+                            <tbody id="logsTableBody">
+                                <tr>
+                                    <td colspan="5" class="no-data">Loading logs...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="logs-pagination">
+                        <button id="prevPage" class="btn btn-secondary" disabled>Previous</button>
+                        <span id="pageInfo">Page 1 of 1</span>
+                        <button id="nextPage" class="btn btn-secondary" disabled>Next</button>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Loading dashboard...</div>
+    </div>
+
+    <!-- Error Modal -->
+    <div id="errorModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Error</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="errorMessage">An error occurred</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

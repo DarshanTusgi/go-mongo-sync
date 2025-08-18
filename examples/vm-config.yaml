@@ -1,0 +1,150 @@
+# VM-sync HTTP client configuration
+# 
+# License Configuration (Environment Variable):
+# VM_SYNC_LICENSE="vm-tag,vm-uuid-456"  # VM-sync license key
+# 
+# This license must be included in the cloud-sync's VM_SYNC_LICENSES
+# environment variable for successful WebSocket authentication.
+#
+# Production Environment Variables (optional):
+# VM_SYNC_LICENSE: Your vm-sync license UUID (must match cloud-sync authorization)
+# MONGODB_URI: Your local MongoDB connection string
+# CLOUD_SYNC_URL: URL of your cloud-sync server (e.g., https://your-cloud-sync.com)
+# CLOUD_SYNC_WS_URL: WebSocket URL of your cloud-sync server (e.g., wss://your-cloud-sync.com/ws)
+# ENCRYPTION_KEY: Base64 encoded 32-byte encryption key (must match cloud-sync)
+# ENCRYPTION_KEY_ID: Unique identifier for your encryption key (must match cloud-sync)
+
+cloud_sync:
+  # Development URLs (replace with ${CLOUD_SYNC_URL} and ${CLOUD_SYNC_WS_URL} for production)
+  http_url: "http://localhost:8080"
+  ws_url: "ws://localhost:8080/ws"
+
+mongodb:
+  # Development URI (replace with ${MONGODB_URI} for production)
+  uri: "mongodb://localhost:27017/?retryWrites=true&w=majority"
+  timeout: 30s
+
+# Collections to sync (filtering is handled by cloud-sync)
+# Format: "source-db.collection:target-db.collection" or "source-db.collection" (uses same name)
+collections:
+  - "sync-test-db.products"
+  - "sync-test-db.users"
+  - "sync-test-db.orders"
+  - "test_db.items"
+  - "test_db.categories"
+  - "test_db.failure_test"
+
+# Sync configuration
+sync:
+  initial_sync: true
+  realtime_sync: true
+  batch_size: 100      # Increase to 1000 for production
+  parallel_collections: true
+  max_workers: 4       # Increase to 8 for production
+  retry_attempts: 3    # Number of retry attempts for failed operations
+  retry_delay: "5s"    # Delay between retry attempts
+
+# Internal cluster configuration
+# Multiple vm-sync instances can form a cluster for high availability
+cluster:
+  enabled: true
+  node_id: "vm-sync-node-1"  # Change to unique ID for each node (e.g., vm-sync-prod-1)
+  discovery_port: 9090       # Change to 9091, 9092, etc. for additional nodes
+  heartbeat_interval: "10s"
+  election_timeout: "5s"
+  log_level: "info"          # Use "warn" for production
+
+# Encryption configuration (must match cloud-sync)
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  # Development key (use ${ENCRYPTION_KEY_ID} for production)
+  key_id: "cloud-sync-key-001"
+  # Development key (use ${ENCRYPTION_KEY} for production) - NEVER hardcode in production
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"  # Base64 encoded 32-byte key
+
+# Connection and retry configuration
+connection:
+  reconnect_interval: "5s"
+  max_reconnect_attempts: 10
+  connection_timeout: "30s"
+  keepalive_interval: "30s"
+
+# Logging configuration
+logging:
+  level: "info"        # Use "warn" for production
+  format: "json"
+  output: "stdout"
+  include_timestamps: true
+
+# Performance tuning
+performance:
+  buffer_size: 1000
+  flush_interval: "1s"
+  max_batch_wait: "5s"
+  compression_enabled: true
+
+# Health check configuration
+health:
+  enabled: true
+  port: 8081
+  path: "/health"
+  interval: "30s"
+
+# Metrics configuration
+metrics:
+  enabled: true
+  port: 8082
+  path: "/metrics"
+  collection_interval: "10s"
+
+# Checkpoint configuration for client-side resume token tracking
+checkpoint:
+  enabled: true
+  database: "vm_sync_checkpoints"
+  collection: "client_resume_tokens"
+  save_interval_seconds: 3
+  cleanup_enabled: true
+  retention_days: 7
+
+# Watermarks configuration for exactly-once semantics
+watermarks:
+  enabled: true
+  database: "vm_sync_watermarks"
+  collection: "event_watermarks"
+
+# Sequence configuration for ordered event processing
+sequence:
+  enabled: true
+  database: "vm_sync_sequences"
+  collection: "sequence_counters"
+  batch_size: 500
+  node_id: "vm-sync-node-001"
+
+# Cluster time fence for snapshot consistency
+fence:
+  enabled: true
+
+# Example configuration for multiple nodes:
+# 
+# Node 2 configuration changes:
+# cluster:
+#   node_id: "vm-sync-node-2"
+#   discovery_port: 9091
+# health:
+#   port: 8083
+# metrics:
+#   port: 8084
+# sequence:
+#   node_id: "vm-sync-node-002"
+#
+# Node 3 configuration changes:
+# cluster:
+#   node_id: "vm-sync-node-3"
+#   discovery_port: 9092
+# health:
+#   port: 8085
+# metrics:
+#   port: 8086
+# sequence:
+#   node_id: "vm-sync-node-003"

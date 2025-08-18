@@ -1,0 +1,74 @@
+# Multi-stage Dockerfile for vm-sync
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
+
+# Set working directory
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags='-w -s -extldflags "-static"' \
+    -a -installsuffix cgo \
+    -o vm-sync \
+    ./cmd/vm-sync
+
+# Runtime stage
+FROM alpine:latest
+
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates tzdata wget
+
+# Create non-root user
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
+
+# Set working directory
+WORKDIR /app
+
+# Copy binary from builder stage
+COPY --from=builder /app/vm-sync .
+
+# Copy configuration examples
+COPY --from=builder /app/examples/vm-config.yaml ./examples/
+
+# Create directories for logs, data, and resume state
+RUN mkdir -p /app/logs /app/data /app/state && \
+    chown -R appuser:appgroup /app
+
+# Switch to non-root user
+USER appuser
+
+# Health check - check if process is running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD pgrep vm-sync > /dev/null || exit 1
+
+# Set default environment variables
+ENV LOG_LEVEL=info
+ENV LOG_FORMAT=json
+ENV SYNC_INITIAL=true
+ENV SYNC_BATCH_SIZE=1000
+ENV SYNC_WORKERS=4
+
+# Volume for persistent data
+VOLUME ["/app/data", "/app/state"]
+
+# Default command
+CMD ["./vm-sync", "-config", "examples/vm-config.yaml"]
+
+# Labels for metadata
+LABEL maintainer="Go Data Sync Team"
+LABEL version="1.0.0"
+LABEL description="VM synchronization client for Go Data Sync"
+LABEL component="vm-sync"

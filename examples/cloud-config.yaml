@@ -1,0 +1,156 @@
+# Cloud-sync HTTP server configuration
+# 
+# License Configuration (Environment Variables):
+# CLOUD_SYNC_LICENSE="cloud-tag,cloud-uuid-123"  # Cloud-sync license key
+# VM_SYNC_LICENSES="vm-tag1,vm-uuid-456,vm-tag2,vm-uuid-789"  # Comma-separated VM licenses
+# 
+# License validation ensures only authorized vm-sync instances can connect
+# via WebSocket. Both cloud-sync and vm-sync must have valid licenses.
+#
+# Production Environment Variables (optional):
+# MONGODB_URI: Your MongoDB connection string
+# ENCRYPTION_KEY: Base64 encoded 32-byte encryption key
+# ENCRYPTION_KEY_ID: Unique identifier for your encryption key
+
+server:
+  port: 8080
+  host: "localhost"  # Use "0.0.0.0" for production to listen on all interfaces
+  read_timeout: "15s"  # Increase to "30s" for production
+  write_timeout: "15s"  # Increase to "30s" for production
+  idle_timeout: "60s"   # Increase to "120s" for production
+
+mongodb:
+  # Development URI (replace with ${MONGODB_URI} for production)
+  uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
+  timeout: 30s
+  databases:
+    - name: "sync-test-db"
+      enabled: true
+      priority: 1
+      collections:
+        - name: "products"
+          enabled: true
+          batch_size: 100  # Increase to 1000 for production
+          priority: 1
+          field_filter:
+            include_fields: ["_id", "name", "price", "category", "status", "createdAt"]
+            always_include: ["_id"]
+          # Document filter: only sync active products with price > 0
+          document_filter:
+            criteria:
+              - field: "status"
+                operator: "eq"
+                value: "active"
+              - field: "price"
+                operator: "gt"
+                value: 0
+        - name: "users"
+          enabled: true
+          batch_size: 50   # Increase to 500 for production
+          priority: 2
+          field_filter:
+            include_fields: ["_id", "name", "email", "status", "verified", "createdAt"]
+            always_include: ["_id"]
+          # Document filter: only sync verified active users
+          document_filter:
+            criteria:
+              - field: "verified"
+                operator: "eq"
+                value: true
+              - field: "status"
+                operator: "eq"
+                value: "active"
+        - name: "orders"
+          enabled: true
+          batch_size: 100  # Increase to 1000 for production
+          priority: 3
+          field_filter:
+            include_fields: ["_id", "userId", "productId", "quantity", "status", "createdAt"]
+            always_include: ["_id"]
+    - name: "test_db"
+      enabled: true
+      priority: 2
+      collections:
+        - name: "items"
+          enabled: true
+          batch_size: 100
+          priority: 1
+          field_filter:
+            include_fields: ["_id", "name", "description", "category"]
+            always_include: ["_id"]
+        - name: "categories"
+          enabled: true
+          batch_size: 50
+          priority: 2
+          field_filter:
+            include_fields: ["_id", "name", "description"]
+            always_include: ["_id"]
+        - name: "failure_test"
+          enabled: true
+          batch_size: 10
+          priority: 3
+          field_filter:
+            include_fields: ["_id", "data"]
+            always_include: ["_id"]
+
+# WebSocket configuration
+websocket:
+  enabled: true
+  endpoint: "/ws"
+  max_connections: 100
+  ping_interval: "30s"
+  pong_timeout: "10s"
+
+# Encryption configuration
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  # Development key (use ${ENCRYPTION_KEY_ID} for production)
+  key_id: "cloud-sync-key-001"
+  # Development key (use ${ENCRYPTION_KEY} for production)
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"  # Base64 encoded 32-byte key
+
+# Logging configuration
+logging:
+  level: "info"  # Use "warn" for production
+  format: "json"
+  output: "stdout"
+
+# Checkpoint configuration for resumable synchronization
+checkpoint:
+  enabled: true
+  database: "sync_checkpoints"
+  collection: "resume_tokens"
+  save_interval_seconds: 5
+  cleanup_enabled: true
+  retention_days: 30
+
+# Transfer tracking configuration
+# Tracks what data has been delivered to each client to prevent duplicates
+tracking:
+  enabled: true
+  mongo_uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"  # Use ${MONGODB_URI} for production
+  database: "sync_tracking"
+  transfer_collection: "transfer_records"    # Records individual document transfers
+  state_collection: "client_sync_states"     # Tracks overall sync state per client
+  batch_collection: "transfer_batches"       # Tracks transfer batch operations
+
+# Sequence number generation for ordered event processing
+sequence:
+  enabled: true
+  database: "sync_sequences"
+  collection: "sequence_counters"
+  batch_size: 1000
+  node_id: "cloud-sync-node-001"
+
+# Cluster time fence for snapshot consistency
+fence:
+  enabled: true
+
+# Performance tuning
+performance:
+  max_workers: 4      # Increase to 8-16 for production
+  buffer_size: 1000
+  batch_timeout: "5s"
+  retry_attempts: 3
+  retry_delay: "2s"
