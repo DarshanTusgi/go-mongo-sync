@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -260,6 +262,9 @@ func main() {
 	// Start status broadcaster for dashboard updates
 	go startStatusBroadcaster()
 
+	// Start push-based data synchronization
+	go startPushBasedSync()
+
 	// Setup HTTP routes
 	router := mux.NewRouter()
 	router.HandleFunc(config.WebSocket.Endpoint, handleWebSocket)
@@ -327,6 +332,161 @@ func main() {
 	}
 
 	log.Println("Server exited")
+}
+
+func startPushBasedSync() {
+	log.Println("Starting push-based synchronization...")
+	
+	// Wait a bit for vm-sync to start up
+	time.Sleep(5 * time.Second)
+	
+	// Get vm-sync endpoint from environment or use default
+	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
+	if vmSyncEndpoint == "" {
+		vmSyncEndpoint = "http://localhost:8081" // Default vm-sync endpoint
+	}
+	
+	log.Printf("Pushing data to vm-sync at: %s", vmSyncEndpoint)
+	
+	// Push data for each configured database and collection
+	for _, dbConfig := range config.MongoDB.Databases {
+		if !dbConfig.Enabled {
+			log.Printf("Skipping disabled database: %s", dbConfig.Name)
+			continue
+		}
+		
+		for _, collConfig := range dbConfig.Collections {
+			if !collConfig.Enabled {
+				log.Printf("Skipping disabled collection: %s.%s", dbConfig.Name, collConfig.Name)
+				continue
+			}
+			
+			log.Printf("Starting push for %s.%s", dbConfig.Name, collConfig.Name)
+			if err := pushCollectionData(vmSyncEndpoint, dbConfig.Name, collConfig.Name); err != nil {
+				log.Printf("Error pushing data for %s.%s: %v", dbConfig.Name, collConfig.Name, err)
+			} else {
+				log.Printf("Successfully pushed data for %s.%s", dbConfig.Name, collConfig.Name)
+			}
+		}
+	}
+	
+	log.Println("Initial push-based synchronization completed")
+}
+
+func pushCollectionData(vmSyncEndpoint, database, collection string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	defer cancel()
+	
+	coll := mongoClient.Database(database).Collection(collection)
+	
+	// Count total documents
+	totalCount, err := coll.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		return fmt.Errorf("failed to count documents: %v", err)
+	}
+	
+	log.Printf("Pushing %d documents from %s.%s", totalCount, database, collection)
+	
+	pageSize := 1000 // Default page size
+	totalPages := int((totalCount + int64(pageSize) - 1) / int64(pageSize))
+	
+	if totalPages == 0 {
+		totalPages = 1 // At least one page for metadata
+	}
+	
+	// Push data page by page
+	for pageNumber := 1; pageNumber <= totalPages; pageNumber++ {
+		if err := pushSinglePage(ctx, vmSyncEndpoint, database, collection, pageNumber, pageSize, totalPages); err != nil {
+			return fmt.Errorf("failed to push page %d: %v", pageNumber, err)
+		}
+		log.Printf("Pushed page %d/%d for %s.%s", pageNumber, totalPages, database, collection)
+	}
+	
+	return nil
+}
+
+func pushSinglePage(ctx context.Context, vmSyncEndpoint, database, collection string, pageNumber, pageSize, totalPages int) error {
+	coll := mongoClient.Database(database).Collection(collection)
+	
+	// Calculate skip value
+	skip := (pageNumber - 1) * pageSize
+	
+	// Find documents for this page
+	findOptions := options.Find().SetSkip(int64(skip)).SetLimit(int64(pageSize))
+	cursor, err := coll.Find(ctx, bson.M{}, findOptions)
+	if err != nil {
+		return fmt.Errorf("failed to find documents: %v", err)
+	}
+	defer cursor.Close(ctx)
+	
+	// Collect documents
+	var documents []bson.Raw
+	for cursor.Next(ctx) {
+		documents = append(documents, cursor.Current)
+	}
+	
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("cursor error: %v", err)
+	}
+	
+	// Collect indexes and collection options on first page
+	var indexes []models.IndexInfo
+	var collectionOptions *models.CollectionOptions
+	var snapshotFence *models.SnapshotFenceInfo
+	
+	if pageNumber == 1 {
+		// Collect indexes
+		if idxs, err := collectIndexes(ctx, coll); err != nil {
+			log.Printf("Warning: Failed to collect indexes for %s.%s: %v", database, collection, err)
+		} else {
+			indexes = idxs
+		}
+		
+		// Collect collection options
+		if opts, err := collectCollectionOptions(ctx, mongoClient.Database(database), collection); err != nil {
+			log.Printf("Warning: Failed to collect collection options for %s.%s: %v", database, collection, err)
+		} else {
+			collectionOptions = opts
+		}
+		
+		// Create snapshot fence info
+		snapshotFence = &models.SnapshotFenceInfo{
+			ClusterTime:   nil, // Will be set properly in production
+			OperationTime: nil, // Will be set properly in production
+			CapturedAt:    time.Now(),
+		}
+	}
+	
+	// Create page result
+	pageResult := models.PageResult{
+		PageNumber:        pageNumber,
+		Documents:         documents,
+		Indexes:           indexes,
+		CollectionOptions: collectionOptions,
+		SnapshotFence:     snapshotFence,
+		IsLastPage:        pageNumber == totalPages,
+	}
+	
+	// Marshal to JSON
+	payload, err := json.Marshal(pageResult)
+	if err != nil {
+		return fmt.Errorf("failed to marshal page result: %v", err)
+	}
+	
+	// Send to vm-sync
+	url := fmt.Sprintf("%s/api/v1/push/%s/%s", vmSyncEndpoint, database, collection)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("failed to send request to vm-sync: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("vm-sync returned error %d: %s", resp.StatusCode, string(body))
+	}
+	
+	return nil
 }
 
 func loadConfig(filename string) error {
@@ -729,14 +889,16 @@ func startStatusBroadcaster() {
 }
 
 // isInvalidateResumeTokenError checks if the error is due to trying to resume after an invalidate event
+// or when the resume token is no longer available in the oplog
 func isInvalidateResumeTokenError(err error) bool {
 	if err == nil {
 		return false
 	}
 	// Check for MongoDB's InvalidResumeToken error related to invalidate events
 	errorStr := err.Error()
-	return strings.Contains(errorStr, "InvalidResumeToken") && 
-		   strings.Contains(errorStr, "invalidate notification")
+	return (strings.Contains(errorStr, "InvalidResumeToken") && strings.Contains(errorStr, "invalidate notification")) ||
+		   strings.Contains(errorStr, "cannot resume stream; the resume token was not found") ||
+		   strings.Contains(errorStr, "ChangeStreamFatalError")
 }
 
 func monitorChangeStreams() {
@@ -889,27 +1051,23 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 	
 	// Add document filters to change stream pipeline
 	if len(collConfig.DocumentFilter.Criteria) > 0 {
-		docFilterPipeline := filterEngine.BuildDocumentFilterPipeline(&collConfig.DocumentFilter)
+		docFilterPipeline := filterEngine.BuildChangeStreamDocumentFilterPipeline(&collConfig.DocumentFilter)
+		log.Printf("DEBUG: Generated document filter pipeline for %s.%s: %+v", dbName, collName, docFilterPipeline)
 		for _, stage := range docFilterPipeline {
 			// Convert bson.M to bson.D for pipeline
 			var stageD bson.D
 			for k, v := range stage {
 				stageD = append(stageD, bson.E{Key: k, Value: v})
 			}
+			log.Printf("DEBUG: Adding pipeline stage for %s.%s: %+v", dbName, collName, stageD)
 			pipeline = append(pipeline, stageD)
 		}
 	}
 	
-	// Add field filters to change stream pipeline
-	fieldFilterPipeline := filterEngine.BuildFieldFilterPipeline(&collConfig.FieldFilter)
-	for _, stage := range fieldFilterPipeline {
-		// Convert bson.M to bson.D for pipeline
-		var stageD bson.D
-		for k, v := range stage {
-			stageD = append(stageD, bson.E{Key: k, Value: v})
-		}
-		pipeline = append(pipeline, stageD)
-	}
+	// NOTE: Field filters are NOT applied to change stream pipeline
+	// because they would filter out essential change stream fields like
+	// operationType, documentKey, fullDocument, etc.
+	// Field filtering is applied later during event processing.
 	
 	log.Printf("Starting change stream for %s.%s with %d pipeline stages", dbName, collName, len(pipeline))
 	if len(pipeline) > 0 {
@@ -918,7 +1076,7 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 			"collection": collName,
 			"filter_stages": len(pipeline),
 			"has_document_filter": len(collConfig.DocumentFilter.Criteria) > 0,
-			"has_field_filter": len(collConfig.FieldFilter.IncludeFields) > 0 || len(collConfig.FieldFilter.ExcludeFields) > 0,
+			"field_filter_note": "Field filters applied during event processing, not in change stream pipeline",
 		})
 	}
 	
@@ -961,9 +1119,10 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 		}
 		syncPausedMutex.RUnlock()
 
-		log.Printf("About to call changeStream.Next() for %s.%s", dbName, collName)
-		if changeStream.Next(ctx) {
-			log.Printf("changeStream.Next() returned true for %s.%s", dbName, collName)
+		// Use TryNext instead of blocking Next
+		hasNext := changeStream.TryNext(ctx)
+		
+		if hasNext {
 			// Get raw BSON data to preserve MongoDB types
 			rawData := changeStream.Current
 			var changeDoc bson.M
@@ -980,7 +1139,19 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 				continue
 			}
 
-			operationType := changeDoc["operationType"].(string)
+			// Debug: log the change document structure
+			keys := make([]string, 0, len(changeDoc))
+			for k := range changeDoc {
+				keys = append(keys, k)
+			}
+			log.Printf("Change document keys for %s.%s: %v", dbName, collName, keys)
+			
+			operationType, ok := changeDoc["operationType"].(string)
+			if !ok {
+				log.Printf("Warning: operationType field missing or invalid in change document for %s.%s", dbName, collName)
+				log.Printf("Full change document: %+v", changeDoc)
+				continue
+			}
 			log.Printf("Change detected in %s.%s: %s", dbName, collName, operationType)
 			
 			// Log change event
@@ -1111,9 +1282,14 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 				})
 			}
 		}
-		} else {
-			log.Printf("changeStream.Next() returned false for %s.%s", dbName, collName)
-			break
+	} else {
+			// Check for errors
+			if err := changeStream.Err(); err != nil {
+				log.Printf("Change stream error for %s.%s: %v", dbName, collName, err)
+				break
+			}
+			// Sleep briefly before trying again
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -1140,6 +1316,17 @@ func handleDataRequest(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
+	}
+
+	// Set default pagination values
+	if req.PageSize <= 0 {
+		req.PageSize = 1000 // Default page size to prevent memory exhaustion
+	}
+	if req.PageSize > 10000 {
+		req.PageSize = 10000 // Maximum page size limit
+	}
+	if req.PageNumber < 0 {
+		req.PageNumber = 0 // Ensure non-negative page number
 	}
 
 	// Extract client ID from request headers or generate one
@@ -1187,7 +1374,13 @@ func handleDataRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	coll := mongoClient.Database(req.Database).Collection(req.Collection)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	
+	// Use configurable data timeout, default to 30 seconds if not set
+	dataTimeout := config.Server.DataTimeout
+	if dataTimeout == 0 {
+		dataTimeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dataTimeout)
 	defer cancel()
 
 	if req.CountOnly {
@@ -1363,77 +1556,100 @@ func handleDataRequest(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Error starting transfer batch: %v", err)
 		}
 
-		// Query only untransferred documents
+		// Query only untransferred documents with pagination
 		if len(untransferredIDs) == 0 {
 			// No new documents to transfer
 			documents = []bson.Raw{}
 			count = 0
 		} else {
-			// Add filter for untransferred documents
-			idFilter := bson.M{"_id": bson.M{"$in": untransferredIDs}}
-			if len(pipeline) > 0 {
-				// Insert the ID filter at the beginning
-				filteredPipeline := append([]bson.M{{"$match": idFilter}}, pipeline...)
-				cursor, err := coll.Aggregate(ctx, filteredPipeline)
-				if err != nil {
-					response := models.DataResponse{
-						Database:   req.Database,
-						Collection: req.Collection,
-						Error:      fmt.Sprintf("Failed to query documents: %v", err),
-					}
-					json.NewEncoder(w).Encode(response)
-					return
-				}
-				defer cursor.Close(ctx)
-
-				for cursor.Next(ctx) {
-					rawDoc := cursor.Current
-					documents = append(documents, rawDoc)
-
-					// Record transfer
-					var doc bson.M
-					if err := bson.Unmarshal(rawDoc, &doc); err == nil {
-						if id, ok := doc["_id"].(primitive.ObjectID); ok {
-							if err := transferTracker.RecordTransfer(clientID, req.Database, req.Collection, id, batchID); err != nil {
-								log.Printf("Error recording transfer: %v", err)
-							}
-						}
-					}
-				}
+			// Apply pagination to untransferred IDs
+			skip := req.PageNumber * req.PageSize
+			if skip >= len(untransferredIDs) {
+				// Page beyond available data
+				documents = []bson.Raw{}
+				count = 0
 			} else {
-				cursor, err := coll.Find(ctx, idFilter)
-				if err != nil {
-					response := models.DataResponse{
-						Database:   req.Database,
-						Collection: req.Collection,
-						Error:      fmt.Sprintf("Failed to query documents: %v", err),
-					}
-					json.NewEncoder(w).Encode(response)
-					return
+				// Get the slice of IDs for this page
+				end := skip + req.PageSize
+				if end > len(untransferredIDs) {
+					end = len(untransferredIDs)
 				}
-				defer cursor.Close(ctx)
+				paginatedIDs := untransferredIDs[skip:end]
+				
+				// Add filter for paginated untransferred documents
+				idFilter := bson.M{"_id": bson.M{"$in": paginatedIDs}}
+				if len(pipeline) > 0 {
+					// Insert the ID filter at the beginning
+					filteredPipeline := append([]bson.M{{"$match": idFilter}}, pipeline...)
+					cursor, err := coll.Aggregate(ctx, filteredPipeline)
+					if err != nil {
+						response := models.DataResponse{
+							Database:   req.Database,
+							Collection: req.Collection,
+							Error:      fmt.Sprintf("Failed to query documents: %v", err),
+						}
+						json.NewEncoder(w).Encode(response)
+						return
+					}
+					defer cursor.Close(ctx)
 
-				for cursor.Next(ctx) {
-					rawDoc := cursor.Current
-					documents = append(documents, rawDoc)
+					for cursor.Next(ctx) {
+						rawDoc := cursor.Current
+						documents = append(documents, rawDoc)
 
-					// Record transfer
-					var doc bson.M
-					if err := bson.Unmarshal(rawDoc, &doc); err == nil {
-						if id, ok := doc["_id"].(primitive.ObjectID); ok {
-							if err := transferTracker.RecordTransfer(clientID, req.Database, req.Collection, id, batchID); err != nil {
-								log.Printf("Error recording transfer: %v", err)
+						// Record transfer
+						var doc bson.M
+						if err := bson.Unmarshal(rawDoc, &doc); err == nil {
+							if id, ok := doc["_id"].(primitive.ObjectID); ok {
+								if err := transferTracker.RecordTransfer(clientID, req.Database, req.Collection, id, batchID); err != nil {
+									log.Printf("Error recording transfer: %v", err)
+								}
+							}
+						}
+					}
+				} else {
+					cursor, err := coll.Find(ctx, idFilter)
+					if err != nil {
+						response := models.DataResponse{
+							Database:   req.Database,
+							Collection: req.Collection,
+							Error:      fmt.Sprintf("Failed to query documents: %v", err),
+						}
+						json.NewEncoder(w).Encode(response)
+						return
+					}
+					defer cursor.Close(ctx)
+
+					for cursor.Next(ctx) {
+						rawDoc := cursor.Current
+						documents = append(documents, rawDoc)
+
+						// Record transfer
+						var doc bson.M
+						if err := bson.Unmarshal(rawDoc, &doc); err == nil {
+							if id, ok := doc["_id"].(primitive.ObjectID); ok {
+								if err := transferTracker.RecordTransfer(clientID, req.Database, req.Collection, id, batchID); err != nil {
+									log.Printf("Error recording transfer: %v", err)
+								}
 							}
 						}
 					}
 				}
+				count = int64(len(documents))
 			}
-			count = int64(len(documents))
 		}
 	} else {
-		// Original logic when tracking is disabled
+		// Transfer tracking disabled - return paginated documents
+		skip := req.PageNumber * req.PageSize
+		limit := req.PageSize
+		
 		if len(pipeline) > 0 {
-			cursor, err := coll.Aggregate(ctx, pipeline)
+			// Add skip and limit to aggregation pipeline
+			paginatedPipeline := append(pipeline, 
+				bson.M{"$skip": skip},
+				bson.M{"$limit": limit},
+			)
+			cursor, err := coll.Aggregate(ctx, paginatedPipeline)
 			if err != nil {
 				response := models.DataResponse{
 					Database:   req.Database,
@@ -1451,7 +1667,9 @@ func handleDataRequest(w http.ResponseWriter, r *http.Request) {
 				documents = append(documents, rawDoc)
 			}
 		} else {
-			cursor, err := coll.Find(ctx, bson.M{})
+			// Use find with skip and limit options
+			opts := options.Find().SetSkip(int64(skip)).SetLimit(int64(limit))
+			cursor, err := coll.Find(ctx, bson.M{}, opts)
 			if err != nil {
 				response := models.DataResponse{
 					Database:   req.Database,
@@ -1472,11 +1690,45 @@ func handleDataRequest(w http.ResponseWriter, r *http.Request) {
 		count = int64(len(documents))
 	}
 
+	// Calculate pagination metadata
+	var totalDocuments int64
+	// For simplicity, get total count from collection for both modes
+	totalDocuments, countErr := coll.CountDocuments(ctx, bson.M{})
+	if countErr != nil {
+		log.Printf("Warning: Failed to get total document count for pagination: %v", countErr)
+		totalDocuments = count // Fallback to current page count
+	}
+	
+	totalPages := (totalDocuments + int64(req.PageSize) - 1) / int64(req.PageSize)
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	
+	paginationInfo := models.PaginationInfo{
+		PageSize:       req.PageSize,
+		PageNumber:     req.PageNumber,
+		TotalPages:     int(totalPages),
+		TotalDocuments: totalDocuments,
+		HasNextPage:    req.PageNumber < int(totalPages-1),
+		HasPrevPage:    req.PageNumber > 0,
+	}
+	
+	// Set LastDocumentID for cursor-based pagination if documents exist
+	if len(documents) > 0 {
+		var lastDoc bson.M
+		if unmarshalErr := bson.Unmarshal(documents[len(documents)-1], &lastDoc); unmarshalErr == nil {
+			if id, ok := lastDoc["_id"].(primitive.ObjectID); ok {
+				paginationInfo.LastDocumentID = id.Hex()
+			}
+		}
+	}
+
 	response := models.DataResponse{
 		Database:   req.Database,
 		Collection: req.Collection,
 		Documents:  documents,
 		Count:      count,
+		Pagination: &paginationInfo,
 	}
 
 	// Collect indexes and collection metadata

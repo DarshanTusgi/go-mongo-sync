@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -33,8 +35,9 @@ import (
 // Config represents the client configuration
 type Config struct {
 	CloudSync struct {
-		HTTPURL string `yaml:"http_url"`
-		WSURL   string `yaml:"ws_url"`
+		HTTPURL     string        `yaml:"http_url"`
+		WSURL       string        `yaml:"ws_url"`
+		HTTPTimeout time.Duration `yaml:"http_timeout"`
 	} `yaml:"cloud_sync"`
 	MongoDB struct {
 		URI     string        `yaml:"uri"`
@@ -55,10 +58,29 @@ type Config struct {
 	Fence       models.FenceConfig       `yaml:"fence"`
 }
 
+// PageResult represents the result of fetching a single page
+type PageResult struct {
+	PageNumber int
+	Documents  []bson.Raw
+	Error      error
+	Indexes    []models.IndexInfo
+	CollectionOptions *models.CollectionOptions
+	SnapshotFence     *models.SnapshotFenceInfo
+	IsLastPage        bool
+}
+
+// WorkerPool manages parallel page fetching
+type WorkerPool struct {
+	workerCount   int
+	maxMemoryMB   int
+	currentMemory int64
+	memoryMutex   sync.RWMutex
+}
+
 var (
 	config        Config
 	mongoClient   *mongo.Client
-	httpClient    = &http.Client{Timeout: 30 * time.Second}
+	httpClient    *http.Client
 	encryptionMgr *crypto.EncryptionManager
 	checkpointMgr *resume.CheckpointManager
 	watermarkMgr  *watermarks.WatermarkManager
@@ -67,6 +89,7 @@ var (
 	oplogMonitor  *resume.OplogMonitor
 	clientID      string
 	vmLicense     *license.LicenseKey
+	workerPool    *WorkerPool
 )
 
 func main() {
@@ -77,6 +100,14 @@ func main() {
 	if err := loadConfig(*configFile); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Initialize HTTP client with configurable timeout
+	httpTimeout := config.CloudSync.HTTPTimeout
+	if httpTimeout == 0 {
+		httpTimeout = 300 * time.Second // Default to 5 minutes for large data transfers
+	}
+	httpClient = &http.Client{Timeout: httpTimeout}
+	log.Printf("HTTP client initialized with timeout: %v", httpTimeout)
 
 	// Connect to local MongoDB
 	ctx, cancel := context.WithTimeout(context.Background(), config.MongoDB.Timeout)
@@ -194,12 +225,9 @@ func main() {
 	}
 	log.Printf("VM license loaded: UUID=%s", vmLicense.UUID)
 
-	// Perform initial data synchronization
-	log.Println("Starting initial data synchronization...")
-	if err := performInitialSync(); err != nil {
-		log.Fatalf("Initial sync failed: %v", err)
-	}
-	log.Println("Initial data synchronization completed")
+	// Start HTTP server to receive data from cloud-sync
+	log.Println("Starting HTTP server for push-based synchronization...")
+	go startHTTPServer()
 
 	// Start real-time sync via WebSocket
 	log.Println("Starting real-time synchronization...")
@@ -225,6 +253,101 @@ func main() {
 	}
 
 	log.Println("Client exited")
+}
+
+func startHTTPServer() {
+	router := mux.NewRouter()
+	
+	// Push endpoint for receiving data from cloud-sync
+	router.HandleFunc("/api/v1/push/{database}/{collection}", handlePushData).Methods("POST")
+	
+	// Health check endpoint
+	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	}).Methods("GET")
+	
+	port := "8081" // Default port for vm-sync
+	if envPort := os.Getenv("VM_SYNC_PORT"); envPort != "" {
+		port = envPort
+	}
+	
+	log.Printf("HTTP server starting on port %s", port)
+	if err := http.ListenAndServe(":"+port, router); err != nil {
+		log.Fatalf("HTTP server failed: %v", err)
+	}
+}
+
+func handlePushData(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	database := vars["database"]
+	collection := vars["collection"]
+	
+	log.Printf("Received push data for %s.%s", database, collection)
+	
+	// Read the request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading request body: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+	
+	// Parse the page result
+	var pageResult PageResult
+	if err := json.Unmarshal(body, &pageResult); err != nil {
+		log.Printf("Error parsing page result: %v", err)
+		http.Error(w, "Failed to parse page result", http.StatusBadRequest)
+		return
+	}
+	
+	// Process the received data
+	if err := processPushedData(database, collection, &pageResult); err != nil {
+		log.Printf("Error processing pushed data: %v", err)
+		http.Error(w, "Failed to process data", http.StatusInternalServerError)
+		return
+	}
+	
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Data processed successfully"))
+}
+
+func processPushedData(database, collection string, pageResult *PageResult) error {
+	if pageResult.Error != nil {
+		return fmt.Errorf("page result contains error: %v", pageResult.Error)
+	}
+	
+	// Clear collection on first page
+	if pageResult.PageNumber == 1 {
+		coll := mongoClient.Database(database).Collection(collection)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		if err := coll.Drop(ctx); err != nil {
+			log.Printf("Warning: Failed to drop collection %s.%s: %v", database, collection, err)
+		}
+		log.Printf("Cleared collection %s.%s for fresh sync", database, collection)
+	}
+	
+	// Insert documents if any
+	if len(pageResult.Documents) > 0 {
+		if err := insertDocumentsBatch(database, collection, pageResult.Documents); err != nil {
+			return fmt.Errorf("failed to insert documents: %v", err)
+		}
+		log.Printf("Inserted %d documents for %s.%s (page %d)", 
+			len(pageResult.Documents), database, collection, pageResult.PageNumber)
+	}
+	
+	// Handle final processing on last page
+	if pageResult.IsLastPage {
+		if err := handleFinalProcessing(database, collection, pageResult); err != nil {
+			return fmt.Errorf("failed to handle final processing: %v", err)
+		}
+		log.Printf("Completed push-based sync for %s.%s", database, collection)
+	}
+	
+	return nil
 }
 
 func loadConfig(filename string) error {
@@ -329,30 +452,97 @@ func getLocalCount(database, collection string) (int64, error) {
 	return coll.CountDocuments(ctx, bson.M{})
 }
 
-func syncCollectionData(database, collection string) error {
-	// Get data from cloud
+// initWorkerPool initializes the worker pool with configuration
+func initWorkerPool() {
+	maxWorkers := config.Sync.MaxWorkers
+	if maxWorkers <= 0 {
+		maxWorkers = 4 // Default to 4 workers
+	}
+	
+	// Calculate memory limit (default 512MB)
+	maxMemoryMB := 512
+	// Use batch size to estimate memory needs
+	if config.Sync.BatchSize > 0 {
+		// Estimate memory based on batch size (assume ~1KB per document)
+		estimatedMB := (config.Sync.BatchSize * maxWorkers * 1024) / (1024 * 1024)
+		if estimatedMB > 128 && estimatedMB < 2048 {
+			maxMemoryMB = estimatedMB
+		}
+	}
+	
+	workerPool = &WorkerPool{
+		workerCount:   maxWorkers,
+		maxMemoryMB:   maxMemoryMB,
+		currentMemory: 0,
+	}
+	
+	log.Printf("Initialized worker pool: %d workers, %dMB memory limit", maxWorkers, maxMemoryMB)
+}
+
+// estimateMemoryUsage estimates memory usage for a page of documents
+func (wp *WorkerPool) estimateMemoryUsage(documents []bson.Raw) int64 {
+	var totalSize int64
+	for _, doc := range documents {
+		totalSize += int64(len(doc))
+	}
+	return totalSize
+}
+
+// canAllocateMemory checks if we can allocate memory for a page
+func (wp *WorkerPool) canAllocateMemory(estimatedSize int64) bool {
+	wp.memoryMutex.RLock()
+	defer wp.memoryMutex.RUnlock()
+	
+	maxBytes := int64(wp.maxMemoryMB) * 1024 * 1024
+	return wp.currentMemory+estimatedSize <= maxBytes
+}
+
+// allocateMemory reserves memory for a page
+func (wp *WorkerPool) allocateMemory(size int64) {
+	wp.memoryMutex.Lock()
+	defer wp.memoryMutex.Unlock()
+	wp.currentMemory += size
+}
+
+// releaseMemory frees memory after processing a page
+func (wp *WorkerPool) releaseMemory(size int64) {
+	wp.memoryMutex.Lock()
+	defer wp.memoryMutex.Unlock()
+	wp.currentMemory -= size
+	if wp.currentMemory < 0 {
+		wp.currentMemory = 0
+	}
+}
+
+// fetchPageConcurrently fetches a single page of data
+func fetchPageConcurrently(database, collection string, pageNumber, pageSize int, resultChan chan<- PageResult) {
 	req := models.DataRequest{
 		Database:   database,
 		Collection: collection,
 		CountOnly:  false,
+		PageSize:   pageSize,
+		PageNumber: pageNumber,
 	}
 
 	reqBody, err := json.Marshal(req)
 	if err != nil {
-		return err
+		resultChan <- PageResult{PageNumber: pageNumber, Error: err}
+		return
 	}
 
 	// Create HTTP request with client ID header
 	httpReq, err := http.NewRequest("POST", config.CloudSync.HTTPURL+"/api/data", bytes.NewBuffer(reqBody))
 	if err != nil {
-		return err
+		resultChan <- PageResult{PageNumber: pageNumber, Error: err}
+		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-Client-ID", clientID)
 
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
-		return err
+		resultChan <- PageResult{PageNumber: pageNumber, Error: err}
+		return
 	}
 	defer resp.Body.Close()
 
@@ -363,31 +553,56 @@ func syncCollectionData(database, collection string) error {
 		// Read encrypted response body
 		encryptedData, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return fmt.Errorf("failed to read encrypted response: %w", err)
+			resultChan <- PageResult{PageNumber: pageNumber, Error: fmt.Errorf("failed to read encrypted response: %w", err)}
+			return
 		}
 		
 		// Decrypt the response
 		if err := encryptionMgr.DecryptJSON(encryptedData, &dataResp); err != nil {
-			return fmt.Errorf("failed to decrypt response: %w", err)
+			resultChan <- PageResult{PageNumber: pageNumber, Error: fmt.Errorf("failed to decrypt response: %w", err)}
+			return
 		}
-		log.Printf("Decrypted response for %s.%s (KeyID: %s)", database, collection, resp.Header.Get("X-Encryption-KeyID"))
+		log.Printf("Decrypted response for %s.%s page %d (KeyID: %s)", database, collection, pageNumber, resp.Header.Get("X-Encryption-KeyID"))
 	} else {
 		// Handle unencrypted response
 		if err := json.NewDecoder(resp.Body).Decode(&dataResp); err != nil {
-			return err
+			resultChan <- PageResult{PageNumber: pageNumber, Error: err}
+			return
 		}
 	}
 
 	if dataResp.Error != "" {
-		return fmt.Errorf("cloud error: %s", dataResp.Error)
+		resultChan <- PageResult{PageNumber: pageNumber, Error: fmt.Errorf("cloud error: %s", dataResp.Error)}
+		return
 	}
 
-	if len(dataResp.Documents) == 0 {
-		log.Printf("No documents to sync for %s.%s", database, collection)
-		return nil
-	}
+	// Determine if this is the last page
+	isLastPage := dataResp.Pagination == nil || !dataResp.Pagination.HasNextPage
 
-	// Clear local collection and insert new data
+	resultChan <- PageResult{
+		PageNumber:        pageNumber,
+		Documents:         dataResp.Documents,
+		Error:             nil,
+		Indexes:           dataResp.Indexes,
+		CollectionOptions: dataResp.CollectionOptions,
+		SnapshotFence:     dataResp.SnapshotFence,
+		IsLastPage:        isLastPage,
+	}
+}
+
+func syncCollectionData(database, collection string) error {
+	// Initialize worker pool if not already done
+	if workerPool == nil {
+		initWorkerPool()
+	}
+	
+	// Use pagination to handle large collections efficiently
+	pageSize := 1000 // Default page size
+	if config.Sync.BatchSize > 0 {
+		pageSize = config.Sync.BatchSize
+	}
+	
+	// Clear local collection for clean sync
 	coll := mongoClient.Database(database).Collection(collection)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -396,46 +611,137 @@ func syncCollectionData(database, collection string) error {
 	if err := coll.Drop(ctx); err != nil {
 		log.Printf("Warning: Failed to drop collection %s.%s: %v", database, collection, err)
 	}
-
-	// Insert documents in batches
-	batchSize := 1000
-	for i := 0; i < len(dataResp.Documents); i += batchSize {
-		end := i + batchSize
-		if end > len(dataResp.Documents) {
-			end = len(dataResp.Documents)
-		}
-
-		// Convert bson.Raw to []interface{} for InsertMany
-		batch := make([]interface{}, 0, end-i)
-		for j := i; j < end; j++ {
-			var doc bson.M
-			if err := bson.Unmarshal(dataResp.Documents[j], &doc); err != nil {
-				log.Printf("Error unmarshaling document: %v", err)
-				continue
-			}
-			batch = append(batch, doc)
-		}
-		if _, err := coll.InsertMany(ctx, batch); err != nil {
-			return fmt.Errorf("failed to insert batch: %v", err)
-		}
-
-		log.Printf("Inserted batch %d-%d for %s.%s", i+1, end, database, collection)
+	
+	// First, get the first page to determine total count and get metadata
+	firstPageResult, err := fetchSinglePage(database, collection, 0, pageSize)
+	if err != nil {
+		return fmt.Errorf("failed to fetch first page: %v", err)
 	}
+	
+	if len(firstPageResult.Documents) == 0 {
+		log.Printf("No documents to sync for %s.%s", database, collection)
+		return nil
+	}
+	
+	// Calculate total pages needed
+	cloudCount, err := getCloudCount(database, collection)
+	if err != nil {
+		return fmt.Errorf("failed to get cloud count: %v", err)
+	}
+	
+	totalPages := int((cloudCount + int64(pageSize) - 1) / int64(pageSize))
+	log.Printf("Starting parallel sync for %s.%s: %d total pages with %d workers", database, collection, totalPages, workerPool.workerCount)
+	
+	// Process first page
+	if err := insertDocumentsBatch(database, collection, firstPageResult.Documents); err != nil {
+		return fmt.Errorf("failed to insert documents from page 0: %v", err)
+	}
+	log.Printf("Processed page 0 for %s.%s: %d documents", database, collection, len(firstPageResult.Documents))
+	
+	// Process remaining pages in parallel if there are more
+	if totalPages > 1 {
+		if err := processRemainingPagesParallel(database, collection, pageSize, totalPages, firstPageResult); err != nil {
+			return err
+		}
+	}
+	
+	// Handle final processing (indexes, collection options, snapshot fence)
+	if err := handleFinalProcessing(database, collection, firstPageResult); err != nil {
+		return err
+	}
+	
+	log.Printf("Successfully completed parallel sync for %s.%s", database, collection)
+	return nil
+}
 
-	log.Printf("Inserted %d documents into %s.%s", len(dataResp.Documents), database, collection)
+func fetchSinglePage(database, collection string, pageNumber, pageSize int) (*PageResult, error) {
+	resultChan := make(chan PageResult, 1)
+	fetchPageConcurrently(database, collection, pageNumber, pageSize, resultChan)
+	result := <-resultChan
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	return &result, nil
+}
+
+func processRemainingPagesParallel(database, collection string, pageSize, totalPages int, firstPageResult *PageResult) error {
+	// Channel for page results
+	resultChan := make(chan PageResult, workerPool.workerCount*2)
+	var wg sync.WaitGroup
+	
+	// Start workers for remaining pages (1 to totalPages-1)
+	pageQueue := make(chan int, totalPages-1)
+	for i := 1; i < totalPages; i++ {
+		pageQueue <- i
+	}
+	close(pageQueue)
+	
+	// Launch worker goroutines
+	for i := 0; i < workerPool.workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pageNum := range pageQueue {
+				fetchPageConcurrently(database, collection, pageNum, pageSize, resultChan)
+			}
+		}()
+	}
+	
+	// Close result channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	// Process results as they come in
+	totalProcessed := len(firstPageResult.Documents) // Already processed page 0
+	for result := range resultChan {
+		if result.Error != nil {
+			return fmt.Errorf("error fetching page %d: %v", result.PageNumber, result.Error)
+		}
+		
+		if len(result.Documents) > 0 {
+			// Estimate memory usage and wait if necessary
+			memorySize := workerPool.estimateMemoryUsage(result.Documents)
+			for !workerPool.canAllocateMemory(memorySize) {
+				log.Printf("Memory limit reached, waiting before processing page %d...", result.PageNumber)
+				time.Sleep(100 * time.Millisecond)
+			}
+			
+			workerPool.allocateMemory(memorySize)
+			
+			// Process documents from this page
+			if err := insertDocumentsBatch(database, collection, result.Documents); err != nil {
+				workerPool.releaseMemory(memorySize)
+				return fmt.Errorf("failed to insert documents from page %d: %v", result.PageNumber, err)
+			}
+			
+			workerPool.releaseMemory(memorySize)
+			totalProcessed += len(result.Documents)
+			log.Printf("Processed page %d for %s.%s: %d documents (total: %d)", result.PageNumber, database, collection, len(result.Documents), totalProcessed)
+		}
+	}
+	
+	return nil
+}
+
+func handleFinalProcessing(database, collection string, pageResult *PageResult) error {
+	coll := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
 	// Recreate indexes if provided
-	if len(dataResp.Indexes) > 0 {
-		if err := recreateIndexes(ctx, coll, dataResp.Indexes); err != nil {
+	if len(pageResult.Indexes) > 0 {
+		if err := recreateIndexes(ctx, coll, pageResult.Indexes); err != nil {
 			log.Printf("Warning: Failed to recreate indexes for %s.%s: %v", database, collection, err)
 		} else {
-			log.Printf("Successfully recreated %d indexes for %s.%s", len(dataResp.Indexes), database, collection)
+			log.Printf("Successfully recreated %d indexes for %s.%s", len(pageResult.Indexes), database, collection)
 		}
 	}
 
 	// Apply collection options if provided
-	if dataResp.CollectionOptions != nil {
-		if err := applyCollectionOptions(ctx, mongoClient.Database(database), collection, dataResp.CollectionOptions); err != nil {
+	if pageResult.CollectionOptions != nil {
+		if err := applyCollectionOptions(ctx, mongoClient.Database(database), collection, pageResult.CollectionOptions); err != nil {
 			log.Printf("Warning: Failed to apply collection options for %s.%s: %v", database, collection, err)
 		} else {
 			log.Printf("Successfully applied collection options for %s.%s", database, collection)
@@ -443,13 +749,13 @@ func syncCollectionData(database, collection string) error {
 	}
 
 	// Store snapshot fence information for change stream coordination
-	if dataResp.SnapshotFence != nil {
+	if pageResult.SnapshotFence != nil {
 		log.Printf("Snapshot completed with fence - ClusterTime: %v, OperationTime: %v", 
-			dataResp.SnapshotFence.ClusterTime, dataResp.SnapshotFence.OperationTime)
+			pageResult.SnapshotFence.ClusterTime, pageResult.SnapshotFence.OperationTime)
 		
 		// Validate that change streams can start consistently with this fence
 		if clusterFence != nil && clusterFence.IsEnabled() {
-			if err := clusterFence.ValidateChangeStreamStart(convertToSnapshotFence(dataResp.SnapshotFence), dataResp.SnapshotFence.OperationTime); err != nil {
+			if err := clusterFence.ValidateChangeStreamStart(convertToSnapshotFence(pageResult.SnapshotFence), pageResult.SnapshotFence.OperationTime); err != nil {
 				log.Printf("Warning: Change stream coordination validation failed: %v", err)
 			} else {
 				log.Printf("Change stream coordination validated successfully for %s.%s", database, collection)
@@ -458,8 +764,54 @@ func syncCollectionData(database, collection string) error {
 	} else {
 		log.Printf("No snapshot fence provided - change stream coordination may have gaps")
 	}
-
+	
 	return nil
+}
+
+// insertDocumentsBatch inserts a batch of documents efficiently
+func insertDocumentsBatch(database, collection string, documents []bson.Raw) error {
+	if len(documents) == 0 {
+		return nil
+	}
+	
+	coll := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Insert documents in smaller batches to avoid memory issues
+	batchSize := 1000
+	for i := 0; i < len(documents); i += batchSize {
+		end := i + batchSize
+		if end > len(documents) {
+			end = len(documents)
+		}
+
+		// Convert bson.Raw to []interface{} for InsertMany
+		batch := make([]interface{}, 0, end-i)
+		for j := i; j < end; j++ {
+			var doc bson.M
+			if err := bson.Unmarshal(documents[j], &doc); err != nil {
+				log.Printf("Error unmarshaling document: %v", err)
+				continue
+			}
+			batch = append(batch, doc)
+		}
+
+		if len(batch) > 0 {
+			if _, err := coll.InsertMany(ctx, batch); err != nil {
+				return fmt.Errorf("failed to insert batch: %v", err)
+			}
+		}
+	}
+	
+	return nil
+}
+
+// Legacy function - keeping for compatibility but replacing with parallel version
+func syncCollectionDataSequential(database, collection string) error {
+	// This function has been replaced by the parallel version above
+	// Keeping for reference only
+	return fmt.Errorf("sequential sync has been replaced by parallel sync")
 }
 
 // convertToSnapshotFence converts SnapshotFenceInfo to SnapshotFence

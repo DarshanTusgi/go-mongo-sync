@@ -41,6 +41,7 @@ type ServerConfig struct {
 	ReadTimeout  time.Duration `yaml:"read_timeout"`
 	WriteTimeout time.Duration `yaml:"write_timeout"`
 	IdleTimeout  time.Duration `yaml:"idle_timeout"`
+	DataTimeout  time.Duration `yaml:"data_timeout"`
 }
 
 // WebSocketConfig represents WebSocket settings

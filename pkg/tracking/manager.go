@@ -145,6 +145,11 @@ func (tt *TransferTracker) GetUntransferredDocuments(clientID, database, collect
 		return allDocumentIDs, nil
 	}
 
+	// If no document IDs provided, return empty slice
+	if len(allDocumentIDs) == 0 {
+		return []primitive.ObjectID{}, nil
+	}
+
 	ctx := context.Background()
 	filter := bson.M{
 		"client_id":  clientID,

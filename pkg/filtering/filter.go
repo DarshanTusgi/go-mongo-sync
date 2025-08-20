@@ -71,6 +71,17 @@ func (fe *FilterEngine) ApplyFieldFilter(doc map[string]interface{}, filter *mod
 
 // BuildDocumentFilterPipeline creates MongoDB aggregation pipeline for document filtering
 func (fe *FilterEngine) BuildDocumentFilterPipeline(filter *models.DocumentFilter) []bson.M {
+	return fe.buildDocumentFilterPipelineWithPrefix(filter, "")
+}
+
+// BuildChangeStreamDocumentFilterPipeline creates MongoDB aggregation pipeline for change stream document filtering
+// In change streams, document fields are nested under "fullDocument"
+func (fe *FilterEngine) BuildChangeStreamDocumentFilterPipeline(filter *models.DocumentFilter) []bson.M {
+	return fe.buildDocumentFilterPipelineWithPrefix(filter, "fullDocument.")
+}
+
+// buildDocumentFilterPipelineWithPrefix creates MongoDB aggregation pipeline for document filtering with optional field prefix
+func (fe *FilterEngine) buildDocumentFilterPipelineWithPrefix(filter *models.DocumentFilter, fieldPrefix string) []bson.M {
 	var pipeline []bson.M
 
 	if filter == nil || len(filter.Criteria) == 0 {
@@ -80,28 +91,43 @@ func (fe *FilterEngine) BuildDocumentFilterPipeline(filter *models.DocumentFilte
 	matchConditions := bson.M{}
 
 	for _, criteria := range filter.Criteria {
+		fieldName := fieldPrefix + criteria.Field
 		switch strings.ToLower(criteria.Operator) {
 		case "eq":
-			matchConditions[criteria.Field] = criteria.Value
+			matchConditions[fieldName] = criteria.Value
 		case "ne":
-			matchConditions[criteria.Field] = bson.M{"$ne": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$ne": criteria.Value}
 		case "in":
-			matchConditions[criteria.Field] = bson.M{"$in": criteria.Value}
+			// Validate that criteria.Value is a slice/array for $in operator
+			if reflect.TypeOf(criteria.Value).Kind() == reflect.Slice {
+				v := reflect.ValueOf(criteria.Value)
+				if v.Len() > 0 {
+					matchConditions[fieldName] = bson.M{"$in": criteria.Value}
+				}
+				// If empty slice, skip this condition to avoid MongoDB error
+			}
 		case "nin":
-			matchConditions[criteria.Field] = bson.M{"$nin": criteria.Value}
+			// Validate that criteria.Value is a slice/array for $nin operator
+			if reflect.TypeOf(criteria.Value).Kind() == reflect.Slice {
+				v := reflect.ValueOf(criteria.Value)
+				if v.Len() > 0 {
+					matchConditions[fieldName] = bson.M{"$nin": criteria.Value}
+				}
+				// If empty slice, skip this condition to avoid MongoDB error
+			}
 		case "gt":
-			matchConditions[criteria.Field] = bson.M{"$gt": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$gt": criteria.Value}
 		case "gte":
-			matchConditions[criteria.Field] = bson.M{"$gte": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$gte": criteria.Value}
 		case "lt":
-			matchConditions[criteria.Field] = bson.M{"$lt": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$lt": criteria.Value}
 		case "lte":
-			matchConditions[criteria.Field] = bson.M{"$lte": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$lte": criteria.Value}
 		case "regex":
-			matchConditions[criteria.Field] = bson.M{"$regex": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$regex": criteria.Value}
 		default:
 			// Default to equality if operator is not recognized
-			matchConditions[criteria.Field] = criteria.Value
+			matchConditions[fieldName] = criteria.Value
 		}
 	}
 

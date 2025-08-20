@@ -79,14 +79,18 @@ func (ctf *ClusterTimeFence) CaptureSnapshotFence(ctx context.Context, database 
 	}
 	defer session.EndSession(ctx)
 
-	// Perform a lightweight read operation to get current cluster time
+	// Perform a lightweight read operation within the session context to get current cluster time
 	// We use a ping-like operation on the admin database
 	db := ctf.client.Database(database)
 	var result bson.M
 
 	// Use majority read concern to ensure we get a consistent cluster time
 	opts := options.RunCmd()
-	err = db.RunCommand(ctx, bson.D{{"ping", 1}}, opts).Decode(&result)
+	
+	// Execute the command within the session context
+	err = mongo.WithSession(ctx, session, func(sc mongo.SessionContext) error {
+		return db.RunCommand(sc, bson.D{{"ping", 1}}, opts).Decode(&result)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to capture cluster time: %v", err)
 	}
@@ -96,7 +100,16 @@ func (ctf *ClusterTimeFence) CaptureSnapshotFence(ctx context.Context, database 
 	operationTime := session.OperationTime()
 
 	if clusterTime == nil {
-		return nil, fmt.Errorf("no cluster time available from session")
+		// If cluster time is still not available, try to extract from result
+		if clusterTimeRaw, ok := result["$clusterTime"]; ok {
+			if clusterTimeBytes, err := bson.Marshal(clusterTimeRaw); err == nil {
+				clusterTime = bson.Raw(clusterTimeBytes)
+			}
+		}
+		
+		if clusterTime == nil {
+			return nil, fmt.Errorf("no cluster time available from session")
+		}
 	}
 
 	fence := &SnapshotFence{

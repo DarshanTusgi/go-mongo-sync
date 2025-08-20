@@ -1,0 +1,97 @@
+# Test configuration without restrictive filters
+server:
+  port: 8080
+  host: "localhost"
+  read_timeout: "300s"   # Increased for large data transfers
+  write_timeout: "300s"  # Increased for large data transfers
+  idle_timeout: "60s"
+  data_timeout: "600s"   # 10 minutes for large data requests
+
+mongodb:
+  uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
+  timeout: 30s
+  databases:
+    - name: "sync-test-db"
+      enabled: true
+      priority: 1
+      collections:
+        - name: "products"
+          enabled: true
+          batch_size: 100   # Very small batches for reliable transfers
+          priority: 1
+          field_filter:
+            include_fields: ["_id", "name", "price", "category", "status", "createdAt"]
+            always_include: ["_id"]
+        - name: "users"
+          enabled: true
+          batch_size: 100   # Very small batches for reliable transfers
+          priority: 2
+          field_filter:
+            include_fields: ["_id", "name", "email", "status", "createdAt"]
+            always_include: ["_id"]
+        - name: "orders"
+          enabled: true
+          batch_size: 100   # Very small batches for reliable transfers
+          priority: 3
+          field_filter:
+            include_fields: ["_id", "userId", "total", "status", "orderDate", "createdAt"]
+            always_include: ["_id"]
+
+# WebSocket configuration
+websocket:
+  enabled: true
+  endpoint: "/ws"
+  max_connections: 100
+  ping_interval: "30s"
+  pong_timeout: "10s"
+
+logging:
+  level: "debug"
+  format: "text"
+  output: "stdout"
+
+metrics:
+  enabled: true
+  port: 9090
+  path: "/metrics"
+
+# Encryption configuration
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  key_id: "cloud-sync-key-001"
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"  # Base64 encoded 32-byte key
+
+# Checkpoint configuration for resumable synchronization
+checkpoint:
+  enabled: true
+  database: "sync_checkpoints"
+  collection: "resume_tokens"
+  save_interval_seconds: 5
+  cleanup_enabled: true
+  retention_days: 30
+
+# Transfer tracking configuration
+tracking:
+  enabled: true
+  mongo_uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
+  database: "sync_tracking"
+  transfer_collection: "transfer_records"
+  state_collection: "client_sync_states"
+  batch_collection: "transfer_batches"
+
+# Sequence number generation for ordered event processing
+sequence:
+  enabled: true
+  database: "sync_sequences"
+  collection: "sequence_counters"
+  batch_size: 1000
+  node_id: "cloud-sync-node-001"
+
+# Cluster time fence for snapshot consistency
+fence:
+  enabled: true
+
+# License validation
+license:
+  validation_enabled: false  # Keep disabled for testing

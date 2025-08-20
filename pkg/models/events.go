@@ -42,6 +42,10 @@ type DataRequest struct {
 	CountOnly      bool   `json:"countOnly,omitempty"`
 	PartitionIndex *int   `json:"partitionIndex,omitempty"`
 	UsePartitioning bool  `json:"usePartitioning,omitempty"`
+	// Pagination support
+	PageSize       int    `json:"pageSize,omitempty"`       // Number of documents per page (default: 1000)
+	PageNumber     int    `json:"pageNumber,omitempty"`     // Page number (0-based, default: 0)
+	LastDocumentID string `json:"lastDocumentId,omitempty"` // For cursor-based pagination
 }
 
 // DataResponse represents the response with data using BSON for type preservation
@@ -57,6 +61,8 @@ type DataResponse struct {
 	// Index and collection metadata synchronization
 	Indexes       []IndexInfo              `json:"indexes,omitempty" bson:"indexes,omitempty"`
 	CollectionOptions *CollectionOptions   `json:"collection_options,omitempty" bson:"collection_options,omitempty"`
+	// Pagination metadata
+	Pagination    *PaginationInfo          `json:"pagination,omitempty" bson:"pagination,omitempty"`
 }
 
 // SnapshotFenceInfo contains cluster time information for snapshot coordination
@@ -100,4 +106,25 @@ type CollectionOptions struct {
 	ValidationAction string `json:"validationAction,omitempty" bson:"validationAction,omitempty"`
 	Collation      bson.Raw `json:"collation,omitempty" bson:"collation,omitempty"`
 	ChangeStreamPreAndPostImages bson.Raw `json:"changeStreamPreAndPostImages,omitempty" bson:"changeStreamPreAndPostImages,omitempty"`
+}
+
+// PageResult represents the result of fetching a single page for push-based sync
+type PageResult struct {
+	PageNumber        int                  `json:"pageNumber" bson:"pageNumber"`
+	Documents         []bson.Raw           `json:"documents" bson:"documents"`
+	Indexes           []IndexInfo          `json:"indexes,omitempty" bson:"indexes,omitempty"`
+	CollectionOptions *CollectionOptions   `json:"collectionOptions,omitempty" bson:"collectionOptions,omitempty"`
+	SnapshotFence     *SnapshotFenceInfo   `json:"snapshotFence,omitempty" bson:"snapshotFence,omitempty"`
+	IsLastPage        bool                 `json:"isLastPage" bson:"isLastPage"`
+}
+
+// PaginationInfo contains pagination metadata for data responses
+type PaginationInfo struct {
+	PageSize       int    `json:"pageSize" bson:"pageSize"`             // Number of documents per page
+	PageNumber     int    `json:"pageNumber" bson:"pageNumber"`         // Current page number (0-based)
+	TotalPages     int    `json:"totalPages" bson:"totalPages"`         // Total number of pages
+	TotalDocuments int64  `json:"totalDocuments" bson:"totalDocuments"` // Total number of documents
+	HasNextPage    bool   `json:"hasNextPage" bson:"hasNextPage"`       // Whether there are more pages
+	HasPrevPage    bool   `json:"hasPrevPage" bson:"hasPrevPage"`       // Whether there are previous pages
+	LastDocumentID string `json:"lastDocumentId,omitempty" bson:"lastDocumentId,omitempty"` // Last document ID for cursor-based pagination
 }

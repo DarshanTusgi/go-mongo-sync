@@ -18,6 +18,7 @@ cloud_sync:
   # Development URLs (replace with ${CLOUD_SYNC_URL} and ${CLOUD_SYNC_WS_URL} for production)
   http_url: "http://localhost:8080"
   ws_url: "ws://localhost:8080/ws"
+  http_timeout: "600s"  # 10 minutes for large data transfers
 
 mongodb:
   # Development URI (replace with ${MONGODB_URI} for production)
@@ -38,9 +39,9 @@ collections:
 sync:
   initial_sync: true
   realtime_sync: true
-  batch_size: 100      # Increase to 1000 for production
+  batch_size: 100      # Very small batches for reliable transfers
   parallel_collections: true
-  max_workers: 4       # Increase to 8 for production
+  max_workers: 8       # Optimized for high-volume sync
   retry_attempts: 3    # Number of retry attempts for failed operations
   retry_delay: "5s"    # Delay between retry attempts
 
@@ -67,7 +68,7 @@ encryption:
 connection:
   reconnect_interval: "5s"
   max_reconnect_attempts: 10
-  connection_timeout: "30s"
+  connection_timeout: "300s"  # Increased for large data transfers
   keepalive_interval: "30s"
 
 # Logging configuration
@@ -79,8 +80,8 @@ logging:
 
 # Performance tuning
 performance:
-  buffer_size: 1000
-  flush_interval: "1s"
+  buffer_size: 10000
+  flush_interval: "500ms"
   max_batch_wait: "5s"
   compression_enabled: true
 
