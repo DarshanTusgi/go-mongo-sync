@@ -7,6 +7,7 @@ type Config struct {
 	Server          ServerConfig          `yaml:"server"`
 	MongoDB         MongoDBConfig         `yaml:"mongodb"`
 	WebSocket       WebSocketConfig       `yaml:"websocket"`
+	Sync            SyncConfig            `yaml:"sync"`
 	InternalCluster InternalClusterConfig `yaml:"internal_cluster"`
 	Encryption      EncryptionConfig      `yaml:"encryption"`
 	Checkpoint      CheckpointConfig      `yaml:"checkpoint"`
@@ -62,6 +63,7 @@ type CloudSyncSettings struct {
 type SyncConfig struct {
 	InitialSync        bool `yaml:"initial_sync"`
 	RealtimeSync       bool `yaml:"realtime_sync"`
+	ResumableInitialSync bool `yaml:"resumable_initial_sync"` // Enable resumable initial sync to avoid full re-sync on restart
 	BatchSize          int  `yaml:"batch_size"`
 	ParallelCollections bool `yaml:"parallel_collections"`
 	MaxWorkers         int  `yaml:"max_workers"`

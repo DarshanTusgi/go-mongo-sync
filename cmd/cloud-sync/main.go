@@ -362,7 +362,7 @@ func startPushBasedSync() {
 			}
 			
 			log.Printf("Starting push for %s.%s", dbConfig.Name, collConfig.Name)
-			if err := pushCollectionData(vmSyncEndpoint, dbConfig.Name, collConfig.Name); err != nil {
+			if err := pushCollectionDataWithResume(vmSyncEndpoint, dbConfig.Name, collConfig.Name); err != nil {
 				log.Printf("Error pushing data for %s.%s: %v", dbConfig.Name, collConfig.Name, err)
 			} else {
 				log.Printf("Successfully pushed data for %s.%s", dbConfig.Name, collConfig.Name)
@@ -403,6 +403,230 @@ func pushCollectionData(vmSyncEndpoint, database, collection string) error {
 	}
 	
 	return nil
+}
+
+// pushCollectionDataWithResume handles resumable initial sync logic
+func pushCollectionDataWithResume(vmSyncEndpoint, database, collection string) error {
+	// Extract client ID from vm-sync endpoint or use default
+	clientID := "vm-sync-default" // TODO: Extract from X-Client-ID header in future
+	
+	// Check if resumable initial sync is enabled from config
+	resumableEnabled := config.Sync.ResumableInitialSync
+	
+	if !resumableEnabled || transferTracker == nil || !transferTracker.IsEnabled() {
+		log.Printf("Resumable sync disabled or transfer tracker unavailable, performing full sync for %s.%s", database, collection)
+		return pushCollectionData(vmSyncEndpoint, database, collection)
+	}
+	
+	// Check client sync state
+	syncState, err := transferTracker.GetClientSyncState(clientID, database, collection)
+	if err != nil {
+		log.Printf("Error getting sync state for %s.%s: %v, falling back to full sync", database, collection, err)
+		return pushCollectionData(vmSyncEndpoint, database, collection)
+	}
+	
+	if syncState == nil || !syncState.InitialSyncCompleted {
+		log.Printf("No previous sync state found for %s.%s, performing full sync", database, collection)
+		return pushCollectionData(vmSyncEndpoint, database, collection)
+	}
+	
+	// Check if there are new documents to sync incrementally
+	log.Printf("Found completed sync state for %s.%s (last synced: %v, documents: %d)", 
+		database, collection, syncState.LastSyncedAt, syncState.TotalDocumentsTransferred)
+	
+	// Implement incremental sync logic
+	return pushIncrementalData(vmSyncEndpoint, database, collection, clientID, syncState)
+}
+
+// validateSyncStateConsistency validates the sync state before resuming
+func validateSyncStateConsistency(database, collection, clientID string, syncState *tracking.ClientSyncState) error {
+	coll := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	
+	// Validate that LastSyncedDocumentID exists in the collection
+	if syncState.LastSyncedDocumentID != nil {
+		filter := bson.M{"_id": syncState.LastSyncedDocumentID}
+		count, err := coll.CountDocuments(ctx, filter)
+		if err != nil {
+			return fmt.Errorf("failed to validate last synced document: %v", err)
+		}
+		if count == 0 {
+			log.Printf("WARNING: LastSyncedDocumentID %v not found in %s.%s, may indicate data inconsistency", syncState.LastSyncedDocumentID, database, collection)
+			// Don't fail here, just log warning as document might have been deleted
+		}
+	}
+	
+	// Validate document count consistency
+	if syncState.TotalDocumentsTransferred > 0 {
+		currentCount, err := coll.CountDocuments(ctx, bson.M{})
+		if err != nil {
+			return fmt.Errorf("failed to count current documents: %v", err)
+		}
+		
+		// Log validation info - don't fail on count variance as collections can grow
+		log.Printf("Sync state validation for %s.%s: current_count=%d, transferred=%d, initial_sync_completed=%v", 
+			database, collection, currentCount, syncState.TotalDocumentsTransferred, syncState.InitialSyncCompleted)
+		
+		// Only validate if initial sync was completed and we have a reasonable baseline
+		if syncState.InitialSyncCompleted && currentCount < syncState.TotalDocumentsTransferred {
+			log.Printf("WARNING: Current document count (%d) is less than transferred count (%d) for %s.%s", 
+				currentCount, syncState.TotalDocumentsTransferred, database, collection)
+			// Don't fail here as documents might have been deleted
+		}
+	}
+	
+	return nil
+}
+
+// validateIncrementalSyncIntegrity validates data integrity during incremental sync
+func validateIncrementalSyncIntegrity(database, collection string, expectedCount, actualCount int64) error {
+	if actualCount != expectedCount {
+		return fmt.Errorf("incremental sync count mismatch for %s.%s: expected %d, got %d", database, collection, expectedCount, actualCount)
+	}
+	log.Printf("Incremental sync integrity validated for %s.%s: %d documents", database, collection, actualCount)
+	return nil
+}
+
+// pushIncrementalData pushes only new documents after the last synced document ID
+func pushIncrementalData(vmSyncEndpoint, database, collection, clientID string, syncState *tracking.ClientSyncState) error {
+	coll := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	
+	// Validate sync state consistency before proceeding
+	if err := validateSyncStateConsistency(database, collection, clientID, syncState); err != nil {
+		log.Printf("Sync state validation failed for %s.%s: %v", database, collection, err)
+		return fmt.Errorf("sync state validation failed: %v", err)
+	}
+	
+	// Build filter to find documents after LastSyncedDocumentID
+	filter := bson.M{}
+	if syncState.LastSyncedDocumentID != nil {
+		filter["_id"] = bson.M{"$gt": syncState.LastSyncedDocumentID}
+	}
+	
+	// Count new documents
+	newDocCount, err := coll.CountDocuments(ctx, filter)
+	if err != nil {
+		return fmt.Errorf("failed to count new documents: %v", err)
+	}
+	
+	if newDocCount == 0 {
+		log.Printf("No new documents found for %s.%s, sync is up to date", database, collection)
+		return nil
+	}
+	
+	log.Printf("Found %d new documents for incremental sync of %s.%s", newDocCount, database, collection)
+	
+	// Calculate pages for incremental sync
+	pageSize := 1000
+	if config.Sync.BatchSize > 0 {
+		pageSize = config.Sync.BatchSize
+	}
+	
+	totalPages := int((newDocCount + int64(pageSize) - 1) / int64(pageSize))
+	log.Printf("Starting incremental sync for %s.%s: %d new documents in %d pages", database, collection, newDocCount, totalPages)
+	
+	// Push incremental data page by page with validation
+	var totalPushedDocs int64
+	for pageNumber := 0; pageNumber < totalPages; pageNumber++ {
+		pushedCount, err := pushIncrementalPageWithValidation(ctx, vmSyncEndpoint, database, collection, pageNumber, pageSize, totalPages, filter)
+		if err != nil {
+			return fmt.Errorf("failed to push incremental page %d: %v", pageNumber, err)
+		}
+		totalPushedDocs += pushedCount
+	}
+	
+	// Validate that we pushed the expected number of documents
+	if err := validateIncrementalSyncIntegrity(database, collection, newDocCount, totalPushedDocs); err != nil {
+		return fmt.Errorf("incremental sync validation failed: %v", err)
+	}
+	
+	log.Printf("Completed incremental sync for %s.%s: validated %d documents", database, collection, totalPushedDocs)
+	return nil
+}
+
+// pushIncrementalPageWithValidation pushes a single page of incremental data and returns document count
+func pushIncrementalPageWithValidation(ctx context.Context, vmSyncEndpoint, database, collection string, pageNumber, pageSize, totalPages int, filter bson.M) (int64, error) {
+	count, err := pushIncrementalPageInternal(ctx, vmSyncEndpoint, database, collection, pageNumber, pageSize, totalPages, filter)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// pushIncrementalPage pushes a single page of incremental data
+func pushIncrementalPage(ctx context.Context, vmSyncEndpoint, database, collection string, pageNumber, pageSize, totalPages int, filter bson.M) error {
+	_, err := pushIncrementalPageInternal(ctx, vmSyncEndpoint, database, collection, pageNumber, pageSize, totalPages, filter)
+	return err
+}
+
+// pushIncrementalPageInternal is the internal implementation that returns document count
+func pushIncrementalPageInternal(ctx context.Context, vmSyncEndpoint, database, collection string, pageNumber, pageSize, totalPages int, filter bson.M) (int64, error) {
+	coll := mongoClient.Database(database).Collection(collection)
+	
+	// Find documents for this page
+	skip := int64(pageNumber * pageSize)
+	limit := int64(pageSize)
+	
+	findOptions := options.Find().
+		SetSkip(skip).
+		SetLimit(limit).
+		SetSort(bson.D{{"_id", 1}}) // Sort by _id for consistent pagination
+	
+	cursor, err := coll.Find(ctx, filter, findOptions)
+	if err != nil {
+		return 0, fmt.Errorf("failed to find documents: %v", err)
+	}
+	defer cursor.Close(ctx)
+	
+	// Collect documents
+	var documents []bson.Raw
+	for cursor.Next(ctx) {
+		documents = append(documents, cursor.Current)
+	}
+	
+	if err := cursor.Err(); err != nil {
+		return 0, fmt.Errorf("cursor error: %v", err)
+	}
+	
+	// Create page result for incremental data
+	pageResult := map[string]interface{}{
+		"pageNumber": pageNumber + 1, // 1-indexed for consistency
+		"documents":  documents,
+		"isLastPage": pageNumber == totalPages-1,
+		"error":      nil,
+	}
+	
+	// Only include indexes and collection options on first page
+	if pageNumber == 0 {
+		// For incremental sync, we don't need to recreate indexes/options
+		// as they should already exist from the initial sync
+		pageResult["indexes"] = []interface{}{}
+		pageResult["collectionOptions"] = nil
+	}
+	
+	// Marshal and send
+	jsonData, err := json.Marshal(pageResult)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal page result: %v", err)
+	}
+	
+	resp, err := http.Post(vmSyncEndpoint, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return 0, fmt.Errorf("failed to send incremental data: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("vm-sync returned error %d: %s", resp.StatusCode, string(body))
+	}
+	
+	documentCount := int64(len(documents))
+	log.Printf("Pushed incremental page %d/%d for %s.%s (%d documents)", pageNumber+1, totalPages, database, collection, documentCount)
+	return documentCount, nil
 }
 
 func pushSinglePage(ctx context.Context, vmSyncEndpoint, database, collection string, pageNumber, pageSize, totalPages int) error {
@@ -586,15 +810,24 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			log.Printf("vm-sync client license validated successfully: %s", vmLicense.String())
 
 			// Send success response
-			conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"license_accepted","message":"License validated successfully"}`))
-		} else {
-			log.Printf("Expected text message for license, got message type: %d", messageType)
-			conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"License must be sent as text message"}`))
-			return
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"license_accepted","message":"License validated successfully"}`))
+		
+		// Trigger resumable sync for vm-sync client connection
+		if config.Sync.ResumableInitialSync {
+			log.Printf("Triggering resumable sync for vm-sync client: %s", clientInfo.ClientID)
+			go func() {
+				// Start push-based sync for this client
+				startPushBasedSync()
+			}()
 		}
+	} else {
+		log.Printf("Expected text message for license, got message type: %d", messageType)
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"License must be sent as text message"}`))
+		return
+	}
 
-		// Clear read deadline after license validation
-		conn.SetReadDeadline(time.Time{})
+	// Clear read deadline after license validation
+	conn.SetReadDeadline(time.Time{})
 	}
 
 	clients[conn] = clientInfo

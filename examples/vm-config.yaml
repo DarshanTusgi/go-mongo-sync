@@ -39,6 +39,7 @@ collections:
 sync:
   initial_sync: true
   realtime_sync: true
+  resumable_initial_sync: true  # Enable to resume from last sync state instead of full re-sync
   batch_size: 100      # Very small batches for reliable transfers
   parallel_collections: true
   max_workers: 8       # Optimized for high-volume sync

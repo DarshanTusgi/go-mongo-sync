@@ -101,6 +101,15 @@ websocket:
   ping_interval: "30s"
   pong_timeout: "10s"
 
+# Sync configuration
+sync:
+  initial_sync: true
+  realtime_sync: true
+  resumable_initial_sync: true  # Enable resumable initial sync to avoid full re-sync on restart
+  batch_size: 1000
+  parallel_collections: true
+  max_workers: 4
+
 # Encryption configuration
 encryption:
   enabled: true

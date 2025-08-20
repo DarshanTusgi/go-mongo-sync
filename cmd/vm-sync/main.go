@@ -47,6 +47,7 @@ type Config struct {
 	Sync struct {
 		InitialSync        bool `yaml:"initial_sync"`
 		RealtimeSync       bool `yaml:"realtime_sync"`
+		ResumableInitialSync bool `yaml:"resumable_initial_sync"`
 		BatchSize          int  `yaml:"batch_size"`
 		ParallelCollections bool `yaml:"parallel_collections"`
 		MaxWorkers         int  `yaml:"max_workers"`
@@ -318,16 +319,33 @@ func processPushedData(database, collection string, pageResult *PageResult) erro
 		return fmt.Errorf("page result contains error: %v", pageResult.Error)
 	}
 	
-	// Clear collection on first page
+	// Clear collection on first page (unless resumable sync is enabled and we're resuming)
 	if pageResult.PageNumber == 1 {
-		coll := mongoClient.Database(database).Collection(collection)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		shouldDropCollection := true
 		
-		if err := coll.Drop(ctx); err != nil {
-			log.Printf("Warning: Failed to drop collection %s.%s: %v", database, collection, err)
+		// Check if resumable initial sync is enabled
+		if config.Sync.ResumableInitialSync {
+			// Check if we have existing checkpoint data indicating a previous sync
+			if checkpointMgr != nil {
+				if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil {
+					log.Printf("Found existing checkpoint for %s.%s, skipping collection drop for resumable sync", database, collection)
+					shouldDropCollection = false
+				}
+			}
 		}
-		log.Printf("Cleared collection %s.%s for fresh sync", database, collection)
+		
+		if shouldDropCollection {
+			coll := mongoClient.Database(database).Collection(collection)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			
+			if err := coll.Drop(ctx); err != nil {
+				log.Printf("Warning: Failed to drop collection %s.%s: %v", database, collection, err)
+			}
+			log.Printf("Cleared collection %s.%s for fresh sync", database, collection)
+		} else {
+			log.Printf("Resuming sync for %s.%s, keeping existing data", database, collection)
+		}
 	}
 	
 	// Insert documents if any
