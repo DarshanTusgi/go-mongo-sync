@@ -28,13 +28,8 @@ mongodb:
 # Collections to sync (filtering is handled by cloud-sync)
 # Format: "source-db.collection:target-db.collection" or "source-db.collection" (uses same name)
 collections:
-  - "sync-test-db.products"
-  - "sync-test-db.users"
-  - "sync-test-db.orders"
-  - "test_db.items"
-  - "test_db.categories"
-  - "test_db.failure_test"
-
+  - "new_test_db.orders"
+  - "new_test_db_2.orders"
 # Sync configuration
 sync:
   initial_sync: true

@@ -37,6 +37,7 @@ import (
 	"go-data-sync-http/pkg/metrics"
 	"go-data-sync-http/pkg/logging"
 	"go-data-sync-http/pkg/license"
+	"go-data-sync-http/pkg/memory"
 )
 
 
@@ -82,6 +83,16 @@ var (
 	syncPausedMutex  sync.RWMutex
 	restartChan      = make(chan bool, 1)
 	shutdownChan     = make(chan bool, 1)
+	
+	// VM-sync connection tracking
+	vmSyncConnected     = make(chan bool, 1) // Signal when first vm-sync client connects
+	vmSyncConnectedOnce bool                 // Track if vm-sync has connected at least once
+	vmSyncMutex         sync.RWMutex         // Protect vm-sync connection state
+	
+	// Change buffering for disconnected vm-sync clients
+	memoryManager       *memory.Manager      // Memory manager for change buffering
+	changeBuffer        *memory.Buffer       // Buffer for changes during disconnection
+	bufferMutex         sync.RWMutex         // Protect buffer operations
 )
 
 func main() {
@@ -229,6 +240,62 @@ func main() {
 		"cloud_license": licenseValidator.GetCloudLicense().String(),
 	})
 
+	// Initialize memory manager for change buffering
+	log.Println("Initializing memory manager...")
+	memoryConfig := memory.DefaultConfig()
+	memoryManager = memory.NewManager(memoryConfig)
+	changeBuffer = memoryManager.GetBuffer("vm-sync-changes")
+	log.Println("Memory manager initialized successfully")
+	
+	// Set up flush callback to replay buffered changes when vm-sync reconnects
+	changeBuffer.SetFlushCallback(func(events []*memory.ChangeEvent) {
+		log.Printf("Replaying %d buffered changes to reconnected vm-sync clients", len(events))
+		for _, event := range events {
+			// Convert memory.ChangeEvent back to models.ChangeEvent and broadcast
+			// Parse namespace to extract database and collection
+			parts := strings.Split(event.Namespace, ".")
+			if len(parts) != 2 {
+				log.Printf("Invalid namespace format: %s", event.Namespace)
+				continue
+			}
+			
+			// Convert map[string]interface{} to bson.Raw
+			var docKeyRaw, fullDocRaw bson.Raw
+			if event.DocumentKey != nil {
+				docKeyBytes, err := bson.Marshal(event.DocumentKey)
+				if err != nil {
+					log.Printf("Failed to marshal DocumentKey: %v", err)
+					continue
+				}
+				docKeyRaw = bson.Raw(docKeyBytes)
+			}
+			if event.FullDocument != nil {
+				fullDocBytes, err := bson.Marshal(event.FullDocument)
+				if err != nil {
+					log.Printf("Failed to marshal FullDocument: %v", err)
+					continue
+				}
+				fullDocRaw = bson.Raw(fullDocBytes)
+			}
+			
+			changeEvent := models.ChangeEvent{
+				OperationType: event.OperationType,
+				Database:      parts[0],
+				Collection:    parts[1],
+				DocumentKey:   docKeyRaw,
+				FullDocument:  fullDocRaw,
+				Timestamp:     event.Timestamp,
+			}
+			broadcast <- changeEvent
+		}
+	})
+	log.Println("Change buffer flush callback configured successfully")
+	log.Println("Memory manager and change buffer initialized for vm-sync disconnection handling")
+	appLogger.Info("cloud-sync", "startup", "Change buffering system initialized", map[string]interface{}{
+		"max_events": memoryConfig.MaxChangeEvents,
+		"flush_size": memoryConfig.BufferFlushSize,
+	})
+
 	// Start metrics calculation goroutine
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -337,9 +404,27 @@ func main() {
 func startPushBasedSync() {
 	log.Println("Starting push-based synchronization...")
 	
-	// Wait a bit for vm-sync to start up
-	time.Sleep(5 * time.Second)
+	// Wait for vm-sync to connect via WebSocket before starting initial data dump
+	log.Println("Waiting for vm-sync client to connect via WebSocket...")
+	select {
+	case <-vmSyncConnected:
+		log.Println("vm-sync client connected, proceeding with initial data dump")
+	case <-time.After(10 * time.Minute): // Timeout after 10 minutes
+		log.Println("Timeout waiting for vm-sync connection, proceeding with sync anyway")
+	}
 	
+	startSyncProcess()
+}
+
+// startCatchUpSync handles catch-up synchronization for reconnected vm-sync clients
+// It skips the WebSocket connection wait since the client is already connected
+func startCatchUpSync() {
+	log.Println("Starting catch-up synchronization for reconnected vm-sync client...")
+	startSyncProcess()
+}
+
+// startSyncProcess contains the common sync logic used by both initial and catch-up sync
+func startSyncProcess() {
 	// Get vm-sync endpoint from environment or use default
 	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
 	if vmSyncEndpoint == "" {
@@ -810,7 +895,33 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			log.Printf("vm-sync client license validated successfully: %s", vmLicense.String())
 
 			// Send success response
-		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"license_accepted","message":"License validated successfully"}`))
+			conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"license_accepted","message":"License validated successfully"}`))
+		
+			// Signal that vm-sync has connected
+			vmSyncMutex.Lock()
+			isFirstConnection := !vmSyncConnectedOnce
+			if isFirstConnection {
+				vmSyncConnectedOnce = true
+				select {
+				case vmSyncConnected <- true:
+					log.Println("Signaled vm-sync connection to waiting sync process")
+				default:
+					// Channel already has a value, no need to send again
+				}
+			} else {
+				// This is a reconnection - trigger catch-up sync
+				log.Printf("vm-sync client %s reconnected, triggering catch-up sync", clientInfo.ClientID)
+				appLogger.Info("websocket", "vm_sync_reconnected", "VM-sync client reconnected, starting catch-up sync", map[string]interface{}{
+					"client_id": clientInfo.ClientID,
+					"reconnected_at": time.Now(),
+				})
+				
+				// Start catch-up sync in a separate goroutine
+				go func() {
+					startCatchUpSync()
+				}()
+			}
+			vmSyncMutex.Unlock()
 		
 		// Trigger resumable sync for vm-sync client connection
 		if config.Sync.ResumableInitialSync {
@@ -844,6 +955,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		messageType, messageData, err := conn.ReadMessage()
 		if err != nil {
 			log.Printf("Client disconnected: %v", err)
+			
+			// Track vm-sync disconnection for reconnection handling
+			if clientInfo.ClientType == "vm-sync" {
+				log.Printf("vm-sync client %s disconnected, tracking for reconnection", clientInfo.ClientID)
+				appLogger.Info("websocket", "vm_sync_disconnected", "VM-sync client disconnected", map[string]interface{}{
+					"client_id": clientInfo.ClientID,
+					"disconnected_at": time.Now(),
+				})
+			}
+			
 			delete(clients, conn)
 			log.Printf("Client removed. Total clients: %d", len(clients))
 			break
@@ -872,6 +993,27 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Helper function to check if any vm-sync clients are currently connected
+func hasVMSyncClients() bool {
+	for _, clientInfo := range clients {
+		if clientInfo.ClientType == "vm-sync" {
+			return true
+		}
+	}
+	return false
+}
+
+// Helper function to get count of vm-sync clients
+func getVMSyncClientCount() int {
+	count := 0
+	for _, clientInfo := range clients {
+		if clientInfo.ClientType == "vm-sync" {
+			count++
+		}
+	}
+	return count
+}
+
 func handleBroadcast() {
 	for {
 		select {
@@ -898,6 +1040,44 @@ func handleBroadcast() {
 func handleChangeEvent(event models.ChangeEvent) {
 	log.Printf("Broadcasting change event: %s on %s.%s", event.OperationType, event.Database, event.Collection)
 	
+	// Check if vm-sync clients are connected
+	if !hasVMSyncClients() {
+		// No vm-sync clients connected, buffer the change event
+		bufferMutex.Lock()
+		if changeBuffer != nil {
+			// Convert models.ChangeEvent to memory.ChangeEvent for buffering
+			var docKey, fullDoc map[string]interface{}
+			if len(event.DocumentKey) > 0 {
+				if err := bson.Unmarshal(event.DocumentKey, &docKey); err != nil {
+					log.Printf("Failed to unmarshal DocumentKey for buffering: %v", err)
+					docKey = nil
+				}
+			}
+			if len(event.FullDocument) > 0 {
+				if err := bson.Unmarshal(event.FullDocument, &fullDoc); err != nil {
+					log.Printf("Failed to unmarshal FullDocument for buffering: %v", err)
+					fullDoc = nil
+				}
+			}
+			
+			memoryEvent := &memory.ChangeEvent{
+				ID:            fmt.Sprintf("%s-%s-%d", event.Database, event.Collection, event.Timestamp.UnixNano()),
+				OperationType: event.OperationType,
+				Namespace:     fmt.Sprintf("%s.%s", event.Database, event.Collection),
+				DocumentKey:   docKey,
+				FullDocument:  fullDoc,
+				Timestamp:     event.Timestamp,
+				Size:          len(event.DocumentKey) + len(event.FullDocument) + 100, // Approximate size
+			}
+			
+			changeBuffer.Add(memoryEvent)
+			log.Printf("Buffered change event for %s.%s (no vm-sync clients connected)", event.Database, event.Collection)
+		}
+		bufferMutex.Unlock()
+		return
+	}
+	
+	// vm-sync clients are connected, broadcast normally
 	// Serialize event using BSON to preserve MongoDB types
 	var messageData []byte
 	var err error
@@ -1386,6 +1566,7 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 				continue
 			}
 			log.Printf("Change detected in %s.%s: %s", dbName, collName, operationType)
+			log.Printf("DEBUG: Change event detected - sending to broadcast channel")
 			
 			// Log change event
 			appLogger.Info("cloud-sync", "change_event", fmt.Sprintf("Change detected in %s.%s: %s", dbName, collName, operationType), map[string]interface{}{
@@ -1494,6 +1675,7 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 		}
 
 		// Send event through internal cluster if enabled, otherwise use broadcast channel
+		log.Printf("DEBUG: Sending change event to broadcast channel for %s.%s", dbName, collName)
 		if config.InternalCluster.Enabled && internalCluster != nil {
 			if !internalCluster.ProcessEvent(&event) {
 				log.Println("Internal cluster queue full, dropping event")
@@ -1506,6 +1688,7 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 		} else {
 			select {
 			case broadcast <- event:
+				log.Printf("DEBUG: Change event successfully sent to broadcast channel")
 			default:
 				log.Println("Broadcast channel full, dropping event")
 				appLogger.Warn("cloud-sync", "broadcast_full", fmt.Sprintf("Broadcast channel full, dropping event for %s.%s", dbName, collName), map[string]interface{}{

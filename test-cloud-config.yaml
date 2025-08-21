@@ -11,31 +11,22 @@ mongodb:
   uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
   timeout: 30s
   databases:
-    - name: "sync-test-db"
+    - name: "new_test_db"
       enabled: true
       priority: 1
       collections:
-        - name: "products"
-          enabled: true
-          batch_size: 100   # Very small batches for reliable transfers
-          priority: 1
-          field_filter:
-            include_fields: ["_id", "name", "price", "category", "status", "createdAt"]
-            always_include: ["_id"]
-        - name: "users"
-          enabled: true
-          batch_size: 100   # Very small batches for reliable transfers
-          priority: 2
-          field_filter:
-            include_fields: ["_id", "name", "email", "status", "createdAt"]
-            always_include: ["_id"]
         - name: "orders"
           enabled: true
           batch_size: 100   # Very small batches for reliable transfers
-          priority: 3
-          field_filter:
-            include_fields: ["_id", "userId", "total", "status", "orderDate", "createdAt"]
-            always_include: ["_id"]
+          priority: 1
+    - name: "new_test_db_2"
+      enabled: true
+      priority: 2
+      collections:
+        - name: "orders"
+          enabled: true
+          batch_size: 100   # Very small batches for reliable transfers
+          priority: 2
 
 # WebSocket configuration
 websocket:
@@ -64,7 +55,7 @@ encryption:
 
 # Checkpoint configuration for resumable synchronization
 checkpoint:
-  enabled: true
+  enabled: false
   database: "sync_checkpoints"
   collection: "resume_tokens"
   save_interval_seconds: 5
@@ -73,8 +64,8 @@ checkpoint:
 
 # Transfer tracking configuration
 tracking:
-  enabled: true
-  mongo_uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
+  enabled: false
+  mongo_uri: "mongodb://localhost:27017"
   database: "sync_tracking"
   transfer_collection: "transfer_records"
   state_collection: "client_sync_states"
@@ -95,3 +86,16 @@ fence:
 # License validation
 license:
   validation_enabled: false  # Keep disabled for testing
+
+# Disconnection tolerance and buffering configuration
+disconnection:
+  # Maximum time to buffer changes during vm-sync disconnection
+  max_buffer_duration: "30m"
+  # Maximum number of changes to buffer in memory
+  max_buffer_size: 10000
+  # Timeout for detecting client disconnection
+  disconnection_timeout: "60s"
+  # Enable catch-up synchronization on reconnection
+  catch_up_sync_enabled: true
+  # Maximum time to wait for reconnection before clearing buffer
+  reconnection_timeout: "1h"
