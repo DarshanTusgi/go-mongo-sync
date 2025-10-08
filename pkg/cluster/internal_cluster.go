@@ -2,10 +2,10 @@ package cluster
 
 import (
 	"context"
+	"go-data-sync-http/pkg/models"
+	"log"
 	"sync"
 	"time"
-	"log"
-	"go-data-sync-http/pkg/models"
 )
 
 // InternalCluster manages internal clustering with worker pools and event coordination
@@ -146,9 +146,9 @@ func (ic *InternalCluster) GetOutputChannel() <-chan *models.ChangeEvent {
 // GetStats returns comprehensive cluster statistics
 func (ic *InternalCluster) GetStats() map[string]interface{} {
 	stats := map[string]interface{}{
-		"running":           ic.running,
-		"processor_count":   len(ic.processors),
-		"config":            ic.config,
+		"running":         ic.running,
+		"processor_count": len(ic.processors),
+		"config":          ic.config,
 	}
 
 	if ic.eventCoordinator != nil {

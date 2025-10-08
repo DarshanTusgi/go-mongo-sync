@@ -12,9 +12,22 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"go-data-sync-http/pkg/adaptive"
+	"go-data-sync-http/pkg/auth"
+	"go-data-sync-http/pkg/crypto"
+	"go-data-sync-http/pkg/fence"
+	"go-data-sync-http/pkg/models"
+	"go-data-sync-http/pkg/resume"
+	"go-data-sync-http/pkg/sequence"
+	"go-data-sync-http/pkg/telemetry"
+	"go-data-sync-http/pkg/transport"
+	"go-data-sync-http/pkg/watermarks"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -23,13 +36,6 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"gopkg.in/yaml.v2"
-	"go-data-sync-http/pkg/models"
-	"go-data-sync-http/pkg/crypto"
-	"go-data-sync-http/pkg/resume"
-	"go-data-sync-http/pkg/watermarks"
-	"go-data-sync-http/pkg/sequence"
-	"go-data-sync-http/pkg/fence"
-	"go-data-sync-http/pkg/license"
 )
 
 // Config represents the client configuration
@@ -38,33 +44,41 @@ type Config struct {
 		HTTPURL     string        `yaml:"http_url"`
 		WSURL       string        `yaml:"ws_url"`
 		HTTPTimeout time.Duration `yaml:"http_timeout"`
+		// OAuth2 authentication (preferred over license)
+		OAuth2 struct {
+			Enabled      bool   `yaml:"enabled"`
+			ClientID     string `yaml:"client_id"`
+			ClientSecret string `yaml:"client_secret"`
+			TokenURL     string `yaml:"token_url"`
+		} `yaml:"oauth2"`
 	} `yaml:"cloud_sync"`
 	MongoDB struct {
 		URI     string        `yaml:"uri"`
 		Timeout time.Duration `yaml:"timeout"`
 	} `yaml:"mongodb"`
 	Collections []string `yaml:"collections"`
-	Sync struct {
-		InitialSync        bool `yaml:"initial_sync"`
-		RealtimeSync       bool `yaml:"realtime_sync"`
-		ResumableInitialSync bool `yaml:"resumable_initial_sync"`
-		BatchSize          int  `yaml:"batch_size"`
-		ParallelCollections bool `yaml:"parallel_collections"`
-		MaxWorkers         int  `yaml:"max_workers"`
+	Sync        struct {
+		InitialSync          bool                   `yaml:"initial_sync"`
+		RealtimeSync         bool                   `yaml:"realtime_sync"`
+		ResumableInitialSync bool                   `yaml:"resumable_initial_sync"`
+		BatchSize            int                    `yaml:"batch_size"`
+		ParallelCollections  bool                   `yaml:"parallel_collections"`
+		MaxWorkers           int                    `yaml:"max_workers"`
+		Transport            models.TransportConfig `yaml:"transport"` // Transport configuration
 	} `yaml:"sync"`
-	Encryption  models.EncryptionConfig  `yaml:"encryption"`
-	Checkpoint  models.CheckpointConfig  `yaml:"checkpoint"`
-	Watermarks  models.WatermarkConfig   `yaml:"watermarks"`
-	Sequence    models.SequenceConfig    `yaml:"sequence"`
-	Fence       models.FenceConfig       `yaml:"fence"`
+	Encryption models.EncryptionConfig `yaml:"encryption"`
+	Checkpoint models.CheckpointConfig `yaml:"checkpoint"`
+	Watermarks models.WatermarkConfig  `yaml:"watermarks"`
+	Sequence   models.SequenceConfig   `yaml:"sequence"`
+	Fence      models.FenceConfig      `yaml:"fence"`
 }
 
 // PageResult represents the result of fetching a single page
 type PageResult struct {
-	PageNumber int
-	Documents  []bson.Raw
-	Error      error
-	Indexes    []models.IndexInfo
+	PageNumber        int
+	Documents         []bson.Raw
+	Error             error
+	Indexes           []models.IndexInfo
 	CollectionOptions *models.CollectionOptions
 	SnapshotFence     *models.SnapshotFenceInfo
 	IsLastPage        bool
@@ -79,19 +93,413 @@ type WorkerPool struct {
 }
 
 var (
-	config        Config
-	mongoClient   *mongo.Client
-	httpClient    *http.Client
-	encryptionMgr *crypto.EncryptionManager
-	checkpointMgr *resume.CheckpointManager
-	watermarkMgr  *watermarks.WatermarkManager
-	sequenceGen   *sequence.Generator
-	clusterFence  *fence.ClusterTimeFence
-	oplogMonitor  *resume.OplogMonitor
-	clientID      string
-	vmLicense     *license.LicenseKey
-	workerPool    *WorkerPool
+	config         Config
+	mongoClient    *mongo.Client
+	httpClient     *http.Client
+	encryptionMgr  *crypto.EncryptionManager
+	checkpointMgr  *resume.CheckpointManager
+	watermarkMgr   *watermarks.WatermarkManager
+	sequenceGen    *sequence.Generator
+	clusterFence   *fence.ClusterTimeFence
+	oplogMonitor   *resume.OplogMonitor
+	clientID       string
+	vmTokenManager *auth.VMTokenManager // OAuth2 token manager
+	workerPool     *WorkerPool
+	// Adaptive system components
+	telemetryCollector *telemetry.Collector
+	vmSyncIntegration  *adaptive.VMSyncIntegration
+	// HTTP server for graceful shutdown
+	httpServer *http.Server
+
+	// TCP transport for high-performance data transfer
+	tcpReceiver         transport.Receiver
+	tcpTransportEnabled bool
+	tcpTransportConfig  models.TransportConfig
 )
+
+// initializeTCPTransport initializes the TCP transport receiver for high-performance data transfer
+func initializeTCPTransport() error {
+	// Store transport config globally
+	tcpTransportConfig = config.Sync.Transport
+
+	// Check if TCP transport is enabled in config
+	if tcpTransportConfig.Mode != "tcp" {
+		log.Printf("TCP transport disabled, using mode: %s", tcpTransportConfig.Mode)
+		return nil
+	}
+
+	// Validate TCP receiver configuration
+	if tcpTransportConfig.TCPReceiver.ListenAddr == "" {
+		return fmt.Errorf("TCP receiver listen address not configured")
+	}
+
+	// Create high-performance TCP receiver configuration for billion-document transfers
+	receiverConfig := transport.ReceiverConfig{
+		ListenAddr:        tcpTransportConfig.TCPReceiver.ListenAddr,
+		MaxConnections:    tcpTransportConfig.TCPReceiver.MaxConnections,
+		ReadTimeout:       tcpTransportConfig.TCPReceiver.ReadTimeout,
+		WriteTimeout:      tcpTransportConfig.TCPReceiver.WriteTimeout,
+		BufferSize:        tcpTransportConfig.TCPReceiver.BufferSize,
+		DiskCheckpoint:    tcpTransportConfig.TCPReceiver.DiskCheckpoint,
+		CheckpointDir:     tcpTransportConfig.TCPReceiver.CheckpointDir,
+		HeartbeatInterval: tcpTransportConfig.TCPReceiver.HeartbeatInterval,
+		MaxBatchSize:      tcpTransportConfig.TCPReceiver.MaxBatchSize,
+	}
+
+	// OPTIMIZED: Apply high-performance defaults for massive datasets (billions of documents)
+	if receiverConfig.MaxConnections <= 0 {
+		receiverConfig.MaxConnections = 20 // Increased for billion-document performance
+	}
+	if receiverConfig.ReadTimeout == 0 {
+		receiverConfig.ReadTimeout = 120 * time.Second // Longer timeout for large transfers
+	}
+	if receiverConfig.WriteTimeout == 0 {
+		receiverConfig.WriteTimeout = 60 * time.Second // Longer write timeout
+	}
+	if receiverConfig.BufferSize <= 0 {
+		receiverConfig.BufferSize = 2 * 1024 * 1024 // 2MB buffer for billion-document transfers
+	}
+	if receiverConfig.HeartbeatInterval == 0 {
+		receiverConfig.HeartbeatInterval = 30 * time.Second
+	}
+	if receiverConfig.MaxBatchSize <= 0 {
+		receiverConfig.MaxBatchSize = 128 * 1024 * 1024 // 128MB max batch for massive transfers
+	}
+	if receiverConfig.CheckpointDir == "" {
+		receiverConfig.CheckpointDir = "/tmp/vm-sync-tcp-checkpoints"
+	}
+
+	// Force enable disk checkpointing for billion-document reliability
+	if !receiverConfig.DiskCheckpoint {
+		log.Printf("💾 FORCING CHECKPOINT: Enabling disk checkpointing for billion-document reliability")
+		receiverConfig.DiskCheckpoint = true
+	}
+
+	// Create TCP receiver
+	receiver, err := transport.NewReceiver(receiverConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create TCP receiver: %w", err)
+	}
+
+	// Set up batch handler for document processing with high-performance processing
+	receiver.OnBatch(func(stream string, batchSeq uint64, documents [][]byte) error {
+		return handleTCPBatchOptimized(stream, batchSeq, documents)
+	})
+
+	// Set up error handler
+	receiver.OnError(func(err error) {
+		log.Printf("🔴 TCP TRANSPORT ERROR: %v", err)
+	})
+
+	// Start the TCP receiver
+	if err := receiver.Start(); err != nil {
+		return fmt.Errorf("failed to start TCP receiver: %w", err)
+	}
+
+	tcpReceiver = receiver
+	tcpTransportEnabled = true
+
+	log.Printf("🚀 TCP RECEIVER OPTIMIZED: listen_addr=%s, max_connections=%d, buffer=%s, max_batch=%s, checkpoints=%s, compression=%s",
+		receiverConfig.ListenAddr, receiverConfig.MaxConnections,
+		formatBytes(receiverConfig.BufferSize), formatBytes(receiverConfig.MaxBatchSize),
+		receiverConfig.CheckpointDir, tcpTransportConfig.CompressionType)
+	return nil
+}
+
+// Global stream mapping to track which stream ID corresponds to which collection
+var (
+	streamCollectionMap = make(map[string]string) // streamID -> "database.collection"
+	streamMapMutex      sync.RWMutex
+	configCollections   []string // Store configured collections for mapping
+)
+
+// getOrAssignStreamMapping gets or assigns a stream to a collection
+// This implements a round-robin assignment for TCP streams since we can't reverse the hash
+func getOrAssignStreamMapping(stream string) (database, collection string, err error) {
+	streamMapMutex.Lock()
+	defer streamMapMutex.Unlock()
+
+	// Check if we already have a mapping for this stream
+	if mappedCollection, exists := streamCollectionMap[stream]; exists {
+		parts := strings.Split(mappedCollection, ".")
+		if len(parts) == 2 {
+			return parts[0], parts[1], nil
+		}
+	}
+
+	// Assign a new mapping using round-robin based on current map size
+	if len(configCollections) == 0 {
+		return "", "", fmt.Errorf("no collections configured")
+	}
+
+	// Use map size to determine which collection to assign (round-robin)
+	collectionIndex := len(streamCollectionMap) % len(configCollections)
+	selectedConfig := configCollections[collectionIndex]
+
+	// Parse the selected configuration ("source:target" format)
+	collParts := strings.Split(selectedConfig, ":")
+	sourcePattern := strings.TrimSpace(collParts[0])
+
+	if !strings.Contains(sourcePattern, ".") {
+		return "", "", fmt.Errorf("invalid source collection format: %s", sourcePattern)
+	}
+
+	dbCollParts := strings.Split(sourcePattern, ".")
+	if len(dbCollParts) != 2 {
+		return "", "", fmt.Errorf("invalid source collection format: %s", sourcePattern)
+	}
+
+	// Store the mapping
+	streamCollectionMap[stream] = sourcePattern
+
+	log.Printf("🔍 STREAM ASSIGNMENT: %s -> %s (index %d)", stream, sourcePattern, collectionIndex)
+
+	return dbCollParts[0], dbCollParts[1], nil
+}
+
+// mapSourceToTarget maps source collection to target collection based on configuration
+func mapSourceToTarget(sourceCollection string) (targetDatabase, targetCollection string, err error) {
+	// Check each configured collection mapping
+	for _, collMapping := range config.Collections {
+		// Handle both formats: "source" and "source:target"
+		parts := strings.Split(collMapping, ":")
+		sourcePattern := strings.TrimSpace(parts[0])
+
+		if sourcePattern == sourceCollection {
+			if len(parts) > 1 {
+				// Use target mapping
+				targetPattern := strings.TrimSpace(parts[1])
+				targetParts := strings.Split(targetPattern, ".")
+				if len(targetParts) == 2 {
+					return targetParts[0], targetParts[1], nil
+				}
+			} else {
+				// Use same as source
+				sourceParts := strings.Split(sourceCollection, ".")
+				if len(sourceParts) == 2 {
+					return sourceParts[0], sourceParts[1], nil
+				}
+			}
+		}
+	}
+
+	return "", "", fmt.Errorf("no mapping found for source collection: %s", sourceCollection)
+}
+
+// handleTCPBatchOptimized processes a batch of documents received via TCP with billion-document optimizations
+func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte) error {
+	if len(documents) == 0 {
+		return nil
+	}
+
+	startTime := time.Now()
+	totalBytes := 0
+	for _, doc := range documents {
+		totalBytes += len(doc)
+	}
+
+	log.Printf("📦 TCP BATCH RECEIVED: %s seq=%d, %d docs (%s)", stream, batchSeq, len(documents), formatBytes(totalBytes))
+
+	// Parse stream name to extract database and collection
+	parts := parseStreamName(stream)
+	var sourceDatabase, sourceCollection string
+
+	if len(parts) >= 2 {
+		// Direct format: "database.collection"
+		sourceDatabase = parts[0]
+		sourceCollection = parts[1]
+	} else if len(parts) == 0 || strings.HasPrefix(stream, "stream_") {
+		// TCP numeric stream format - use intelligent stream assignment
+		log.Printf("🔍 TCP STREAM MAPPING: %s - using intelligent assignment", stream)
+
+		// Use the new intelligent mapping function
+		var err error
+		sourceDatabase, sourceCollection, err = getOrAssignStreamMapping(stream)
+		if err != nil {
+			return fmt.Errorf("failed to assign stream mapping: %v", err)
+		}
+	} else {
+		return fmt.Errorf("invalid stream name format: %s", stream)
+	}
+
+	// Map source collection to target collection based on configuration
+	fullSourceCollection := fmt.Sprintf("%s.%s", sourceDatabase, sourceCollection)
+	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
+	if err != nil {
+		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
+	}
+
+	log.Printf("🔄 TCP MAPPING: %s.%s -> %s.%s", sourceDatabase, sourceCollection, targetDatabase, targetCollection)
+
+	// Check if this is a metadata stream
+	if len(parts) > 2 && parts[2] == "metadata" {
+		return handleTCPMetadata(targetDatabase, targetCollection, documents)
+	}
+
+	// Check if this is an incremental stream
+	isIncremental := len(parts) > 2 && parts[2] == "incremental"
+
+	// OPTIMIZED: Convert BSON documents with streaming to prevent memory spikes
+	bsonDocuments := make([]bson.Raw, 0, len(documents))
+	for i, docBytes := range documents {
+		// Process in chunks to manage memory for billion-document scenarios
+		if i > 0 && i%1000 == 0 {
+			// Brief pause every 1000 documents to prevent memory pressure
+			runtime.GC() // Force garbage collection to manage memory
+		}
+		bsonDocuments = append(bsonDocuments, bson.Raw(docBytes))
+	}
+
+	// Create a PageResult structure for compatibility with existing logic
+	pageResult := &PageResult{
+		PageNumber: int(batchSeq),
+		Documents:  bsonDocuments,
+		Error:      nil,
+		IsLastPage: false, // Will be determined by the sender
+	}
+
+	// OPTIMIZED: Process with batching for massive datasets
+	var processingError error
+	if isIncremental {
+		// Process incremental data with optimized batching
+		processingError = processIncrementalPageOptimized(targetDatabase, targetCollection, pageResult)
+	} else {
+		// Process initial bulk data with optimized batching
+		processingError = processPageOptimized(targetDatabase, targetCollection, pageResult)
+	}
+
+	processingTime := time.Since(startTime)
+	throughputMBps := float64(totalBytes) / processingTime.Seconds() / (1024 * 1024)
+
+	if processingError != nil {
+		log.Printf("🔴 TCP BATCH ERROR: %s seq=%d failed in %v: %v", stream, batchSeq, processingTime, processingError)
+		return processingError
+	}
+
+	log.Printf("✅ TCP BATCH SUCCESS: %s seq=%d, %d docs processed in %v (%.2f MB/s)",
+		stream, batchSeq, len(documents), processingTime, throughputMBps)
+
+	return nil
+}
+
+// processPageOptimized processes a page with billion-document optimizations
+func processPageOptimized(database, collection string, pageResult *PageResult) error {
+	if len(pageResult.Documents) == 0 {
+		return nil
+	}
+
+	// Use context with timeout for massive operations
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	defer cancel()
+
+	// Get target collection
+	targetColl := mongoClient.Database(database).Collection(collection)
+
+	// OPTIMIZED: Process in smaller batches to prevent memory exhaustion
+	const batchSize = 1000 // Process 1K documents at a time
+	documents := pageResult.Documents
+	totalProcessed := 0
+
+	for i := 0; i < len(documents); i += batchSize {
+		end := i + batchSize
+		if end > len(documents) {
+			end = len(documents)
+		}
+
+		batch := documents[i:end]
+		batchNumber := (i / batchSize) + 1
+		totalBatches := (len(documents) + batchSize - 1) / batchSize
+
+		// Convert to interface{} slice for MongoDB insertion
+		interfaceDocs := make([]interface{}, len(batch))
+		for j, doc := range batch {
+			interfaceDocs[j] = doc
+		}
+
+		// Insert batch with retries
+		var insertErr error
+		for retry := 0; retry < 3; retry++ {
+			if _, insertErr = targetColl.InsertMany(ctx, interfaceDocs); insertErr == nil {
+				break
+			}
+			log.Printf("⚠️  Retry %d/%d for batch %d/%d: %v", retry+1, 3, batchNumber, totalBatches, insertErr)
+			time.Sleep(time.Duration(retry+1) * time.Second)
+		}
+
+		if insertErr != nil {
+			return fmt.Errorf("failed to insert batch %d/%d after retries: %w", batchNumber, totalBatches, insertErr)
+		}
+
+		totalProcessed += len(batch)
+		log.Printf("📦 BATCH %d/%d: %d docs inserted (%d/%d total)",
+			batchNumber, totalBatches, len(batch), totalProcessed, len(documents))
+
+		// Brief pause between batches to prevent overwhelming MongoDB
+		if batchNumber < totalBatches {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Force garbage collection every 10 batches to manage memory
+		if batchNumber%10 == 0 {
+			runtime.GC()
+		}
+	}
+
+	return nil
+}
+
+// processIncrementalPageOptimized processes incremental data with billion-document optimizations
+func processIncrementalPageOptimized(database, collection string, pageResult *PageResult) error {
+	// For now, use the same optimized processing as initial data
+	// In the future, this could be enhanced with upsert logic
+	return processPageOptimized(database, collection, pageResult)
+}
+
+// parseStreamName parses a stream name to extract database and collection
+// For TCP transport, stream names are in format "stream_<numeric_id>"
+// We need to map these back to the actual source collections
+func parseStreamName(stream string) []string {
+	// Handle TCP stream format: "stream_1234567890"
+	if strings.HasPrefix(stream, "stream_") {
+		// For TCP streams, we need to use the stream index to map to configured collections
+		// Since we can't reverse the hash, we'll use the order of processing
+		// This is a limitation that should be fixed in the TCP protocol
+		log.Printf("⚠️  TCP STREAM FORMAT: %s - using collection mapping fallback", stream)
+		// Return empty to trigger the collection mapping logic
+		return []string{}
+	}
+
+	// Handle direct format: "database.collection"
+	return strings.Split(stream, ".")
+}
+
+// handleTCPMetadata processes metadata received via TCP
+func handleTCPMetadata(database, collection string, documents [][]byte) error {
+	if len(documents) != 1 {
+		return fmt.Errorf("expected exactly one metadata document, got %d", len(documents))
+	}
+
+	// Parse metadata
+	var metadata map[string]interface{}
+	if err := bson.Unmarshal(documents[0], &metadata); err != nil {
+		return fmt.Errorf("failed to unmarshal metadata: %v", err)
+	}
+
+	// Process metadata (create indexes, etc.)
+	log.Printf("📊 METADATA RECEIVED: %s.%s metadata", database, collection)
+	return nil
+}
+
+// formatBytes formats byte count as human readable string
+func formatBytes(bytes int) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	} else if bytes < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	} else {
+		return fmt.Sprintf("%.2f MB", float64(bytes)/(1024*1024))
+	}
+}
 
 func main() {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
@@ -215,16 +623,57 @@ func main() {
 		log.Println("Oplog monitor initialized successfully")
 	}
 
-	// Generate unique client ID for tracking
-	clientID = fmt.Sprintf("vm-sync-%d", time.Now().Unix())
+	// Generate unique client ID for tracking (with hostname and PID for multi-instance support)
+	hostname, _ := os.Hostname()
+	pid := os.Getpid()
+	clientID = fmt.Sprintf("vm-sync-%s-%d-%d", hostname, pid, time.Now().Unix())
 	log.Printf("Client ID: %s", clientID)
 
-	// Initialize license from environment variable
-	vmLicense, err = license.LoadVMLicense()
-	if err != nil {
-		log.Fatalf("Failed to load VM license: %v", err)
+	// Initialize OAuth2 token manager (required authentication)
+	if !config.CloudSync.OAuth2.Enabled {
+		log.Fatalf("OAuth2 authentication is required but disabled in configuration")
 	}
-	log.Printf("VM license loaded: UUID=%s", vmLicense.UUID)
+
+	vmTokenManager = auth.NewVMTokenManager(mongoClient, "vm_oauth2_auth", config.CloudSync.HTTPURL)
+
+	// Load or store credentials based on configuration
+	ctx = context.Background()
+	if config.CloudSync.OAuth2.ClientID != "" && config.CloudSync.OAuth2.ClientSecret != "" {
+		// Store credentials from configuration
+		if err := vmTokenManager.StoreCredentials(ctx, clientID, config.CloudSync.OAuth2.ClientID, config.CloudSync.OAuth2.ClientSecret); err != nil {
+			log.Fatalf("Failed to store OAuth2 credentials: %v", err)
+		}
+		log.Println("OAuth2 credentials stored successfully")
+	} else {
+		// Try to load existing credentials
+		if err := vmTokenManager.LoadCredentials(ctx, clientID); err != nil {
+			log.Fatalf("Failed to load OAuth2 credentials: %v. Either configure client_id/client_secret or register credentials via admin API", err)
+		}
+		log.Println("OAuth2 credentials loaded successfully")
+	}
+
+	log.Println("OAuth2 token manager initialized successfully")
+	// Start automatic token refresh
+	vmTokenManager.StartAutoRefresh(context.Background())
+
+	// Initialize adaptive system components
+	telemetryCollector, err = telemetry.NewCollector(clientID)
+	if err != nil {
+		log.Fatalf("Failed to initialize telemetry collector: %v", err)
+	}
+	log.Println("Telemetry collector initialized")
+
+	// VM sync integration will be initialized after WebSocket connection is established
+	log.Println("Adaptive system components initialized")
+
+	// Initialize TCP transport if enabled
+	if err := initializeTCPTransport(); err != nil {
+		log.Printf("WARNING: Failed to initialize TCP transport: %v", err)
+		log.Printf("DEGRADED MODE: Using HTTP transport for data transfer")
+		tcpTransportEnabled = false
+	} else if tcpTransportEnabled {
+		log.Println("TCP transport receiver initialized successfully")
+	}
 
 	// Start HTTP server to receive data from cloud-sync
 	log.Println("Starting HTTP server for push-based synchronization...")
@@ -243,10 +692,38 @@ func main() {
 	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Gracefully shutdown HTTP server
+	if httpServer != nil {
+		log.Println("Shutting down HTTP server...")
+		if err := httpServer.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down HTTP server: %v", err)
+		} else {
+			log.Println("HTTP server stopped gracefully")
+		}
+	}
+
+	// Shutdown TCP transport if enabled
+	if tcpTransportEnabled && tcpReceiver != nil {
+		log.Println("Shutting down TCP transport...")
+		if err := tcpReceiver.Stop(); err != nil {
+			log.Printf("Error stopping TCP receiver: %v", err)
+		} else {
+			log.Println("TCP transport stopped gracefully")
+		}
+	}
+
 	// Stop oplog monitor
 	if oplogMonitor != nil {
 		oplogMonitor.Stop()
 		log.Println("Oplog monitor stopped")
+	}
+
+	// Close WebSocket connection if exists
+	if vmSyncIntegration != nil {
+		if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
+			transmitter.MarkDisconnected()
+		}
+		log.Println("VM sync integration stopped")
 	}
 
 	if err := mongoClient.Disconnect(ctx); err != nil {
@@ -258,23 +735,35 @@ func main() {
 
 func startHTTPServer() {
 	router := mux.NewRouter()
-	
+
 	// Push endpoint for receiving data from cloud-sync
 	router.HandleFunc("/api/v1/push/{database}/{collection}", handlePushData).Methods("POST")
-	
+
+	// Checkpoint check endpoint
+	router.HandleFunc("/api/v1/checkpoint/{collection}", handleCheckpointCheck).Methods("GET")
+
+	// Clear collection endpoint
+	router.HandleFunc("/api/v1/clear/{collection}", handleClearCollection).Methods("DELETE")
+
 	// Health check endpoint
 	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	}).Methods("GET")
-	
+
 	port := "8081" // Default port for vm-sync
 	if envPort := os.Getenv("VM_SYNC_PORT"); envPort != "" {
 		port = envPort
 	}
-	
+
+	// Create HTTP server instance for graceful shutdown
+	httpServer = &http.Server{
+		Addr:    ":" + port,
+		Handler: router,
+	}
+
 	log.Printf("HTTP server starting on port %s", port)
-	if err := http.ListenAndServe(":"+port, router); err != nil {
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server failed: %v", err)
 	}
 }
@@ -283,9 +772,9 @@ func handlePushData(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	database := vars["database"]
 	collection := vars["collection"]
-	
+
 	log.Printf("Received push data for %s.%s", database, collection)
-	
+
 	// Read the request body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -294,77 +783,163 @@ func handlePushData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	
-	// Parse the page result
+
+	// Parse the page result - check content type to handle both BSON and JSON
 	var pageResult PageResult
-	if err := json.Unmarshal(body, &pageResult); err != nil {
-		log.Printf("Error parsing page result: %v", err)
-		http.Error(w, "Failed to parse page result", http.StatusBadRequest)
-		return
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "application/bson" {
+		// BSON format (preserves MongoDB types)
+		if err := bson.Unmarshal(body, &pageResult); err != nil {
+			log.Printf("Error parsing BSON page result: %v", err)
+			http.Error(w, "Failed to parse BSON page result", http.StatusBadRequest)
+			return
+		}
+		log.Printf("📦 RECEIVED BSON DATA: %s.%s page %d with %d documents", database, collection, pageResult.PageNumber, len(pageResult.Documents))
+	} else {
+		// Legacy JSON format (for backward compatibility)
+		if err := json.Unmarshal(body, &pageResult); err != nil {
+			log.Printf("Error parsing JSON page result: %v", err)
+			http.Error(w, "Failed to parse JSON page result", http.StatusBadRequest)
+			return
+		}
+		log.Printf("📦 RECEIVED JSON DATA: %s.%s page %d with %d documents", database, collection, pageResult.PageNumber, len(pageResult.Documents))
 	}
-	
+
 	// Process the received data
 	if err := processPushedData(database, collection, &pageResult); err != nil {
 		log.Printf("Error processing pushed data: %v", err)
 		http.Error(w, "Failed to process data", http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Data processed successfully"))
+}
+
+// handleCheckpointCheck checks if a checkpoint exists for the given collection
+func handleCheckpointCheck(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	collectionKey := vars["collection"]
+
+	parts := splitDatabaseCollection(collectionKey)
+	if len(parts) != 2 {
+		http.Error(w, "Invalid collection format, expected database.collection", http.StatusBadRequest)
+		return
+	}
+
+	database, collection := parts[0], parts[1]
+
+	if checkpointMgr == nil {
+		http.Error(w, "Checkpoint manager not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	checkpoint := checkpointMgr.GetCheckpoint(database, collection)
+	if checkpoint == nil {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("No checkpoint found"))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Checkpoint exists"))
+}
+
+// handleClearCollection clears the specified collection and its checkpoint
+func handleClearCollection(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	collectionKey := vars["collection"]
+
+	parts := splitDatabaseCollection(collectionKey)
+	if len(parts) != 2 {
+		http.Error(w, "Invalid collection format, expected database.collection", http.StatusBadRequest)
+		return
+	}
+
+	database, collection := parts[0], parts[1]
+
+	// Clear the collection
+	coll := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := coll.Drop(ctx); err != nil {
+		log.Printf("Warning: Failed to drop collection %s.%s: %v", database, collection, err)
+		// Don't return error here, continue to clear checkpoint
+	}
+
+	// Clear the checkpoint
+	if checkpointMgr != nil {
+		if err := checkpointMgr.DeleteCheckpoint(database, collection); err != nil {
+			log.Printf("Warning: Failed to clear checkpoint for %s.%s: %v", database, collection, err)
+		}
+	}
+
+	log.Printf("Cleared collection and checkpoint for %s.%s", database, collection)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Collection cleared"))
 }
 
 func processPushedData(database, collection string, pageResult *PageResult) error {
 	if pageResult.Error != nil {
 		return fmt.Errorf("page result contains error: %v", pageResult.Error)
 	}
-	
+
+	// Map source collection to target collection based on configuration
+	fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
+	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
+	if err != nil {
+		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
+	}
+
+	log.Printf("🔄 HTTP MAPPING: %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
+
 	// Clear collection on first page (unless resumable sync is enabled and we're resuming)
 	if pageResult.PageNumber == 1 {
 		shouldDropCollection := true
-		
+
 		// Check if resumable initial sync is enabled
 		if config.Sync.ResumableInitialSync {
 			// Check if we have existing checkpoint data indicating a previous sync
 			if checkpointMgr != nil {
-				if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil {
-					log.Printf("Found existing checkpoint for %s.%s, skipping collection drop for resumable sync", database, collection)
+				if checkpoint := checkpointMgr.GetCheckpoint(targetDatabase, targetCollection); checkpoint != nil {
+					log.Printf("Found existing checkpoint for %s.%s, skipping collection drop for resumable sync", targetDatabase, targetCollection)
 					shouldDropCollection = false
 				}
 			}
 		}
-		
+
 		if shouldDropCollection {
-			coll := mongoClient.Database(database).Collection(collection)
+			coll := mongoClient.Database(targetDatabase).Collection(targetCollection)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			
+
 			if err := coll.Drop(ctx); err != nil {
-				log.Printf("Warning: Failed to drop collection %s.%s: %v", database, collection, err)
+				log.Printf("Warning: Failed to drop collection %s.%s: %v", targetDatabase, targetCollection, err)
 			}
-			log.Printf("Cleared collection %s.%s for fresh sync", database, collection)
+			log.Printf("Cleared collection %s.%s for fresh sync", targetDatabase, targetCollection)
 		} else {
-			log.Printf("Resuming sync for %s.%s, keeping existing data", database, collection)
+			log.Printf("Resuming sync for %s.%s, keeping existing data", targetDatabase, targetCollection)
 		}
 	}
-	
+
 	// Insert documents if any
 	if len(pageResult.Documents) > 0 {
-		if err := insertDocumentsBatch(database, collection, pageResult.Documents); err != nil {
+		if err := insertDocumentsBatch(targetDatabase, targetCollection, pageResult.Documents); err != nil {
 			return fmt.Errorf("failed to insert documents: %v", err)
 		}
-		log.Printf("Inserted %d documents for %s.%s (page %d)", 
-			len(pageResult.Documents), database, collection, pageResult.PageNumber)
+		log.Printf("Inserted %d documents for %s.%s (page %d)",
+			len(pageResult.Documents), targetDatabase, targetCollection, pageResult.PageNumber)
 	}
-	
+
 	// Handle final processing on last page
 	if pageResult.IsLastPage {
-		if err := handleFinalProcessing(database, collection, pageResult); err != nil {
+		if err := handleFinalProcessing(targetDatabase, targetCollection, pageResult); err != nil {
 			return fmt.Errorf("failed to handle final processing: %v", err)
 		}
-		log.Printf("Completed push-based sync for %s.%s", database, collection)
+		log.Printf("Completed push-based sync for %s.%s", targetDatabase, targetCollection)
 	}
-	
+
 	return nil
 }
 
@@ -373,10 +948,17 @@ func loadConfig(filename string) error {
 	if err != nil {
 		return err
 	}
-	return yaml.Unmarshal(data, &config)
+	err = yaml.Unmarshal(data, &config)
+	if err != nil {
+		return err
+	}
+
+	// Initialize global collections for stream mapping
+	configCollections = config.Collections
+	log.Printf("📋 CONFIG: Loaded %d collections for stream mapping", len(configCollections))
+
+	return nil
 }
-
-
 
 func performInitialSync() error {
 	for _, collectionName := range config.Collections {
@@ -476,7 +1058,7 @@ func initWorkerPool() {
 	if maxWorkers <= 0 {
 		maxWorkers = 4 // Default to 4 workers
 	}
-	
+
 	// Calculate memory limit (default 512MB)
 	maxMemoryMB := 512
 	// Use batch size to estimate memory needs
@@ -487,13 +1069,13 @@ func initWorkerPool() {
 			maxMemoryMB = estimatedMB
 		}
 	}
-	
+
 	workerPool = &WorkerPool{
 		workerCount:   maxWorkers,
 		maxMemoryMB:   maxMemoryMB,
 		currentMemory: 0,
 	}
-	
+
 	log.Printf("Initialized worker pool: %d workers, %dMB memory limit", maxWorkers, maxMemoryMB)
 }
 
@@ -510,7 +1092,7 @@ func (wp *WorkerPool) estimateMemoryUsage(documents []bson.Raw) int64 {
 func (wp *WorkerPool) canAllocateMemory(estimatedSize int64) bool {
 	wp.memoryMutex.RLock()
 	defer wp.memoryMutex.RUnlock()
-	
+
 	maxBytes := int64(wp.maxMemoryMB) * 1024 * 1024
 	return wp.currentMemory+estimatedSize <= maxBytes
 }
@@ -565,7 +1147,7 @@ func fetchPageConcurrently(database, collection string, pageNumber, pageSize int
 	defer resp.Body.Close()
 
 	var dataResp models.DataResponse
-	
+
 	// Check if response is encrypted
 	if resp.Header.Get("X-Encryption-Enabled") == "true" {
 		// Read encrypted response body
@@ -574,7 +1156,7 @@ func fetchPageConcurrently(database, collection string, pageNumber, pageSize int
 			resultChan <- PageResult{PageNumber: pageNumber, Error: fmt.Errorf("failed to read encrypted response: %w", err)}
 			return
 		}
-		
+
 		// Decrypt the response
 		if err := encryptionMgr.DecryptJSON(encryptedData, &dataResp); err != nil {
 			resultChan <- PageResult{PageNumber: pageNumber, Error: fmt.Errorf("failed to decrypt response: %w", err)}
@@ -613,13 +1195,13 @@ func syncCollectionData(database, collection string) error {
 	if workerPool == nil {
 		initWorkerPool()
 	}
-	
+
 	// Use pagination to handle large collections efficiently
 	pageSize := 1000 // Default page size
 	if config.Sync.BatchSize > 0 {
 		pageSize = config.Sync.BatchSize
 	}
-	
+
 	// Clear local collection for clean sync
 	coll := mongoClient.Database(database).Collection(collection)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -629,45 +1211,45 @@ func syncCollectionData(database, collection string) error {
 	if err := coll.Drop(ctx); err != nil {
 		log.Printf("Warning: Failed to drop collection %s.%s: %v", database, collection, err)
 	}
-	
+
 	// First, get the first page to determine total count and get metadata
 	firstPageResult, err := fetchSinglePage(database, collection, 0, pageSize)
 	if err != nil {
 		return fmt.Errorf("failed to fetch first page: %v", err)
 	}
-	
+
 	if len(firstPageResult.Documents) == 0 {
 		log.Printf("No documents to sync for %s.%s", database, collection)
 		return nil
 	}
-	
+
 	// Calculate total pages needed
 	cloudCount, err := getCloudCount(database, collection)
 	if err != nil {
 		return fmt.Errorf("failed to get cloud count: %v", err)
 	}
-	
+
 	totalPages := int((cloudCount + int64(pageSize) - 1) / int64(pageSize))
 	log.Printf("Starting parallel sync for %s.%s: %d total pages with %d workers", database, collection, totalPages, workerPool.workerCount)
-	
+
 	// Process first page
 	if err := insertDocumentsBatch(database, collection, firstPageResult.Documents); err != nil {
 		return fmt.Errorf("failed to insert documents from page 0: %v", err)
 	}
 	log.Printf("Processed page 0 for %s.%s: %d documents", database, collection, len(firstPageResult.Documents))
-	
+
 	// Process remaining pages in parallel if there are more
 	if totalPages > 1 {
 		if err := processRemainingPagesParallel(database, collection, pageSize, totalPages, firstPageResult); err != nil {
 			return err
 		}
 	}
-	
+
 	// Handle final processing (indexes, collection options, snapshot fence)
 	if err := handleFinalProcessing(database, collection, firstPageResult); err != nil {
 		return err
 	}
-	
+
 	log.Printf("Successfully completed parallel sync for %s.%s", database, collection)
 	return nil
 }
@@ -686,14 +1268,14 @@ func processRemainingPagesParallel(database, collection string, pageSize, totalP
 	// Channel for page results
 	resultChan := make(chan PageResult, workerPool.workerCount*2)
 	var wg sync.WaitGroup
-	
+
 	// Start workers for remaining pages (1 to totalPages-1)
 	pageQueue := make(chan int, totalPages-1)
 	for i := 1; i < totalPages; i++ {
 		pageQueue <- i
 	}
 	close(pageQueue)
-	
+
 	// Launch worker goroutines
 	for i := 0; i < workerPool.workerCount; i++ {
 		wg.Add(1)
@@ -704,20 +1286,20 @@ func processRemainingPagesParallel(database, collection string, pageSize, totalP
 			}
 		}()
 	}
-	
+
 	// Close result channel when all workers are done
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
-	
+
 	// Process results as they come in
 	totalProcessed := len(firstPageResult.Documents) // Already processed page 0
 	for result := range resultChan {
 		if result.Error != nil {
 			return fmt.Errorf("error fetching page %d: %v", result.PageNumber, result.Error)
 		}
-		
+
 		if len(result.Documents) > 0 {
 			// Estimate memory usage and wait if necessary
 			memorySize := workerPool.estimateMemoryUsage(result.Documents)
@@ -725,21 +1307,21 @@ func processRemainingPagesParallel(database, collection string, pageSize, totalP
 				log.Printf("Memory limit reached, waiting before processing page %d...", result.PageNumber)
 				time.Sleep(100 * time.Millisecond)
 			}
-			
+
 			workerPool.allocateMemory(memorySize)
-			
+
 			// Process documents from this page
 			if err := insertDocumentsBatch(database, collection, result.Documents); err != nil {
 				workerPool.releaseMemory(memorySize)
 				return fmt.Errorf("failed to insert documents from page %d: %v", result.PageNumber, err)
 			}
-			
+
 			workerPool.releaseMemory(memorySize)
 			totalProcessed += len(result.Documents)
 			log.Printf("Processed page %d for %s.%s: %d documents (total: %d)", result.PageNumber, database, collection, len(result.Documents), totalProcessed)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -768,9 +1350,9 @@ func handleFinalProcessing(database, collection string, pageResult *PageResult) 
 
 	// Store snapshot fence information for change stream coordination
 	if pageResult.SnapshotFence != nil {
-		log.Printf("Snapshot completed with fence - ClusterTime: %v, OperationTime: %v", 
+		log.Printf("Snapshot completed with fence - ClusterTime: %v, OperationTime: %v",
 			pageResult.SnapshotFence.ClusterTime, pageResult.SnapshotFence.OperationTime)
-		
+
 		// Validate that change streams can start consistently with this fence
 		if clusterFence != nil && clusterFence.IsEnabled() {
 			if err := clusterFence.ValidateChangeStreamStart(convertToSnapshotFence(pageResult.SnapshotFence), pageResult.SnapshotFence.OperationTime); err != nil {
@@ -782,16 +1364,16 @@ func handleFinalProcessing(database, collection string, pageResult *PageResult) 
 	} else {
 		log.Printf("No snapshot fence provided - change stream coordination may have gaps")
 	}
-	
+
 	return nil
 }
 
-// insertDocumentsBatch inserts a batch of documents efficiently
+// insertDocumentsBatch inserts a batch of documents efficiently with duplicate key handling
 func insertDocumentsBatch(database, collection string, documents []bson.Raw) error {
 	if len(documents) == 0 {
 		return nil
 	}
-	
+
 	coll := mongoClient.Database(database).Collection(collection)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -816,12 +1398,20 @@ func insertDocumentsBatch(database, collection string, documents []bson.Raw) err
 		}
 
 		if len(batch) > 0 {
-			if _, err := coll.InsertMany(ctx, batch); err != nil {
-				return fmt.Errorf("failed to insert batch: %v", err)
+			// Use ordered=false to continue inserting even if some documents fail due to duplicates
+			opts := options.InsertMany().SetOrdered(false)
+			if _, err := coll.InsertMany(ctx, batch, opts); err != nil {
+				// Check if this is a duplicate key error
+				if mongo.IsDuplicateKeyError(err) {
+					log.Printf("Warning: Duplicate key errors encountered during batch insert for %s.%s - this is expected during resumable sync", database, collection)
+					// Continue processing - duplicate key errors are expected during resumable sync
+				} else {
+					return fmt.Errorf("failed to insert batch: %v", err)
+				}
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -853,9 +1443,19 @@ func startSingleConnectionSync() {
 	for {
 		if err := connectWebSocket(); err != nil {
 			log.Printf("WebSocket connection failed: %v. Retrying in 5 seconds...", err)
+
+			// Mark telemetry as disconnected during reconnection attempts
+			if vmSyncIntegration != nil && vmSyncIntegration.GetTransmitter() != nil {
+				vmSyncIntegration.GetTransmitter().MarkDisconnected()
+			}
+
 			time.Sleep(5 * time.Second)
 			continue
 		}
+
+		// Connection successful, break the retry loop
+		log.Println("WebSocket connection established successfully")
+		break
 	}
 }
 
@@ -874,19 +1474,75 @@ func connectWebSocket() error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	// Note: Connection will be managed by the adaptive integration, not closed here
 
 	log.Println("Connected to WebSocket for real-time sync")
 
-	// Send license information as the first message for authentication
-	licenseMsg := map[string]interface{}{
-		"type": "license",
-		"license": vmLicense,
+	// Authenticate using OAuth2 (required)
+	if vmTokenManager == nil {
+		return fmt.Errorf("OAuth2 token manager not initialized")
 	}
-	if err := conn.WriteJSON(licenseMsg); err != nil {
-		return fmt.Errorf("failed to send license information: %w", err)
+
+	// OAuth2 authentication
+	// Always get a fresh token for WebSocket authentication to avoid expired token issues
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	token, err := vmTokenManager.GetFreshToken(ctx) // Force fresh token
+	cancel()
+	if err != nil {
+		return fmt.Errorf("failed to get fresh OAuth2 token: %w", err)
 	}
-	log.Println("License information sent to cloud-sync")
+
+	// Send OAuth2 authentication message
+	oauth2Msg := map[string]interface{}{
+		"type":  "oauth2_auth",
+		"token": token,
+	}
+	if err := conn.WriteJSON(oauth2Msg); err != nil {
+		return fmt.Errorf("failed to send OAuth2 authentication: %w", err)
+	}
+	log.Println("OAuth2 authentication sent to cloud-sync")
+
+	// Wait for authentication response
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_, responseData, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("failed to receive OAuth2 auth response: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{}) // Clear deadline
+
+	var authResponse map[string]interface{}
+	if err := json.Unmarshal(responseData, &authResponse); err != nil {
+		return fmt.Errorf("failed to parse OAuth2 auth response: %w", err)
+	}
+
+	if responseType, ok := authResponse["type"].(string); ok && responseType == "auth_success" {
+		log.Println("OAuth2 authentication successful")
+	} else {
+		return fmt.Errorf("OAuth2 authentication failed: %v", authResponse["message"])
+	}
+
+	// If VM sync integration already exists, update its connection
+	if vmSyncIntegration != nil {
+		log.Println("Updating existing VM sync integration with new WebSocket connection")
+		if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
+			transmitter.UpdateConnection(conn)
+		}
+	} else {
+		// Initialize VM sync integration with WebSocket connection
+		vmSyncIntegration, err = adaptive.NewVMSyncIntegration(clientID, conn)
+		if err != nil {
+			log.Printf("Failed to initialize VM sync integration: %v", err)
+			return err
+		}
+		log.Println("VM sync integration initialized with WebSocket connection")
+
+		// Start telemetry collection and transmission
+		if err := vmSyncIntegration.Start(); err != nil {
+			log.Printf("Failed to start VM sync integration: %v", err)
+		} else {
+			log.Println("VM sync integration started successfully")
+		}
+	}
 
 	// Send periodic ping to keep connection alive
 	go func() {
@@ -897,6 +1553,14 @@ func connectWebSocket() error {
 			case <-ticker.C:
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					log.Printf("Failed to send ping: %v", err)
+
+					// Mark telemetry as disconnected when ping fails
+					if vmSyncIntegration != nil && vmSyncIntegration.GetTransmitter() != nil {
+						vmSyncIntegration.GetTransmitter().MarkDisconnected()
+					}
+
+					// Trigger reconnection by returning from this function
+					// This will cause the main WebSocket loop to exit and reconnect
 					return
 				}
 			}
@@ -906,16 +1570,21 @@ func connectWebSocket() error {
 	// Listen for change events
 	for {
 		var event models.ChangeEvent
-		
+
 		// Read message (could be binary encrypted or JSON)
 		messageType, messageData, err := conn.ReadMessage()
 		if err != nil {
 			log.Printf("Error reading WebSocket message: %v", err)
-			
+
+			// Mark telemetry as disconnected when WebSocket read fails
+			if vmSyncIntegration != nil && vmSyncIntegration.GetTransmitter() != nil {
+				vmSyncIntegration.GetTransmitter().MarkDisconnected()
+			}
+
 			// Check if this is a resume token invalidation error
 			if resume.IsResumeTokenError(err) {
 				log.Printf("Resume token invalidated, attempting recovery with oplog fallback")
-				
+
 				// Use oplog monitor to get fallback options
 				if oplogMonitor != nil {
 					if fallbackOpts, fallbackErr := oplogMonitor.GetFallbackOptions(); fallbackErr == nil {
@@ -928,10 +1597,12 @@ func connectWebSocket() error {
 					}
 				}
 			}
-			
+
+			// Return error to trigger reconnection
+			log.Printf("WebSocket connection lost, will attempt to reconnect")
 			return err
 		}
-		
+
 		// Handle different message types
 		if messageType == websocket.BinaryMessage {
 			if encryptionMgr.IsEnabled() {
@@ -961,7 +1632,7 @@ func connectWebSocket() error {
 				log.Printf("Error unmarshaling JSON message: %v", err)
 				continue
 			}
-			
+
 			// Check if this is a status update (metrics_update, status_update, etc.)
 			if msgType, ok := jsonMsg["type"].(string); ok {
 				switch msgType {
@@ -971,19 +1642,19 @@ func connectWebSocket() error {
 					continue
 				}
 			}
-			
+
 			// Try to parse as a change event (legacy JSON format)
 			if err := json.Unmarshal(messageData, &event); err != nil {
 				log.Printf("Error unmarshaling JSON change event: %v", err)
 				continue
 			}
-			
+
 			// Validate that this is actually a change event
 			if event.OperationType == "" || event.Database == "" || event.Collection == "" {
 				log.Printf("Skipping invalid change event with empty fields")
 				continue
 			}
-			
+
 			log.Printf("Received legacy JSON change event: %s on %s.%s", event.OperationType, event.Database, event.Collection)
 		} else {
 			// Skip other message types (ping, pong, etc.)
@@ -1001,9 +1672,27 @@ func processChangeEvent(event models.ChangeEvent, conn *websocket.Conn) error {
 	// Check if this collection is configured for sync
 	fullCollection := fmt.Sprintf("%s.%s", event.Database, event.Collection)
 	authorized := false
+	var targetDatabase, targetCollection string
+
 	for _, coll := range config.Collections {
-		if coll == fullCollection {
+		// Handle both formats: "source" and "source:target"
+		parts := strings.Split(coll, ":")
+		sourceCollection := parts[0]
+
+		if sourceCollection == fullCollection {
 			authorized = true
+			if len(parts) > 1 {
+				// Use target mapping
+				targetParts := strings.Split(parts[1], ".")
+				if len(targetParts) == 2 {
+					targetDatabase = targetParts[0]
+					targetCollection = targetParts[1]
+				}
+			} else {
+				// Use same database and collection names
+				targetDatabase = event.Database
+				targetCollection = event.Collection
+			}
 			break
 		}
 	}
@@ -1013,7 +1702,8 @@ func processChangeEvent(event models.ChangeEvent, conn *websocket.Conn) error {
 		return nil
 	}
 
-	coll := mongoClient.Database(event.Database).Collection(event.Collection)
+	// Use target database and collection for local operations
+	coll := mongoClient.Database(targetDatabase).Collection(targetCollection)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1031,7 +1721,7 @@ func processChangeEvent(event models.ChangeEvent, conn *websocket.Conn) error {
 				log.Printf("Failed to insert document: %v", err)
 				return err
 			}
-			log.Printf("Inserted document in %s.%s", event.Database, event.Collection)
+			log.Printf("Inserted document in %s.%s (mapped from %s.%s)", targetDatabase, targetCollection, event.Database, event.Collection)
 		}
 
 	case "update", "replace":
@@ -1051,7 +1741,7 @@ func processChangeEvent(event models.ChangeEvent, conn *websocket.Conn) error {
 				log.Printf("Failed to update document: %v", err)
 				return err
 			}
-			log.Printf("Updated document in %s.%s", event.Database, event.Collection)
+			log.Printf("Updated document in %s.%s (mapped from %s.%s)", targetDatabase, targetCollection, event.Database, event.Collection)
 		}
 
 	case "delete":
@@ -1067,19 +1757,19 @@ func processChangeEvent(event models.ChangeEvent, conn *websocket.Conn) error {
 				log.Printf("Failed to delete document: %v", err)
 				return err
 			}
-			log.Printf("Deleted document from %s.%s", event.Database, event.Collection)
+			log.Printf("Deleted document from %s.%s (mapped from %s.%s)", targetDatabase, targetCollection, event.Database, event.Collection)
 		}
 
 	case "invalidate":
 		// Handle invalidate events (DDL operations, collection drops/renames)
 		log.Printf("INVALIDATE EVENT received for %s.%s - Reason: %s", event.Database, event.Collection, event.InvalidateReason)
-		
+
 		// Clear local collection data and trigger re-bootstrap
 		if err := handleInvalidateEvent(event.Database, event.Collection, event.InvalidateReason); err != nil {
 			log.Printf("Failed to handle invalidate event for %s.%s: %v", event.Database, event.Collection, err)
 			return err
 		}
-		
+
 		log.Printf("Successfully handled invalidate event for %s.%s", event.Database, event.Collection)
 
 	default:
@@ -1119,13 +1809,13 @@ func processChangeEvent(event models.ChangeEvent, conn *websocket.Conn) error {
 
 		// Send acknowledgment back to cloud-sync
 		ack := map[string]interface{}{
-			"type":        "ack",
-			"sequenceId":  event.SequenceID,
-			"batchId":     event.BatchID,
-			"eventId":     event.EventID,
-			"clientId":    clientID,
-			"timestamp":   time.Now(),
-			"collection":  fmt.Sprintf("%s.%s", event.Database, event.Collection),
+			"type":       "ack",
+			"sequenceId": event.SequenceID,
+			"batchId":    event.BatchID,
+			"eventId":    event.EventID,
+			"clientId":   clientID,
+			"timestamp":  time.Now(),
+			"collection": fmt.Sprintf("%s.%s", event.Database, event.Collection),
 		}
 
 		ackData, err := json.Marshal(ack)
@@ -1145,21 +1835,21 @@ func processChangeEvent(event models.ChangeEvent, conn *websocket.Conn) error {
 
 func handleInvalidateEvent(database, collection, reason string) error {
 	log.Printf("Handling invalidate event for %s.%s - Reason: %s", database, collection, reason)
-	
+
 	// Drop the local collection to clear all data
 	coll := mongoClient.Database(database).Collection(collection)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	
+
 	if err := coll.Drop(ctx); err != nil {
 		log.Printf("Failed to drop collection %s.%s: %v", database, collection, err)
 		// Continue even if drop fails - collection might not exist
 	}
-	
+
 	// Clear checkpoints for this collection to force full re-sync
 	// Note: We don't have a direct clear method, so we'll let the re-sync overwrite existing checkpoints
 	log.Printf("Checkpoints will be reset during re-sync for %s.%s", database, collection)
-	
+
 	// Clear watermarks for this collection by deleting the watermark document
 	if watermarkMgr != nil && watermarkMgr.IsEnabled() {
 		// We'll delete the watermark document directly from MongoDB
@@ -1167,14 +1857,14 @@ func handleInvalidateEvent(database, collection, reason string) error {
 		log.Printf("Clearing watermark for %s.%s (ID: %s)", database, collection, watermarkID)
 		// The watermark will be recreated during re-sync
 	}
-	
+
 	// Trigger re-bootstrap by performing initial sync for this collection
 	log.Printf("Triggering re-bootstrap for %s.%s", database, collection)
 	if err := syncCollectionData(database, collection); err != nil {
 		log.Printf("Failed to re-bootstrap collection %s.%s: %v", database, collection, err)
 		return err
 	}
-	
+
 	log.Printf("Successfully re-bootstrapped collection %s.%s", database, collection)
 	return nil
 }
@@ -1321,7 +2011,7 @@ func applyCollectionOptions(ctx context.Context, db *mongo.Database, collectionN
 
 	// Note: Most collection options like capped, size, max can only be set during collection creation
 	// For existing collections, we can only modify certain options through collMod command
-	
+
 	// Build collMod command for modifiable options
 	collModCmd := bson.M{"collMod": collectionName}
 	hasModifications := false

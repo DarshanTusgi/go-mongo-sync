@@ -1,4 +1,4 @@
-// Dashboard JavaScript for Cloud Sync Monitoring
+// 🚀 GOD MODE Dashboard JavaScript - Enhanced Real-time Monitoring
 class CloudSyncDashboard {
     constructor() {
         this.websocket = null;
@@ -10,16 +10,42 @@ class CloudSyncDashboard {
             status: '',
             search: ''
         };
+        this.retryCount = 0;
+        this.maxRetries = 3;
+        this.connectionState = 'disconnected';
         
         this.init();
     }
 
     init() {
+        console.log('🚀 GOD MODE Dashboard initializing...');
+        this.showInitialData(); // Show placeholder data immediately
         this.hideLoadingOverlay();
         this.setupEventListeners();
         this.startAutoRefresh();
         this.connectWebSocket();
         this.loadInitialData();
+        this.updateConnectionIndicator();
+    }
+    
+    showInitialData() {
+        console.log('📋 Setting up initial placeholder data...');
+        // Set initial placeholder values to show the dashboard is working
+        this.updateElement('totalDocs', 'Loading...');
+        this.updateElement('todayDocs', 'Loading...');
+        this.updateElement('syncRate', 'Loading...');
+        this.updateElement('backlogSize', 'Loading...');
+        this.updateElement('avgLatency', 'Loading...');
+        this.updateElement('activeWatchers', 'Loading...');
+        this.updateElement('lastResumeToken', 'Loading...');
+        this.updateElement('syncMode', 'Loading...');
+        this.updateElement('lastCheckpoint', 'Loading...');
+        this.updateElement('connectedClients', 'Loading...');
+        
+        // Show initial status as checking
+        ['sourceMongo', 'cloudSync', 'vmSync', 'targetMongo'].forEach(component => {
+            this.updateConnectionStatus(component, 'warning');
+        });
     }
 
     setupEventListeners() {
@@ -127,39 +153,56 @@ class CloudSyncDashboard {
     }
 
     async loadInitialData() {
+        console.log('🚀 Loading initial dashboard data...');
+        this.showLoadingOverlay();
+        
         try {
+            console.log('🔄 Starting parallel data loading...');
             await Promise.all([
                 this.loadMetrics(),
                 this.loadHealthStatus(),
                 this.loadLogs()
             ]);
+            console.log('✅ All initial data loaded successfully');
         } catch (error) {
-            console.error('Error loading initial data:', error);
-            this.showError('Failed to load dashboard data');
+            console.error('❌ Error loading initial data:', error);
+            this.showError('Failed to load dashboard data: ' + error.message);
+        } finally {
+            this.hideLoadingOverlay();
         }
     }
 
     async loadMetrics() {
         try {
-            const response = await fetch('/api/metrics');
-            if (!response.ok) throw new Error('Failed to fetch metrics');
-            
+            console.log('📊 Loading metrics from /api/dashboard/metrics...');
+            const response = await fetch('/api/dashboard/metrics');
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
             const data = await response.json();
+            console.log('✅ Metrics loaded successfully:', data);
             this.updateMetrics(data);
+            this.retryCount = 0; // Reset retry count on success
         } catch (error) {
-            console.error('Error loading metrics:', error);
+            console.error('❌ Error loading metrics:', error);
+            this.handleAPIError('metrics', error);
         }
     }
 
     async loadHealthStatus() {
         try {
+            console.log('🏥 Loading health status from /health...');
             const response = await fetch('/health');
-            if (!response.ok) throw new Error('Failed to fetch health status');
-            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
             const data = await response.json();
+            console.log('✅ Health status loaded:', data);
             this.updateHealthStatus(data);
+            this.retryCount = 0; // Reset retry count on success
         } catch (error) {
-            console.error('Error loading health status:', error);
+            console.error('❌ Error loading health status:', error);
+            this.handleAPIError('health', error);
         }
     }
 
@@ -173,38 +216,54 @@ class CloudSyncDashboard {
                 search: this.filters.search
             });
             
-            const response = await fetch(`/api/logs?${params}`);
-            if (!response.ok) throw new Error('Failed to fetch logs');
-            
+            console.log(`📜 Loading logs from /api/dashboard/logs?${params}...`);
+            const response = await fetch(`/api/dashboard/logs?${params}`);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
             const data = await response.json();
+            console.log(`✅ Logs loaded: ${data.logs ? data.logs.length : 0} entries`, data);
             this.updateLogsTable(data);
+            this.retryCount = 0; // Reset retry count on success
         } catch (error) {
-            console.error('Error loading logs:', error);
+            console.error('❌ Error loading logs:', error);
+            this.handleAPIError('logs', error);
         }
     }
 
 
 
     updateMetrics(metrics) {
+        console.log('📈 Updating dashboard metrics...', metrics);
+        
         // Check if we have dashboard_metrics from the new API structure
         const dashboardMetrics = metrics.dashboard_metrics || metrics;
+        const systemMetrics = metrics.system_metrics || {};
+        const syncStatus = metrics.sync_status || {};
+        
+        console.log('Dashboard metrics extracted:', dashboardMetrics);
+        console.log('System metrics extracted:', systemMetrics);
         
         // Update statistics cards using dashboard_metrics
-        this.updateElement('totalDocs', this.formatNumber(dashboardMetrics.total_documents || 0));
-        this.updateElement('todayDocs', this.formatNumber(dashboardMetrics.total_documents || 0)); // Use same as total for now
-        this.updateElement('syncRate', this.formatNumber(dashboardMetrics.sync_rate || 0, 1));
-        this.updateElement('backlogSize', this.formatNumber(dashboardMetrics.backlog_size || 0));
-        this.updateElement('avgLatency', this.formatNumber(dashboardMetrics.avg_latency || 0, 1));
-        this.updateElement('activeWatchers', dashboardMetrics.active_watchers || 0);
+        this.updateElementWithLog('totalDocs', this.formatNumber(dashboardMetrics.total_documents || 0));
+        this.updateElementWithLog('todayDocs', this.formatNumber(dashboardMetrics.total_documents || 0)); // Use same as total for now
+        this.updateElementWithLog('syncRate', this.formatNumber(dashboardMetrics.sync_rate || 0, 1));
+        this.updateElementWithLog('backlogSize', this.formatNumber(dashboardMetrics.backlog_size || 0));
+        this.updateElementWithLog('avgLatency', this.formatNumber(dashboardMetrics.avg_latency || 0, 1));
+        this.updateElementWithLog('activeWatchers', dashboardMetrics.active_watchers || 0);
         
         // Update config info (fallback to original metrics structure)
-        this.updateElement('lastResumeToken', this.formatTimestamp(metrics.last_resume_token));
-        this.updateElement('syncMode', metrics.sync_mode || 'Unknown');
-        this.updateElement('lastCheckpoint', this.formatTimestamp(metrics.last_checkpoint));
-        this.updateElement('connectedClients', metrics.connected_clients || 0);
+        this.updateElementWithLog('lastResumeToken', this.formatTimestamp(metrics.last_resume_token || syncStatus.last_resume_token));
+        this.updateElementWithLog('syncMode', metrics.sync_mode || syncStatus.sync_mode || 'Unknown');
+        this.updateElementWithLog('lastCheckpoint', this.formatTimestamp(metrics.last_checkpoint || syncStatus.last_checkpoint));
+        this.updateElementWithLog('connectedClients', metrics.connected_clients || systemMetrics.connected_clients || 0);
+        
+        console.log('✅ Dashboard metrics updated successfully');
     }
 
     updateHealthStatus(health) {
+        console.log('🏥 Updating health status...', health);
+        
         this.updateConnectionStatus('sourceMongo', health.source_mongo || 'unknown');
         this.updateConnectionStatus('cloudSync', health.cloud_sync || 'unknown');
         this.updateConnectionStatus('vmSync', health.vm_sync || 'unknown');
@@ -212,8 +271,11 @@ class CloudSyncDashboard {
         
         // Update VM sync details if available
         if (health.vm_sync_info) {
+            console.log('📊 Updating VM sync details:', health.vm_sync_info);
             this.updateVMSyncDetails(health.vm_sync_info);
         }
+        
+        console.log('✅ Health status updated successfully');
     }
 
     updateConnectionStatus(component, status) {
@@ -243,7 +305,21 @@ class CloudSyncDashboard {
         
         if (clientsElement) {
             const clientCount = vmSyncInfo.connected_clients || 0;
-            clientsElement.textContent = `Connected clients: ${clientCount}`;
+            const targetDatabases = vmSyncInfo.target_databases || 0;
+            clientsElement.innerHTML = `
+                <div>Connected clients: ${clientCount}</div>
+                <div>Target databases: ${targetDatabases}</div>
+                <div>Transport: ${vmSyncInfo.transport_mode || 'HTTP'}</div>
+            `;
+            
+            // Show detailed client information if available
+            if (vmSyncInfo.client_details && vmSyncInfo.client_details.length > 0) {
+                const detailsHtml = vmSyncInfo.client_details.map(client => 
+                    `<div class="client-detail" style="margin-top: 4px; font-size: 0.8em; color: #888;">` +
+                    `${client.client_id} (${client.status}) - Connected: ${new Date(client.connected_at).toLocaleTimeString()}</div>`
+                ).join('');
+                clientsElement.innerHTML += detailsHtml;
+            }
         }
     }
 
@@ -257,25 +333,37 @@ class CloudSyncDashboard {
     }
 
     updateLogsTable(data) {
+        console.log('📜 Updating logs table...', data);
         const tbody = document.getElementById('logsTableBody');
         
+        if (!tbody) {
+            console.error('❌ Logs table body element not found');
+            return;
+        }
+        
         if (!data.logs || data.logs.length === 0) {
+            console.log('⚠️ No logs found, showing empty state');
             tbody.innerHTML = '<tr><td colspan="5" class="no-data">No logs found</td></tr>';
             return;
         }
         
-        tbody.innerHTML = data.logs.map(log => `
-            <tr>
-                <td>${this.formatTimestamp(log.timestamp)}</td>
-                <td><span class="status-badge ${log.stage}">${log.stage}</span></td>
-                <td>${log.action}</td>
-                <td><span class="status-badge ${log.status}">${log.status}</span></td>
-                <td>${log.message || '-'}</td>
-            </tr>
-        `).join('');
+        console.log(`📄 Rendering ${data.logs.length} log entries`);
+        tbody.innerHTML = data.logs.map((log, index) => {
+            console.log(`Log entry ${index}:`, log);
+            return `
+                <tr>
+                    <td>${this.formatTimestamp(log.timestamp)}</td>
+                    <td><span class="status-badge ${log.stage}">${log.stage}</span></td>
+                    <td>${log.action}</td>
+                    <td><span class="status-badge ${log.status}">${log.status}</span></td>
+                    <td>${log.message || '-'}</td>
+                </tr>
+            `;
+        }).join('');
         
         // Update pagination
         this.updatePagination(data.total, data.page, data.total_pages);
+        console.log('✅ Logs table updated successfully');
     }
 
     updatePagination(total, page, totalPages) {
@@ -354,6 +442,20 @@ class CloudSyncDashboard {
         const element = document.getElementById(id);
         if (element) {
             element.textContent = value;
+        } else {
+            console.warn(`⚠️ Element with ID '${id}' not found in DOM`);
+        }
+    }
+    
+    updateElementWithLog(id, value) {
+        console.log(`📋 Updating element '${id}' with value:`, value);
+        const element = document.getElementById(id);
+        if (element) {
+            const oldValue = element.textContent;
+            element.textContent = value;
+            console.log(`✅ Updated '${id}': '${oldValue}' -> '${value}'`);
+        } else {
+            console.error(`❌ Element with ID '${id}' not found in DOM`);
         }
     }
 
@@ -412,6 +514,40 @@ class CloudSyncDashboard {
         if (this.websocket) {
             this.websocket.close();
         }
+    }
+    
+    // 🚀 GOD MODE: Enhanced error handling and monitoring
+    handleAPIError(endpoint, error) {
+        console.error(`❌ API Error [${endpoint}]:`, error);
+        this.retryCount++;
+        
+        if (this.retryCount < this.maxRetries) {
+            console.log(`🔄 Retrying ${endpoint} (${this.retryCount}/${this.maxRetries})...`);
+            setTimeout(() => {
+                if (endpoint === 'metrics') this.loadMetrics();
+                else if (endpoint === 'health') this.loadHealthStatus();
+                else if (endpoint === 'logs') this.loadLogs();
+            }, 2000 * this.retryCount); // Exponential backoff
+        } else {
+            this.showError(`Failed to load ${endpoint} after ${this.maxRetries} attempts`);
+        }
+    }
+    
+    updateConnectionIndicator() {
+        const indicator = document.querySelector('.refresh-dot');
+        if (indicator) {
+            indicator.style.background = this.connectionState === 'connected' ? '#22c55e' : '#ef4444';
+        }
+    }
+    
+    // Enhanced logging for GOD MODE debugging
+    logDashboardEvent(event, data = {}) {
+        console.log(`🎯 Dashboard Event [${event}]:`, {
+            timestamp: new Date().toISOString(),
+            connectionState: this.connectionState,
+            retryCount: this.retryCount,
+            ...data
+        });
     }
 }
 

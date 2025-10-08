@@ -33,17 +33,17 @@ func (s State) String() string {
 
 // CircuitBreakerConfig holds configuration for the circuit breaker
 type CircuitBreakerConfig struct {
-	Name                string        `yaml:"name" json:"name"`
-	MaxRequests         uint32        `yaml:"max_requests" json:"max_requests"`
-	Interval            time.Duration `yaml:"interval" json:"interval"`
-	Timeout             time.Duration `yaml:"timeout" json:"timeout"`
-	ReadyToTrip         func(counts Counts) bool
-	OnStateChange       func(name string, from State, to State)
-	IsSuccessful        func(err error) bool
-	Fallback            func(ctx context.Context, err error) (interface{}, error)
-	MaxConcurrentCalls  int32         `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
-	SlowCallThreshold   time.Duration `yaml:"slow_call_threshold" json:"slow_call_threshold"`
-	SlowCallRateThreshold float64     `yaml:"slow_call_rate_threshold" json:"slow_call_rate_threshold"`
+	Name                  string        `yaml:"name" json:"name"`
+	MaxRequests           uint32        `yaml:"max_requests" json:"max_requests"`
+	Interval              time.Duration `yaml:"interval" json:"interval"`
+	Timeout               time.Duration `yaml:"timeout" json:"timeout"`
+	ReadyToTrip           func(counts Counts) bool
+	OnStateChange         func(name string, from State, to State)
+	IsSuccessful          func(err error) bool
+	Fallback              func(ctx context.Context, err error) (interface{}, error)
+	MaxConcurrentCalls    int32         `yaml:"max_concurrent_calls" json:"max_concurrent_calls"`
+	SlowCallThreshold     time.Duration `yaml:"slow_call_threshold" json:"slow_call_threshold"`
+	SlowCallRateThreshold float64       `yaml:"slow_call_rate_threshold" json:"slow_call_rate_threshold"`
 }
 
 // DefaultCircuitBreakerConfig returns default configuration
@@ -93,17 +93,17 @@ func (c Counts) SlowCallRate() float64 {
 
 // CircuitBreaker implements the circuit breaker pattern
 type CircuitBreaker struct {
-	config           *CircuitBreakerConfig
-	mu               sync.RWMutex
-	state            State
-	generation       uint64
-	counts           Counts
-	expiry           time.Time
-	concurrentCalls  int32
-	lastFailureTime  time.Time
-	lastSuccessTime  time.Time
-	stateChangeTime  time.Time
-	metrics          *CircuitBreakerMetrics
+	config          *CircuitBreakerConfig
+	mu              sync.RWMutex
+	state           State
+	generation      uint64
+	counts          Counts
+	expiry          time.Time
+	concurrentCalls int32
+	lastFailureTime time.Time
+	lastSuccessTime time.Time
+	stateChangeTime time.Time
+	metrics         *CircuitBreakerMetrics
 }
 
 // CircuitBreakerMetrics holds metrics for the circuit breaker

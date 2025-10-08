@@ -10,13 +10,13 @@ import (
 
 // Config holds memory management configuration
 type Config struct {
-	MaxBufferSize     int           `yaml:"max_buffer_size" json:"max_buffer_size"`         // Maximum buffer size in bytes
-	GCInterval        time.Duration `yaml:"gc_interval" json:"gc_interval"`                 // Garbage collection interval
-	MemoryThreshold   float64       `yaml:"memory_threshold" json:"memory_threshold"`       // Memory usage threshold (0.0-1.0)
-	MonitorInterval   time.Duration `yaml:"monitor_interval" json:"monitor_interval"`       // Memory monitoring interval
-	MaxChangeEvents   int           `yaml:"max_change_events" json:"max_change_events"`     // Max change events in buffer
-	BufferFlushSize   int           `yaml:"buffer_flush_size" json:"buffer_flush_size"`     // Size to trigger buffer flush
-	EnableCompression bool          `yaml:"enable_compression" json:"enable_compression"`   // Enable data compression
+	MaxBufferSize     int           `yaml:"max_buffer_size" json:"max_buffer_size"`       // Maximum buffer size in bytes
+	GCInterval        time.Duration `yaml:"gc_interval" json:"gc_interval"`               // Garbage collection interval
+	MemoryThreshold   float64       `yaml:"memory_threshold" json:"memory_threshold"`     // Memory usage threshold (0.0-1.0)
+	MonitorInterval   time.Duration `yaml:"monitor_interval" json:"monitor_interval"`     // Memory monitoring interval
+	MaxChangeEvents   int           `yaml:"max_change_events" json:"max_change_events"`   // Max change events in buffer
+	BufferFlushSize   int           `yaml:"buffer_flush_size" json:"buffer_flush_size"`   // Size to trigger buffer flush
+	EnableCompression bool          `yaml:"enable_compression" json:"enable_compression"` // Enable data compression
 }
 
 // DefaultConfig returns default memory management configuration

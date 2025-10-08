@@ -152,7 +152,7 @@ func (om *OplogMonitor) getOplogWindow() (primitive.Timestamp, primitive.Timesta
 	oplogColl := om.client.Database("local").Collection("oplog.rs")
 
 	// Get oldest entry
-	oldestOpts := options.FindOne().SetSort(bson.D{{"ts", 1}})
+	oldestOpts := options.FindOne().SetSort(bson.D{primitive.E{Key: "ts", Value: 1}})
 	var oldestEntry bson.M
 	err := oplogColl.FindOne(om.ctx, bson.D{}, oldestOpts).Decode(&oldestEntry)
 	if err != nil {
@@ -160,7 +160,7 @@ func (om *OplogMonitor) getOplogWindow() (primitive.Timestamp, primitive.Timesta
 	}
 
 	// Get newest entry
-	newestOpts := options.FindOne().SetSort(bson.D{{"ts", -1}})
+	newestOpts := options.FindOne().SetSort(bson.D{primitive.E{Key: "ts", Value: -1}})
 	var newestEntry bson.M
 	err = oplogColl.FindOne(om.ctx, bson.D{}, newestOpts).Decode(&newestEntry)
 	if err != nil {
@@ -178,7 +178,7 @@ func (om *OplogMonitor) extractTimestampFromResumeToken(resumeToken interface{})
 	// Resume tokens are typically BSON documents with timestamp information
 	// This is a simplified implementation - actual implementation would depend on
 	// the specific format of resume tokens used by MongoDB
-	
+
 	switch token := resumeToken.(type) {
 	case bson.M:
 		if ts, ok := token["_data"].(primitive.Timestamp); ok {
@@ -215,12 +215,12 @@ func IsResumeTokenError(err error) bool {
 
 // contains checks if a string contains a substring (case-insensitive)
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && 
-		(s == substr || 
-		 len(s) > len(substr) && 
-		 (s[:len(substr)] == substr || 
-		  s[len(s)-len(substr):] == substr || 
-		  containsAt(s, substr, 1)))
+	return len(s) >= len(substr) &&
+		(s == substr ||
+			len(s) > len(substr) &&
+				(s[:len(substr)] == substr ||
+					s[len(s)-len(substr):] == substr ||
+					containsAt(s, substr, 1)))
 }
 
 func containsAt(s, substr string, start int) bool {

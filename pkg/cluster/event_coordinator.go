@@ -2,49 +2,49 @@ package cluster
 
 import (
 	"context"
+	"go-data-sync-http/pkg/models"
+	"log"
 	"sync"
 	"time"
-	"log"
-	"go-data-sync-http/pkg/models"
 )
 
 // EventCoordinator manages event distribution and deduplication across workers
 type EventCoordinator struct {
-	mu           sync.RWMutex
-	eventBuffer  *EventBuffer
-	workerPool   *WorkerPool
-	inputQueue   chan *models.ChangeEvent
-	outputQueue  chan *models.ChangeEvent
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	config       EventCoordinatorConfig
-	stats        EventCoordinatorStats
-	processors   []EventProcessor
-	roundRobin   int
+	mu          sync.RWMutex
+	eventBuffer *EventBuffer
+	workerPool  *WorkerPool
+	inputQueue  chan *models.ChangeEvent
+	outputQueue chan *models.ChangeEvent
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	config      EventCoordinatorConfig
+	stats       EventCoordinatorStats
+	processors  []EventProcessor
+	roundRobin  int
 }
 
 // EventCoordinatorConfig holds configuration for the event coordinator
 type EventCoordinatorConfig struct {
-	InputQueueSize    int           `yaml:"input_queue_size" json:"input_queue_size"`
-	OutputQueueSize   int           `yaml:"output_queue_size" json:"output_queue_size"`
-	BatchSize         int           `yaml:"batch_size" json:"batch_size"`
-	BatchTimeout      time.Duration `yaml:"batch_timeout" json:"batch_timeout"`
-	DistributionMode  string        `yaml:"distribution_mode" json:"distribution_mode"` // "broadcast", "round_robin", "hash"
-	EnableDedup       bool          `yaml:"enable_dedup" json:"enable_dedup"`
-	BufferConfig      EventBufferConfig `yaml:"buffer" json:"buffer"`
-	WorkerPoolConfig  WorkerPoolConfig  `yaml:"worker_pool" json:"worker_pool"`
+	InputQueueSize   int               `yaml:"input_queue_size" json:"input_queue_size"`
+	OutputQueueSize  int               `yaml:"output_queue_size" json:"output_queue_size"`
+	BatchSize        int               `yaml:"batch_size" json:"batch_size"`
+	BatchTimeout     time.Duration     `yaml:"batch_timeout" json:"batch_timeout"`
+	DistributionMode string            `yaml:"distribution_mode" json:"distribution_mode"` // "broadcast", "round_robin", "hash"
+	EnableDedup      bool              `yaml:"enable_dedup" json:"enable_dedup"`
+	BufferConfig     EventBufferConfig `yaml:"buffer" json:"buffer"`
+	WorkerPoolConfig WorkerPoolConfig  `yaml:"worker_pool" json:"worker_pool"`
 }
 
 // EventCoordinatorStats holds statistics for the event coordinator
 type EventCoordinatorStats struct {
-	mu                sync.RWMutex
-	TotalReceived     int64 `json:"total_received"`
-	TotalProcessed    int64 `json:"total_processed"`
-	TotalDuplicates   int64 `json:"total_duplicates"`
-	TotalDropped      int64 `json:"total_dropped"`
-	CurrentInputQueue int   `json:"current_input_queue"`
-	CurrentOutputQueue int  `json:"current_output_queue"`
+	mu                 sync.RWMutex
+	TotalReceived      int64 `json:"total_received"`
+	TotalProcessed     int64 `json:"total_processed"`
+	TotalDuplicates    int64 `json:"total_duplicates"`
+	TotalDropped       int64 `json:"total_dropped"`
+	CurrentInputQueue  int   `json:"current_input_queue"`
+	CurrentOutputQueue int   `json:"current_output_queue"`
 }
 
 // NewEventCoordinator creates a new event coordinator

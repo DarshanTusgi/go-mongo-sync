@@ -11,7 +11,7 @@ import (
 type PrometheusExporter struct {
 	mu               sync.RWMutex
 	metricsCollector *MetricsCollector
-	
+
 	// Prometheus metrics
 	lagGauge         *prometheus.GaugeVec
 	throughputGauge  *prometheus.GaugeVec
@@ -27,7 +27,7 @@ func NewPrometheusExporter(metricsCollector *MetricsCollector) *PrometheusExport
 	exporter := &PrometheusExporter{
 		metricsCollector: metricsCollector,
 	}
-	
+
 	// Initialize Prometheus metrics
 	exporter.lagGauge = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -36,7 +36,7 @@ func NewPrometheusExporter(metricsCollector *MetricsCollector) *PrometheusExport
 		},
 		[]string{"database", "collection", "type"},
 	)
-	
+
 	exporter.throughputGauge = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "mongodb_sync_throughput",
@@ -44,7 +44,7 @@ func NewPrometheusExporter(metricsCollector *MetricsCollector) *PrometheusExport
 		},
 		[]string{"database", "collection", "metric"},
 	)
-	
+
 	exporter.errorCounter = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "mongodb_sync_errors_total",
@@ -52,7 +52,7 @@ func NewPrometheusExporter(metricsCollector *MetricsCollector) *PrometheusExport
 		},
 		[]string{"database", "collection", "error_type"},
 	)
-	
+
 	exporter.healthGauge = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "mongodb_sync_health_status",
@@ -60,14 +60,14 @@ func NewPrometheusExporter(metricsCollector *MetricsCollector) *PrometheusExport
 		},
 		[]string{"database", "collection", "component"},
 	)
-	
+
 	exporter.uptimeGauge = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "mongodb_sync_uptime_seconds",
 			Help: "MongoDB synchronization service uptime in seconds",
 		},
 	)
-	
+
 	exporter.syncStatusGauge = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "mongodb_sync_status",
@@ -75,14 +75,14 @@ func NewPrometheusExporter(metricsCollector *MetricsCollector) *PrometheusExport
 		},
 		[]string{"database", "collection", "client_id"},
 	)
-	
+
 	exporter.clientCountGauge = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "mongodb_sync_connected_clients",
 			Help: "Number of connected MongoDB sync clients",
 		},
 	)
-	
+
 	return exporter
 }
 
@@ -90,9 +90,9 @@ func NewPrometheusExporter(metricsCollector *MetricsCollector) *PrometheusExport
 func (pe *PrometheusExporter) UpdateMetrics() {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
-	
+
 	metrics := pe.metricsCollector.GetMetrics()
-	
+
 	// Update lag metrics
 	if lagMetrics, ok := metrics["lag_metrics"].(map[string]*LagMetrics); ok {
 		for key, lag := range lagMetrics {
@@ -104,7 +104,7 @@ func (pe *PrometheusExporter) UpdateMetrics() {
 			}
 		}
 	}
-	
+
 	// Update throughput metrics
 	if throughputMetrics, ok := metrics["throughput_metrics"].(map[string]*ThroughputMetrics); ok {
 		for key, throughput := range throughputMetrics {
@@ -118,14 +118,14 @@ func (pe *PrometheusExporter) UpdateMetrics() {
 			}
 		}
 	}
-	
+
 	// Update error metrics
 	if errorMetrics, ok := metrics["error_metrics"].(map[string]*ErrorMetrics); ok {
 		for _, errorMetric := range errorMetrics {
 			pe.errorCounter.WithLabelValues(errorMetric.Database, errorMetric.Collection, errorMetric.ErrorType).Add(float64(errorMetric.ErrorCount))
 		}
 	}
-	
+
 	// Update health metrics
 	if healthMetrics, ok := metrics["health_metrics"].(map[string]*HealthMetrics); ok {
 		for key, health := range healthMetrics {
@@ -140,7 +140,7 @@ func (pe *PrometheusExporter) UpdateMetrics() {
 			}
 		}
 	}
-	
+
 	// Update uptime
 	if uptime, ok := metrics["uptime"].(time.Duration); ok {
 		pe.uptimeGauge.Set(uptime.Seconds())
@@ -166,7 +166,7 @@ func (pe *PrometheusExporter) StartMetricsUpdater(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		
+
 		for range ticker.C {
 			pe.UpdateMetrics()
 		}

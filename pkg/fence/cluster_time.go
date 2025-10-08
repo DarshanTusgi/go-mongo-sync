@@ -28,12 +28,12 @@ type FenceConfig struct {
 
 // SnapshotFence represents a cluster time fence for snapshot consistency
 type SnapshotFence struct {
-	ClusterTime     *primitive.Timestamp `json:"cluster_time"`
-	OperationTime   *primitive.Timestamp `json:"operation_time"`
-	CapturedAt      time.Time            `json:"captured_at"`
-	SessionID       string               `json:"session_id"`
-	ReadConcern     string               `json:"read_concern"`
-	ReadPreference  string               `json:"read_preference"`
+	ClusterTime    *primitive.Timestamp `json:"cluster_time"`
+	OperationTime  *primitive.Timestamp `json:"operation_time"`
+	CapturedAt     time.Time            `json:"captured_at"`
+	SessionID      string               `json:"session_id"`
+	ReadConcern    string               `json:"read_concern"`
+	ReadPreference string               `json:"read_preference"`
 }
 
 // NewClusterTimeFence creates a new cluster time fence manager
@@ -86,10 +86,10 @@ func (ctf *ClusterTimeFence) CaptureSnapshotFence(ctx context.Context, database 
 
 	// Use majority read concern to ensure we get a consistent cluster time
 	opts := options.RunCmd()
-	
+
 	// Execute the command within the session context
 	err = mongo.WithSession(ctx, session, func(sc mongo.SessionContext) error {
-		return db.RunCommand(sc, bson.D{{"ping", 1}}, opts).Decode(&result)
+		return db.RunCommand(sc, bson.D{primitive.E{Key: "ping", Value: 1}}, opts).Decode(&result)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to capture cluster time: %v", err)
@@ -106,7 +106,7 @@ func (ctf *ClusterTimeFence) CaptureSnapshotFence(ctx context.Context, database 
 				clusterTime = bson.Raw(clusterTimeBytes)
 			}
 		}
-		
+
 		if clusterTime == nil {
 			return nil, fmt.Errorf("no cluster time available from session")
 		}
@@ -121,7 +121,7 @@ func (ctf *ClusterTimeFence) CaptureSnapshotFence(ctx context.Context, database 
 		ReadPreference: "primary",
 	}
 
-	log.Printf("Captured snapshot fence - ClusterTime: %v, OperationTime: %v", 
+	log.Printf("Captured snapshot fence - ClusterTime: %v, OperationTime: %v",
 		fence.ClusterTime, fence.OperationTime)
 
 	return fence, nil
@@ -150,7 +150,7 @@ func (ctf *ClusterTimeFence) ValidateChangeStreamStart(fence *SnapshotFence, sta
 		log.Printf("Warning: Snapshot fence is %v old, consider recapturing", time.Since(fence.CapturedAt))
 	}
 
-	log.Printf("Change stream start validated - StartTime: %v, Fence: %v", 
+	log.Printf("Change stream start validated - StartTime: %v, Fence: %v",
 		startAtOperationTime, fence.ClusterTime)
 
 	return nil
@@ -183,7 +183,7 @@ func (ctf *ClusterTimeFence) CreateSnapshotSession(ctx context.Context, fence *S
 	}
 
 	sessionOpts := options.Session()
-	
+
 	// Configure session for snapshot isolation if available
 	// Note: This requires MongoDB 4.0+ and specific storage engines
 	session, err := ctf.client.StartSession(sessionOpts)
@@ -228,8 +228,9 @@ func extractTimestamp(clusterTime bson.Raw) *primitive.Timestamp {
 
 // CompareTimestamps compares two timestamps and returns:
 // -1 if t1 < t2
-//  0 if t1 == t2
-//  1 if t1 > t2
+//
+//	0 if t1 == t2
+//	1 if t1 > t2
 func CompareTimestamps(t1, t2 *primitive.Timestamp) int {
 	if t1 == nil && t2 == nil {
 		return 0

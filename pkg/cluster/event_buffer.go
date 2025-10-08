@@ -1,28 +1,28 @@
 package cluster
 
 import (
-	"sync"
-	"time"
 	"container/ring"
 	"fmt"
 	"go-data-sync-http/pkg/models"
+	"sync"
+	"time"
 )
 
 // EventBuffer provides in-memory buffering with deduplication for change events
 type EventBuffer struct {
-	mu           sync.RWMutex
-	events       *ring.Ring
-	seenEvents   map[string]time.Time // event ID -> timestamp for deduplication
-	maxSize      int
-	ttl          time.Duration
+	mu            sync.RWMutex
+	events        *ring.Ring
+	seenEvents    map[string]time.Time // event ID -> timestamp for deduplication
+	maxSize       int
+	ttl           time.Duration
 	cleanupTicker *time.Ticker
-	stopCleanup  chan struct{}
+	stopCleanup   chan struct{}
 }
 
 // EventBufferConfig holds configuration for the event buffer
 type EventBufferConfig struct {
-	MaxSize     int           `yaml:"max_size" json:"max_size"`
-	TTL         time.Duration `yaml:"ttl" json:"ttl"`
+	MaxSize         int           `yaml:"max_size" json:"max_size"`
+	TTL             time.Duration `yaml:"ttl" json:"ttl"`
 	CleanupInterval time.Duration `yaml:"cleanup_interval" json:"cleanup_interval"`
 }
 
@@ -39,12 +39,12 @@ func NewEventBuffer(config EventBufferConfig) *EventBuffer {
 	}
 
 	buffer := &EventBuffer{
-		events:      ring.New(config.MaxSize),
-		seenEvents:  make(map[string]time.Time),
-		maxSize:     config.MaxSize,
-		ttl:         config.TTL,
+		events:        ring.New(config.MaxSize),
+		seenEvents:    make(map[string]time.Time),
+		maxSize:       config.MaxSize,
+		ttl:           config.TTL,
 		cleanupTicker: time.NewTicker(config.CleanupInterval),
-		stopCleanup: make(chan struct{}),
+		stopCleanup:   make(chan struct{}),
 	}
 
 	// Start cleanup goroutine
@@ -103,8 +103,8 @@ func (eb *EventBuffer) GetRecentEvents(since time.Duration) []*models.ChangeEven
 // generateEventID creates a unique identifier for an event based on its content
 func (eb *EventBuffer) generateEventID(event *models.ChangeEvent) string {
 	docKeyStr := fmt.Sprintf("%x", event.DocumentKey)
-	return event.Database + "|" + event.Collection + "|" + 
-		event.OperationType + "|" + docKeyStr + "|" + 
+	return event.Database + "|" + event.Collection + "|" +
+		event.OperationType + "|" + docKeyStr + "|" +
 		event.Timestamp.Format(time.RFC3339Nano)
 }
 

@@ -1,0 +1,3550 @@
+openapi: 3.0.3
+info:
+  title: Go Data Sync HTTP API
+  description: |
+    # Real-Time MongoDB Data Synchronization API
+
+    This API provides comprehensive endpoints for managing real-time MongoDB data synchronization between cloud and VM environments. The system supports OAuth2 authentication, adaptive performance optimization, and real-time monitoring.
+
+    ## Key Features
+    - **OAuth2 Client Credentials Flow** for secure authentication
+    - **Real-time Data Synchronization** using MongoDB change streams
+    - **Adaptive Performance Control** with automatic optimization
+    - **Comprehensive Monitoring** with metrics and health endpoints
+    - **WebSocket Support** for real-time updates
+    - **TCP and HTTP Transport** protocols
+
+    ## Authentication
+    Most endpoints require OAuth2 Bearer token authentication. Use the `/api/auth/token` endpoint to obtain access tokens.
+
+    ## Rate Limiting
+    - Global: 100 requests/second (burst: 200)
+    - Per-client: 20 requests/second (burst: 40)
+    - Per-IP connections: 10/minute
+
+  version: "2.0.0"
+  contact:
+    name: Go Data Sync API Support
+    url: https://github.com/your-org/go-data-sync-http
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Development server
+  - url: https://api.yourdomain.com
+    description: Production server
+
+security:
+  - BearerAuth: []
+  - AdminAPIKey: []
+
+paths:
+  # ==================== OAUTH2 AUTHENTICATION ====================
+  /api/auth/token:
+    post:
+      tags:
+        - OAuth2 Authentication
+      summary: Obtain OAuth2 Access Token
+      description: |
+        Implements OAuth2 Client Credentials Grant flow to obtain access tokens for API authentication.
+        
+        **Flow:**
+        1. Client provides client_id and client_secret
+        2. Server validates credentials against MongoDB
+        3. Returns JWT bearer token with 1-hour expiry
+        
+        **Security:**
+        - Client secrets are bcrypt-hashed in database
+        - JWT tokens include standard RFC 7519 claims + custom claims
+        - Tokens are signed with HMAC-SHA256
+      operationId: getOAuth2Token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+            example:
+              grant_type: "client_credentials"
+              client_id: "vm_sync_3e67555ad3836e65"
+              client_secret: "4684a92c64ad93d075018f0152fc5d0ac2f9d73ba2589b32c30e664e82e21e95"
+      responses:
+        '200':
+          description: Successfully obtained access token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+              example:
+                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                token_type: "Bearer"
+                expires_in: 3599
+                scope: "[sync data:read data:write]"
+        '400':
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuth2Error'
+              example:
+                error: "invalid_request"
+                error_description: "grant_type, client_id, and client_secret are required"
+        '401':
+          description: Invalid client credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuth2Error'
+              example:
+                error: "invalid_client"
+                error_description: "Invalid client credentials"
+
+  /api/auth/validate:
+    post:
+      tags:
+        - OAuth2 Authentication
+      summary: Validate JWT Token
+      description: |
+        Internal endpoint for validating JWT tokens and retrieving claims information.
+        Used by other services to verify token authenticity and extract user context.
+      operationId: validateToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - token
+              properties:
+                token:
+                  type: string
+                  description: JWT token to validate
+                  example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+      responses:
+        '200':
+          description: Token is valid
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+                    example: true
+                  client_id:
+                    type: string
+                    example: "vm_sync_3e67555ad3836e65"
+                  client_type:
+                    type: string
+                    example: "vm-sync"
+                  app_id:
+                    type: string
+                    example: "vm-sync-test-working"
+                  scopes:
+                    type: array
+                    items:
+                      type: string
+                    example: ["sync", "data:read", "data:write"]
+                  expires_at:
+                    type: integer
+                    format: int64
+                    description: Unix timestamp
+                    example: 1758890731
+        '401':
+          description: Invalid or expired token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuth2Error'
+
+  # ==================== OAUTH2 ADMIN ENDPOINTS ====================
+  /api/auth/admin/clients:
+    post:
+      tags:
+        - OAuth2 Administration
+      summary: Create New OAuth2 Client
+      description: |
+        Creates new OAuth2 client credentials with cryptographically secure client_id and client_secret.
+        
+        **Generated Credentials:**
+        - Client ID: 16 random bytes, hex-encoded with 'vm_sync_' prefix
+        - Client Secret: 32 random bytes, hex-encoded (64 characters)
+        - Secret stored as bcrypt hash in database
+        
+        **Requires Admin API Key:** `X-Admin-API-Key: admin-api-key-placeholder`
+      operationId: createOAuth2Client
+      security:
+        - AdminAPIKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClientRequest'
+            example:
+              app_id: "vm-sync-production"
+              name: "Production VM-Sync Instance"
+              description: "OAuth2 client for production VM synchronization"
+              scopes: ["sync", "data:read", "data:write", "metrics:read"]
+              vm_metadata:
+                hostname: "prod-vm-01"
+                max_collections: 50
+      responses:
+        '200':
+          description: Client created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateClientResponse'
+              example:
+                client_id: "vm_sync_a1b2c3d4e5f6a7b8"
+                client_secret: "9f8e7d6c5b4a39284756adf123456789abcdef..."
+                app_id: "vm-sync-production"
+                name: "Production VM-Sync Instance"
+                scopes: ["sync", "data:read", "data:write", "metrics:read"]
+                created_at: "2025-09-26T12:00:00Z"
+        '400':
+          description: Invalid request parameters
+        '401':
+          description: Admin API key required
+        '403':
+          description: Invalid admin API key
+
+    get:
+      tags:
+        - OAuth2 Administration
+      summary: List All OAuth2 Clients
+      description: |
+        Returns list of all OAuth2 clients with sensitive information redacted.
+        Client secrets are shown as "[REDACTED]" for security.
+      operationId: listOAuth2Clients
+      security:
+        - AdminAPIKey: []
+      responses:
+        '200':
+          description: List of OAuth2 clients
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  clients:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ClientCredentialsResponse'
+                  total:
+                    type: integer
+                    example: 3
+        '401':
+          description: Admin API key required
+        '403':
+          description: Invalid admin API key
+
+  /api/auth/admin/clients/{client_id}:
+    delete:
+      tags:
+        - OAuth2 Administration
+      summary: Revoke OAuth2 Client
+      description: |
+        Deactivates OAuth2 client credentials. The client will no longer be able to obtain new tokens.
+        Existing tokens remain valid until expiry.
+      operationId: revokeOAuth2Client
+      security:
+        - AdminAPIKey: []
+      parameters:
+        - name: client_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "vm_sync_a1b2c3d4e5f6a7b8"
+          description: OAuth2 client ID to revoke
+      responses:
+        '204':
+          description: Client revoked successfully
+        '400':
+          description: client_id is required
+        '401':
+          description: Admin API key required
+        '403':
+          description: Invalid admin API key
+        '500':
+          description: Failed to revoke client
+
+  # ==================== DATA SYNCHRONIZATION ====================
+  /api/data:
+    post:
+      tags:
+        - Data Synchronization
+      summary: Handle Data Request
+      description: |
+        Processes data synchronization requests from VM-Sync clients.
+        Supports pagination, filtering, and resume token management.
+      operationId: handleDataRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                database:
+                  type: string
+                  example: "production_db"
+                collection:
+                  type: string
+                  example: "users"
+                page:
+                  type: integer
+                  example: 1
+                limit:
+                  type: integer
+                  example: 1000
+                resume_token:
+                  type: string
+                  description: MongoDB resume token for change streams
+      responses:
+        '200':
+          description: Data retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documents:
+                    type: array
+                    items:
+                      type: object
+                  has_more:
+                    type: boolean
+                  next_page:
+                    type: integer
+                  resume_token:
+                    type: string
+        '400':
+          description: Invalid request parameters
+        '401':
+          description: Authentication required
+
+  /api/partitions:
+    post:
+      tags:
+        - Data Synchronization
+      summary: Handle Partition Request
+      description: |
+        Manages data partitioning for distributed synchronization across multiple VM instances.
+      operationId: handlePartitionsRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                database:
+                  type: string
+                collection:
+                  type: string
+                partition_count:
+                  type: integer
+      responses:
+        '200':
+          description: Partition information retrieved
+        '401':
+          description: Authentication required
+
+  # ==================== SYNC CONTROL ====================
+  /api/sync/trigger:
+    post:
+      tags:
+        - Sync Control
+      summary: Trigger Manual Initial Sync
+      description: |
+        Manually triggers initial data synchronization for specified collections.
+        Supports force resync option to bypass resume tokens.
+      operationId: triggerInitialSync
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                collections:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      database:
+                        type: string
+                      collection:
+                        type: string
+                force_resync:
+                  type: boolean
+                  description: Force full resync bypassing resume tokens
+              example:
+                collections:
+                  - database: "production_db"
+                    collection: "users"
+                  - database: "production_db"
+                    collection: "orders"
+                force_resync: false
+      responses:
+        '200':
+          description: Sync triggered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  collections_triggered:
+                    type: integer
+        '400':
+          description: Invalid request parameters
+        '401':
+          description: Authentication required
+
+  /api/sync/status:
+    get:
+      tags:
+        - Sync Control
+      summary: Get Sync Status
+      description: |
+        Returns current synchronization status for all collections including:
+        - Sync progress and completion status
+        - Document counts and throughput
+        - Error information and timestamps
+        - Resume token status
+      operationId: getSyncStatus
+      responses:
+        '200':
+          description: Sync status retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collections:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        database:
+                          type: string
+                        collection:
+                          type: string
+                        status:
+                          type: string
+                          enum: ["idle", "syncing", "completed", "error"]
+                        documents_synced:
+                          type: integer
+                        total_documents:
+                          type: integer
+                        started_at:
+                          type: string
+                          format: date-time
+                        completed_at:
+                          type: string
+                          format: date-time
+                        error_message:
+                          type: string
+                  summary:
+                    type: object
+                    properties:
+                      total_collections:
+                        type: integer
+                      syncing_collections:
+                        type: integer
+                      completed_collections:
+                        type: integer
+                      error_collections:
+                        type: integer
+        '401':
+          description: Authentication required
+
+  # ==================== HEALTH AND MONITORING ====================
+  /health:
+    get:
+      tags:
+        - Health & Monitoring
+      summary: System Health Check
+      description: |
+        Comprehensive health check endpoint providing system status and connectivity information.
+        Includes MongoDB connections, service health, and system resources.
+      operationId: getHealthStatus
+      security: []
+      responses:
+        '200':
+          description: System health information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source_mongo:
+                    type: string
+                    enum: ["connected", "disconnected", "error"]
+                    example: "connected"
+                  cloud_sync:
+                    type: string
+                    enum: ["running", "stopped", "error"]
+                    example: "running"
+                  vm_sync:
+                    type: string
+                    enum: ["connected", "disconnected", "unknown"]
+                    example: "connected"
+                  system_health:
+                    type: object
+                    properties:
+                      memory_usage_mb:
+                        type: number
+                        format: float
+                        example: 45.2
+                      cpu_usage_percent:
+                        type: number
+                        format: float
+                        example: 12.3
+                      active_connections:
+                        type: integer
+                        example: 2
+                      uptime_seconds:
+                        type: integer
+                        example: 86400
+                  features:
+                    type: object
+                    properties:
+                      tcp_transport:
+                        type: boolean
+                        example: true
+                      encryption:
+                        type: boolean
+                        example: true
+                      buffer_free:
+                        type: boolean
+                        example: true
+                      oauth2_auth:
+                        type: boolean
+                        example: true
+                  components:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        status:
+                          type: string
+                        last_check:
+                          type: string
+                          format: date-time
+
+  # ==================== METRICS ====================
+  /metrics:
+    get:
+      tags:
+        - Metrics
+      summary: Prometheus Metrics Endpoint
+      description: |
+        Prometheus-compatible metrics endpoint exposing system metrics in OpenMetrics format.
+        Includes custom metrics for data sync operations, performance counters, and error rates.
+      operationId: getPrometheusMetrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus metrics in text format
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP go_data_sync_documents_total Total number of documents synchronized
+                # TYPE go_data_sync_documents_total counter
+                go_data_sync_documents_total{database="production_db",collection="users"} 150000
+                
+                # HELP go_data_sync_throughput_docs_per_second Current synchronization throughput
+                # TYPE go_data_sync_throughput_docs_per_second gauge
+                go_data_sync_throughput_docs_per_second 245.7
+
+  /api/metrics:
+    get:
+      tags:
+        - Metrics
+      summary: JSON Metrics Endpoint
+      description: |
+        Comprehensive system metrics in JSON format for dashboard consumption.
+        Includes performance metrics, resource utilization, and operational statistics.
+      operationId: getJSONMetrics
+      responses:
+        '200':
+          description: System metrics in JSON format
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sync_metrics:
+                    type: object
+                    properties:
+                      total_documents_synced:
+                        type: integer
+                        example: 150000
+                      current_throughput:
+                        type: number
+                        format: float
+                        example: 245.7
+                      active_streams:
+                        type: integer
+                        example: 4
+                  performance_metrics:
+                    type: object
+                    properties:
+                      avg_latency_ms:
+                        type: number
+                        format: float
+                        example: 23.4
+                      memory_usage_mb:
+                        type: number
+                        format: float
+                        example: 128.5
+                      cpu_usage_percent:
+                        type: number
+                        format: float
+                        example: 15.2
+                  error_metrics:
+                    type: object
+                    properties:
+                      total_errors:
+                        type: integer
+                        example: 3
+                      error_rate:
+                        type: number
+                        format: float
+                        example: 0.02
+                      last_error:
+                        type: string
+                        format: date-time
+
+  /api/metrics/lag:
+    get:
+      tags:
+        - Metrics
+      summary: Synchronization Lag Metrics
+      description: Detailed lag metrics showing synchronization delays and backlog information
+      operationId: getLagMetrics
+      responses:
+        '200':
+          description: Lag metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collections:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        database:
+                          type: string
+                        collection:
+                          type: string
+                        lag_seconds:
+                          type: number
+                        backlog_size:
+                          type: integer
+
+  /api/metrics/throughput:
+    get:
+      tags:
+        - Metrics
+      summary: Throughput Metrics
+      description: Real-time and historical throughput metrics for data synchronization
+      operationId: getThroughputMetrics
+      responses:
+        '200':
+          description: Throughput metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  current_throughput:
+                    type: object
+                    properties:
+                      docs_per_second:
+                        type: number
+                      bytes_per_second:
+                        type: number
+                  historical_throughput:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: string
+                          format: date-time
+                        docs_per_second:
+                          type: number
+
+  /api/metrics/health:
+    get:
+      tags:
+        - Metrics
+      summary: Health Metrics
+      description: Component health metrics and availability statistics
+      operationId: getHealthMetrics
+      responses:
+        '200':
+          description: Health metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  components:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        status:
+                          type: string
+                          enum: ["healthy", "unhealthy", "unknown"]
+                        uptime_seconds:
+                          type: integer
+                        last_check:
+                          type: string
+                          format: date-time
+
+  /api/metrics/errors:
+    get:
+      tags:
+        - Metrics
+      summary: Error Metrics
+      description: Detailed error metrics including error types, frequencies, and recent errors
+      operationId: getErrorMetrics
+      responses:
+        '200':
+          description: Error metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error_summary:
+                    type: object
+                    properties:
+                      total_errors:
+                        type: integer
+                      error_rate:
+                        type: number
+                      errors_by_type:
+                        type: object
+                        additionalProperties:
+                          type: integer
+                  recent_errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: string
+                          format: date-time
+                        error_type:
+                          type: string
+                        message:
+                          type: string
+                        component:
+                          type: string
+
+  # ==================== ALERTS ====================
+  /api/alerts:
+    get:
+      tags:
+        - Alerts
+      summary: Get Active Alerts
+      description: Returns all currently active system alerts
+      operationId: getActiveAlerts
+      responses:
+        '200':
+          description: List of active alerts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Alert'
+
+  /api/alerts/history:
+    get:
+      tags:
+        - Alerts
+      summary: Get Alert History
+      description: Retrieve historical alert data with pagination
+      operationId: getAlertHistory
+      parameters:
+        - name: limit
+          in: query
+          description: Number of alerts to return
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: offset
+          in: query
+          description: Number of alerts to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Alert history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertHistoryResponse'
+
+  /api/alerts/rules:
+    get:
+      tags:
+        - Alerts
+      summary: Get Alert Rules
+      description: Retrieve configured alert rules
+      operationId: getAlertRules
+      responses:
+        '200':
+          description: Alert rules
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRulesResponse'
+    post:
+      tags:
+        - Alerts
+      summary: Create Alert Rule
+      description: Create a new alert rule
+      operationId: createAlertRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAlertRuleRequest'
+      responses:
+        '201':
+          description: Alert rule created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+
+  /api/alerts/rules/{id}:
+    put:
+      tags:
+        - Alerts
+      summary: Update Alert Rule
+      description: Update an existing alert rule
+      operationId: updateAlertRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Alert rule ID
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAlertRuleRequest'
+      responses:
+        '200':
+          description: Alert rule updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+    delete:
+      tags:
+        - Alerts
+      summary: Delete Alert Rule
+      description: Delete an alert rule
+      operationId: deleteAlertRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Alert rule ID
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Alert rule deleted
+
+  # ==================== BUFFER-FREE SYSTEM ENDPOINTS ====================
+  /api/buffer-free/status:
+    get:
+      tags:
+        - Buffer-Free System
+      summary: Buffer-Free System Status
+      description: |
+        Status of the buffer-free resume token system that enables zero-memory 
+        change stream monitoring.
+      operationId: getBufferFreeStatus
+      responses:
+        '200':
+          description: Buffer-free system status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BufferFreeStatusResponse'
+
+  /api/buffer-free/tokens:
+    get:
+      tags:
+        - Buffer-Free System
+      summary: Resume Token Status
+      description: |
+        Status and management information for resume tokens used in 
+        buffer-free change stream monitoring.
+      operationId: getTokenStatus
+      responses:
+        '200':
+          description: Resume token status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenStatusResponse'
+
+  # ==================== VM-SYNC CLIENT ENDPOINTS ====================
+  /api/v1/push/{database}/{collection}:
+    post:
+      tags:
+        - VM-Sync Client
+      summary: Push Data to VM-Sync
+      description: |
+        Endpoint for cloud-sync to push synchronized data to VM-sync clients.
+        This is an internal endpoint used by the synchronization system.
+      operationId: pushDataToVM
+      servers:
+        - url: http://localhost:8081
+          description: VM-Sync Server
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: Target database name
+          schema:
+            type: string
+            example: inventory
+        - name: collection
+          in: path
+          required: true
+          description: Target collection name
+          schema:
+            type: string
+            example: products
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PageResult'
+      responses:
+        '200':
+          description: Data processed successfully
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Data processed successfully"
+        '400':
+          description: Invalid request data
+        '500':
+          description: Processing error
+
+  /api/v1/checkpoint/{collection}:
+    get:
+      tags:
+        - VM-Sync Client
+      summary: Check Checkpoint Existence
+      description: |
+        Check if a checkpoint exists for the specified collection. 
+        Used for resumable synchronization.
+      operationId: checkCheckpoint
+      servers:
+        - url: http://localhost:8081
+          description: VM-Sync Server
+      parameters:
+        - name: collection
+          in: path
+          required: true
+          description: Collection key in format "database.collection"
+          schema:
+            type: string
+            example: inventory.products
+      responses:
+        '200':
+          description: Checkpoint exists
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Checkpoint exists"
+        '404':
+          description: No checkpoint found
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "No checkpoint found"
+        '400':
+          description: Invalid collection format
+
+  /api/v1/clear/{collection}:
+    delete:
+      tags:
+        - VM-Sync Client
+      summary: Clear Collection and Checkpoint
+      description: |
+        Clear the specified collection and its associated checkpoint. 
+        Used for resetting synchronization state.
+      operationId: clearCollection
+      servers:
+        - url: http://localhost:8081
+          description: VM-Sync Server
+      parameters:
+        - name: collection
+          in: path
+          required: true
+          description: Collection key in format "database.collection"
+          schema:
+            type: string
+            example: inventory.products
+      responses:
+        '200':
+          description: Collection cleared successfully
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Collection cleared"
+        '400':
+          description: Invalid collection format
+
+  # ==================== WEBSOCKET ENDPOINT ====================
+  /ws:
+    get:
+      tags:
+        - Data Synchronization
+      summary: WebSocket Connection
+      description: |
+        WebSocket endpoint for real-time data synchronization and dashboard updates.
+        
+        **Client Types:**
+        - `vm-sync`: VM client connections for data synchronization
+        - `dashboard`: Dashboard connections for real-time updates
+        
+        **Message Types:**
+        - Binary messages: BSON-encoded change events (optionally encrypted)
+        - Text messages: JSON status updates and configuration messages
+        
+        **Authentication:**
+        - License-based authentication via headers or OAuth2 tokens
+        
+        **Usage:**
+        ```javascript
+        const ws = new WebSocket('ws://localhost:8080/ws');
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          // Handle real-time updates
+        };
+        ```
+      operationId: connectWebSocket
+      security:
+        - BearerAuth: []
+        - LicenseAuth: []
+        - {}
+      responses:
+        '101':
+          description: WebSocket connection established
+        '400':
+          description: WebSocket upgrade failed
+        '401':
+          description: Authentication failed
+
+# ==================== COMPONENTS ====================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        OAuth2 JWT Bearer token authentication. Obtain tokens via `/api/auth/token` endpoint.
+        
+        **Usage:** `Authorization: Bearer <token>`
+    
+    AdminKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: |
+        Admin API key for administrative operations. Set via environment variable.
+        
+        **Usage:** `X-Admin-Key: <admin_key>`
+    
+    LicenseAuth:
+      type: apiKey
+      in: header
+      name: X-License-Key
+      description: |
+        License key authentication for VM-sync clients.
+        
+        **Usage:** `X-License-Key: <license_key>`
+
+  schemas:
+    # ==================== OAUTH2 SCHEMAS ====================
+    TokenResponse:
+      type: object
+      required:
+        - access_token
+        - token_type
+        - expires_in
+      properties:
+        access_token:
+          type: string
+          description: JWT access token
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        token_type:
+          type: string
+          enum: [Bearer]
+          description: Token type (always "Bearer")
+        expires_in:
+          type: integer
+          description: Token lifetime in seconds
+          example: 3600
+        scope:
+          type: string
+          description: Granted scopes
+          example: "data_sync monitoring"
+    
+    TokenValidationResponse:
+      type: object
+      properties:
+        valid:
+          type: boolean
+          description: Whether token is valid
+        client_id:
+          type: string
+          description: Client identifier
+        client_type:
+          type: string
+          description: Type of client
+        app_id:
+          type: string
+          description: Application identifier
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Token scopes
+        expires_at:
+          type: integer
+          description: Token expiration timestamp
+    
+    CreateClientRequest:
+      type: object
+      required:
+        - name
+        - client_type
+      properties:
+        name:
+          type: string
+          description: Human-readable client name
+          example: "VM Sync Client - Production"
+        description:
+          type: string
+          description: Client description
+          example: "Production VM sync client for data center 1"
+        client_type:
+          type: string
+          enum: [vm_sync, dashboard, api_client]
+          description: Type of client
+        app_id:
+          type: string
+          description: Application identifier
+          example: "vm-datacenter-1"
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Requested scopes
+          example: ["data_sync", "monitoring"]
+        expires_at:
+          type: string
+          format: date-time
+          description: Client expiration time
+          example: "2024-12-31T23:59:59Z"
+    
+    CreateClientResponse:
+      type: object
+      properties:
+        client_id:
+          type: string
+          description: Generated client ID
+          example: "vm_sync_3e67555ad3836e65"
+        client_secret:
+          type: string
+          description: Generated client secret
+          example: "4684a92c64ad93d075018f0152fc5d0ac2f9d73ba2589b32c30e664e82e21e95"
+        name:
+          type: string
+          description: Client name
+        client_type:
+          type: string
+          description: Client type
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiration timestamp
+    
+    ClientListResponse:
+      type: object
+      properties:
+        clients:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClientInfo'
+        total:
+          type: integer
+          description: Total number of clients
+        limit:
+          type: integer
+          description: Items per page
+        offset:
+          type: integer
+          description: Current offset
+    
+    ClientInfo:
+      type: object
+      properties:
+        client_id:
+          type: string
+        name:
+          type: string
+        client_type:
+          type: string
+        app_id:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        last_used:
+          type: string
+          format: date-time
+    
+    OAuth2Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - invalid_client
+            - invalid_grant
+            - unauthorized_client
+            - unsupported_grant_type
+            - invalid_scope
+            - server_error
+          description: OAuth2 error code
+        error_description:
+          type: string
+          description: Human-readable error description
+        error_uri:
+          type: string
+          format: uri
+          description: URL to error documentation
+    
+    # ==================== DATA SYNC SCHEMAS ====================
+    DataRequest:
+      type: object
+      required:
+        - database
+        - collection
+      properties:
+        database:
+          type: string
+          description: Source database name
+          example: "inventory"
+        collection:
+          type: string
+          description: Source collection name
+          example: "products"
+        page:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Page number for pagination
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 1000
+          description: Maximum documents per page
+        filter:
+          type: object
+          description: MongoDB query filter
+          example:
+            status: "active"
+            quantity: { "$gt": 0 }
+        fields:
+          type: array
+          items:
+            type: string
+          description: Specific fields to include
+          example: ["name", "price", "status"]
+        sort:
+          type: object
+          description: Sort specification
+          example:
+            created_at: -1
+    
+    DataResponse:
+      type: object
+      properties:
+        documents:
+          type: array
+          items:
+            type: object
+          description: Retrieved documents
+        page:
+          type: integer
+          description: Current page number
+        limit:
+          type: integer
+          description: Documents per page
+        total:
+          type: integer
+          description: Total document count
+        has_more:
+          type: boolean
+          description: Whether more pages exist
+        resume_token:
+          type: string
+          description: Resume token for change streams
+    
+    PartitionRequest:
+      type: object
+      required:
+        - database
+        - collection
+        - partitions
+      properties:
+        database:
+          type: string
+          description: Database name
+        collection:
+          type: string
+          description: Collection name
+        partitions:
+          type: integer
+          minimum: 1
+          maximum: 16
+          description: Number of partitions
+        partition_field:
+          type: string
+          default: "_id"
+          description: Field to partition on
+        limit_per_partition:
+          type: integer
+          default: 10000
+          description: Max documents per partition
+    
+    PartitionResponse:
+      type: object
+      properties:
+        partitions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PartitionInfo'
+        total_documents:
+          type: integer
+          description: Total documents across all partitions
+    
+    PartitionInfo:
+      type: object
+      properties:
+        partition_id:
+          type: integer
+          description: Partition identifier
+        range:
+          type: object
+          description: Partition range bounds
+        document_count:
+          type: integer
+          description: Documents in this partition
+        documents:
+          type: array
+          items:
+            type: object
+          description: Partition documents
+    
+    SyncStatusResponse:
+      type: object
+      properties:
+        sync_operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncOperation'
+        overall_status:
+          type: string
+          enum: [idle, running, paused, error]
+          description: Overall sync status
+        last_sync:
+          type: string
+          format: date-time
+          description: Last sync operation time
+    
+    SyncOperation:
+      type: object
+      properties:
+        sync_id:
+          type: string
+          description: Sync operation identifier
+        database:
+          type: string
+          description: Database being synced
+        collection:
+          type: string
+          description: Collection being synced
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        progress:
+          type: object
+          properties:
+            documents_processed:
+              type: integer
+            total_documents:
+              type: integer
+            percentage:
+              type: number
+              format: float
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        error_message:
+          type: string
+          description: Error details if status is failed
+    
+    PageResult:
+      type: object
+      description: Data structure for VM-sync push operations
+      properties:
+        page_number:
+          type: integer
+          description: Current page number
+        total_pages:
+          type: integer
+          description: Total number of pages
+        documents:
+          type: array
+          items:
+            type: object
+          description: Page documents
+        error:
+          type: object
+          description: Error information if any
+    
+    # ==================== HEALTH & MONITORING SCHEMAS ====================
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          description: Overall system health
+        source_mongo:
+          type: string
+          enum: [connected, disconnected, error]
+          description: Source MongoDB connection status
+        cloud_sync:
+          type: string
+          enum: [connected, disconnected, error]
+          description: Cloud sync service status
+        vm_sync:
+          type: string
+          enum: [connected, disconnected, error]
+          description: VM sync connections status
+        system_health:
+          type: object
+          properties:
+            memory_usage_mb:
+              type: number
+              format: float
+              description: Memory usage in MB
+            cpu_usage_percent:
+              type: number
+              format: float
+              description: CPU usage percentage
+            active_connections:
+              type: integer
+              description: Number of active connections
+            uptime_seconds:
+              type: integer
+              description: System uptime in seconds
+        features:
+          type: object
+          properties:
+            tcp_transport:
+              type: boolean
+              description: TCP transport enabled
+            encryption:
+              type: boolean
+              description: Encryption enabled
+            buffer_free:
+              type: boolean
+              description: Buffer-free system enabled
+            oauth2_auth:
+              type: boolean
+              description: OAuth2 authentication enabled
+        version:
+          type: string
+          description: System version
+          example: "1.0.0"
+        build_info:
+          type: object
+          properties:
+            commit:
+              type: string
+              description: Git commit hash
+            build_time:
+              type: string
+              format: date-time
+              description: Build timestamp
+    
+    # ==================== METRICS SCHEMAS ====================
+    MetricsResponse:
+      type: object
+      properties:
+        sync_metrics:
+          $ref: '#/components/schemas/SyncMetrics'
+        performance_metrics:
+          $ref: '#/components/schemas/PerformanceMetrics'
+        system_metrics:
+          $ref: '#/components/schemas/SystemMetrics'
+        timestamp:
+          type: string
+          format: date-time
+          description: Metrics collection time
+    
+    SyncMetrics:
+      type: object
+      properties:
+        total_documents:
+          type: integer
+          description: Total documents synchronized
+        sync_rate:
+          type: number
+          format: float
+          description: Documents per second
+        active_watchers:
+          type: integer
+          description: Active change stream watchers
+        last_resume_token:
+          type: string
+          description: Latest resume token
+    
+    PerformanceMetrics:
+      type: object
+      properties:
+        avg_latency_ms:
+          type: number
+          format: float
+          description: Average operation latency
+        throughput_mbps:
+          type: number
+          format: float
+          description: Data throughput in MB/s
+        queue_depth:
+          type: integer
+          description: Current queue depth
+        error_rate:
+          type: number
+          format: float
+          description: Error rate percentage
+    
+    SystemMetrics:
+      type: object
+      properties:
+        cpu_usage:
+          type: number
+          format: float
+          description: CPU usage percentage
+        memory_usage:
+          type: number
+          format: float
+          description: Memory usage percentage
+        disk_usage:
+          type: number
+          format: float
+          description: Disk usage percentage
+        network_io:
+          type: object
+          properties:
+            bytes_sent:
+              type: integer
+            bytes_received:
+              type: integer
+    
+    LagMetrics:
+      type: object
+      properties:
+        replication_lag_ms:
+          type: number
+          format: float
+          description: Replication lag in milliseconds
+        change_stream_lag_ms:
+          type: number
+          format: float
+          description: Change stream processing lag
+        network_latency_ms:
+          type: number
+          format: float
+          description: Network round-trip time
+    
+    ThroughputMetrics:
+      type: object
+      properties:
+        documents_per_second:
+          type: number
+          format: float
+          description: Document processing rate
+        bytes_per_second:
+          type: number
+          format: float
+          description: Data transfer rate
+        operations_per_second:
+          type: number
+          format: float
+          description: Operation processing rate
+    
+    HealthMetrics:
+      type: object
+      properties:
+        connection_health:
+          type: object
+          properties:
+            mongodb_connections:
+              type: integer
+            websocket_connections:
+              type: integer
+            tcp_connections:
+              type: integer
+        resource_health:
+          type: object
+          properties:
+            memory_available_mb:
+              type: number
+              format: float
+            disk_available_gb:
+              type: number
+              format: float
+            cpu_load_average:
+              type: number
+              format: float
+    
+    ErrorMetrics:
+      type: object
+      properties:
+        total_errors:
+          type: integer
+          description: Total error count
+        error_rate_per_minute:
+          type: number
+          format: float
+          description: Errors per minute
+        error_categories:
+          type: object
+          properties:
+            connection_errors:
+              type: integer
+            sync_errors:
+              type: integer
+            authentication_errors:
+              type: integer
+            system_errors:
+              type: integer
+    
+    ChartDataResponse:
+      type: object
+      properties:
+        time_series:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeSeriesPoint'
+        metadata:
+          type: object
+          properties:
+            metric_name:
+              type: string
+            time_range:
+              type: string
+            resolution:
+              type: string
+    
+    TimeSeriesPoint:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        value:
+          type: number
+          format: float
+        label:
+          type: string
+    
+    # ==================== DASHBOARD SCHEMAS ====================
+    DashboardMetrics:
+      type: object
+      properties:
+        dashboard_metrics:
+          type: object
+          properties:
+            total_documents:
+              type: integer
+              description: Total documents synced
+            sync_rate:
+              type: number
+              format: float
+              description: Current sync rate
+            active_watchers:
+              type: integer
+              description: Active change stream watchers
+            avg_latency:
+              type: number
+              format: float
+              description: Average latency in ms
+        enhanced_logging:
+          type: object
+          properties:
+            total_entries:
+              type: integer
+              description: Total log entries
+            error_entries:
+              type: integer
+              description: Error log entries
+            warning_entries:
+              type: integer
+              description: Warning log entries
+        real_time_status:
+          type: object
+          properties:
+            websocket_connected:
+              type: boolean
+              description: WebSocket connection status
+            last_update:
+              type: string
+              format: date-time
+              description: Last metrics update time
+    
+    DashboardLogsResponse:
+      type: object
+      properties:
+        logs:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogEntry'
+        pagination:
+          type: object
+          properties:
+            page:
+              type: integer
+            limit:
+              type: integer
+            total:
+              type: integer
+            has_more:
+              type: boolean
+        filters:
+          type: object
+          properties:
+            stage:
+              type: string
+            status:
+              type: string
+            search:
+              type: string
+    
+    LogEntry:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Log entry identifier
+        timestamp:
+          type: string
+          format: date-time
+          description: Log timestamp
+        level:
+          type: string
+          enum: [debug, info, warn, error]
+          description: Log level
+        message:
+          type: string
+          description: Log message
+        stage:
+          type: string
+          description: System stage/component
+        status:
+          type: string
+          description: Operation status
+        correlation_id:
+          type: string
+          description: Request correlation ID
+        details:
+          type: object
+          description: Additional log details
+    
+    # ==================== ADAPTIVE CONTROLLER SCHEMAS ====================
+    AdaptiveStatsResponse:
+      type: object
+      properties:
+        is_active:
+          type: boolean
+          description: Whether adaptive controller is active
+        current_config:
+          $ref: '#/components/schemas/AdaptiveConfig'
+        effectiveness_score:
+          type: number
+          format: float
+          description: Current effectiveness score (0.0-1.0)
+        health_status:
+          type: string
+          enum: [healthy, degraded, disabled]
+          description: Adaptive system health
+        telemetry:
+          type: object
+          properties:
+            vm_telemetry:
+              $ref: '#/components/schemas/TelemetryData'
+            cloud_telemetry:
+              $ref: '#/components/schemas/TelemetryData'
+        last_adjustment:
+          type: string
+          format: date-time
+          description: Last configuration adjustment time
+        adjustment_count:
+          type: integer
+          description: Total adjustments made
+    
+    AdaptiveConfig:
+      type: object
+      description: Adaptive performance configuration
+      properties:
+        fetch_parallelism:
+          type: integer
+          description: Number of parallel fetch operations
+          minimum: 1
+          maximum: 100
+          default: 10
+        batch_size:
+          type: integer
+          description: Batch size for operations
+          minimum: 1
+          maximum: 10000
+          default: 1000
+        worker_count:
+          type: integer
+          description: Number of worker threads
+          minimum: 1
+          maximum: 50
+          default: 5
+
+  /api/alerts/history:
+    get:
+      tags:
+        - Alerts
+      summary: Get Alert History
+      description: Returns historical alert information
+      operationId: getAlertHistory
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Alert history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Alert'
+
+  /api/alerts/rules:
+    get:
+      tags:
+        - Alerts
+      summary: Get Alert Rules
+      description: Returns configured alert rules
+      operationId: getAlertRules
+      responses:
+        '200':
+          description: List of alert rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AlertRule'
+
+    post:
+      tags:
+        - Alerts
+      summary: Create Alert Rule
+      description: Creates a new alert rule
+      operationId: createAlertRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRule'
+      responses:
+        '201':
+          description: Alert rule created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+
+  /api/alerts/rules/{id}:
+    put:
+      tags:
+        - Alerts
+      summary: Update Alert Rule
+      description: Updates an existing alert rule
+      operationId: updateAlertRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRule'
+      responses:
+        '200':
+          description: Alert rule updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+
+    delete:
+      tags:
+        - Alerts
+      summary: Delete Alert Rule
+      description: Deletes an alert rule
+      operationId: deleteAlertRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Alert rule deleted
+
+  # ==================== DASHBOARD ====================
+  /dashboard:
+    get:
+      tags:
+        - Dashboard
+      summary: Main Dashboard Interface
+      description: |
+        Serves the main dashboard HTML interface with comprehensive monitoring capabilities.
+        Features real-time updates, interactive controls, and glassmorphism design.
+      operationId: getDashboard
+      security: []
+      responses:
+        '200':
+          description: Dashboard HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /dashboard/simple:
+    get:
+      tags:
+        - Dashboard
+      summary: Simplified Dashboard Interface
+      description: Lightweight dashboard interface for mobile and low-bandwidth scenarios
+      operationId: getSimpleDashboard
+      security: []
+      responses:
+        '200':
+          description: Simple dashboard HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/dashboard/metrics:
+    get:
+      tags:
+        - Dashboard
+      summary: Dashboard-Specific Metrics
+      description: |
+        Optimized metrics endpoint for dashboard consumption with pre-calculated values
+        and formatted data structures.
+      operationId: getDashboardMetrics
+      responses:
+        '200':
+          description: Dashboard metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dashboard_metrics:
+                    type: object
+                    properties:
+                      total_documents:
+                        type: integer
+                        description: Total documents synchronized
+                        example: 150000
+                      sync_rate:
+                        type: number
+                        format: float
+                        description: Current sync rate (docs/sec)
+                        example: 245.7
+                      active_watchers:
+                        type: integer
+                        description: Active change stream watchers
+                        example: 6
+                      avg_latency:
+                        type: number
+                        format: float
+                        description: Average latency in milliseconds
+                        example: 23.4
+                      backlog_size:
+                        type: integer
+                        description: Current backlog size
+                        example: 0
+                  connection_status:
+                    type: object
+                    properties:
+                      source_mongo:
+                        type: string
+                        example: "connected"
+                      cloud_sync:
+                        type: string
+                        example: "running"
+                      vm_sync:
+                        type: string
+                        example: "connected"
+                  system_info:
+                    type: object
+                    properties:
+                      uptime:
+                        type: string
+                        example: "2d 14h 32m"
+                      version:
+                        type: string
+                        example: "2.0.0"
+                      mode:
+                        type: string
+                        example: "buffer-free"
+
+  /api/dashboard/logs:
+    get:
+      tags:
+        - Dashboard
+      summary: Dashboard Log Entries
+      description: |
+        Enhanced logging endpoint with structured log entries, correlation tracking,
+        and advanced filtering capabilities for dashboard consumption.
+      operationId: getDashboardLogs
+      parameters:
+        - name: level
+          in: query
+          schema:
+            type: string
+            enum: ["debug", "info", "warn", "error", "fatal"]
+          description: Filter logs by level
+        - name: stage
+          in: query
+          schema:
+            type: string
+          description: Filter logs by stage
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 1000
+          description: Maximum number of log entries to return
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Search term for log message content
+      responses:
+        '200':
+          description: Log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LogEntry'
+                  total:
+                    type: integer
+                  has_more:
+                    type: boolean
+
+  /api/metrics/charts:
+    get:
+      tags:
+        - Dashboard
+      summary: Chart Data for Dashboard
+      description: Formatted metrics data optimized for chart visualization
+      operationId: getChartData
+      responses:
+        '200':
+          description: Chart data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  throughput_chart:
+                    type: object
+                    properties:
+                      labels:
+                        type: array
+                        items:
+                          type: string
+                      datasets:
+                        type: array
+                        items:
+                          type: object
+                  latency_chart:
+                    type: object
+                  error_rate_chart:
+                    type: object
+
+  /api/control/{action}:
+    post:
+      tags:
+        - Dashboard
+      summary: System Control Actions
+      description: |
+        Execute system control actions such as restart, pause, or resume operations.
+        Provides immediate feedback and status updates.
+      operationId: executeControlAction
+      parameters:
+        - name: action
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: ["restart", "pause", "resume"]
+          description: Control action to execute
+      responses:
+        '200':
+          description: Action executed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "System restart initiated successfully"
+                  action:
+                    type: string
+                    example: "restart"
+                  timestamp:
+                    type: string
+                    format: date-time
+        '400':
+          description: Invalid action
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "Invalid action. Supported actions: restart, pause, resume"
+        '401':
+          description: Authentication required
+
+  # ==================== ADAPTIVE CONTROLLER ====================
+  /api/adaptive/stats:
+    get:
+      tags:
+        - Adaptive Controller
+      summary: Adaptive Controller Statistics
+      description: |
+        Comprehensive statistics about the adaptive performance controller including
+        current configuration, effectiveness metrics, and optimization history.
+      operationId: getAdaptiveStats
+      responses:
+        '200':
+          description: Adaptive controller statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_active:
+                    type: boolean
+                    example: true
+                  last_activity:
+                    type: string
+                    format: date-time
+                  effectiveness_score:
+                    type: number
+                    format: float
+                    description: Score from 0-100 indicating controller effectiveness
+                    example: 87.5
+                  health_status:
+                    type: string
+                    enum: ["healthy", "degraded", "critical"]
+                    example: "healthy"
+                  current_config:
+                    type: object
+                    properties:
+                      fetch_parallelism:
+                        type: integer
+                        example: 50
+                      push_parallelism:
+                        type: integer
+                        example: 50
+                      batch_size:
+                        type: integer
+                        example: 1000
+                  performance_metrics:
+                    type: object
+                    properties:
+                      cpu_usage:
+                        type: number
+                        format: float
+                        example: 25.4
+                      memory_usage:
+                        type: number
+                        format: float
+                        example: 512.8
+                      latency_ms:
+                        type: number
+                        format: float
+                        example: 45.2
+                  optimization_history:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: string
+                          format: date-time
+                        action:
+                          type: string
+                        old_value:
+                          type: integer
+                        new_value:
+                          type: integer
+                        reason:
+                          type: string
+        '503':
+          description: Adaptive controller not available
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Adaptive controller not available"
+                  message:
+                    type: string
+                    example: "Running in degraded mode without adaptive features"
+                  status:
+                    type: string
+                    example: "disabled"
+
+  /api/adaptive/history:
+    get:
+      tags:
+        - Adaptive Controller
+      summary: Adaptive Controller History
+      description: |
+        Historical data about adaptive controller adjustments including
+        learning patterns, effectiveness analysis, and recommendations.
+      operationId: getAdaptiveHistory
+      responses:
+        '200':
+          description: Adaptive controller history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  current_config:
+                    type: object
+                    description: Current controller configuration
+                  history_size:
+                    type: integer
+                    description: Number of historical entries
+                    example: 150
+                  learning_enabled:
+                    type: boolean
+                    example: true
+                  last_adjustment:
+                    type: string
+                    format: date-time
+                  recommendations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type:
+                          type: string
+                          example: "performance"
+                        priority:
+                          type: string
+                          enum: ["low", "medium", "high"]
+                        message:
+                          type: string
+                          example: "Consider increasing parallelism during peak hours"
+                        timestamp:
+                          type: string
+                          format: date-time
+        '503':
+          description: Adaptive controller not available
+
+  /api/adaptive/health:
+    get:
+      tags:
+        - Adaptive Controller
+      summary: Adaptive Controller Health
+      description: |
+        Health status and diagnostics for the adaptive performance controller
+        including system resource utilization and optimization effectiveness.
+      operationId: getAdaptiveHealth
+      responses:
+        '200':
+          description: Adaptive controller health information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  overall_health:
+                    type: string
+                    enum: ["healthy", "warning", "critical"]
+                    example: "healthy"
+                  components:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                          example: "resource_monitor"
+                        status:
+                          type: string
+                          enum: ["healthy", "degraded", "failed"]
+                        last_check:
+                          type: string
+                          format: date-time
+                        details:
+                          type: string
+                  resource_usage:
+                    type: object
+                    properties:
+                      cpu_threshold_status:
+                        type: string
+                        enum: ["normal", "high", "critical"]
+                      memory_threshold_status:
+                        type: string
+                        enum: ["normal", "high", "critical"]
+                      latency_threshold_status:
+                        type: string
+                        enum: ["normal", "high", "critical"]
+                  optimization_effectiveness:
+                    type: object
+                    properties:
+                      score:
+                        type: number
+                        format: float
+                        description: Effectiveness score (0-100)
+                      trend:
+                        type: string
+                        enum: ["improving", "stable", "degrading"]
+                      recommendations_count:
+                        type: integer
+
+  # ==================== COLLECTION DISTRIBUTION ====================
+  /api/distribution/status:
+    get:
+      tags:
+        - Collection Distribution
+      summary: Distribution Status
+      description: |
+        Current status of collection distribution across VM instances including
+        load balancing information and performance metrics.
+      operationId: getDistributionStatus
+      responses:
+        '200':
+          description: Distribution status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_collections:
+                    type: integer
+                    example: 25
+                  distributed_collections:
+                    type: integer
+                    example: 23
+                  unassigned_collections:
+                    type: integer
+                    example: 2
+                  vm_instances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        vm_id:
+                          type: string
+                          example: "vm-prod-01"
+                        status:
+                          type: string
+                          enum: ["active", "inactive", "overloaded"]
+                        assigned_collections:
+                          type: integer
+                          example: 8
+                        load_percentage:
+                          type: number
+                          format: float
+                          example: 65.4
+                        last_seen:
+                          type: string
+                          format: date-time
+                  load_balance_score:
+                    type: number
+                    format: float
+                    description: Score indicating how well balanced the load is (0-100)
+                    example: 85.2
+        '503':
+          description: Collection distributor not available
+
+  /api/distribution/assignments:
+    get:
+      tags:
+        - Collection Distribution
+      summary: Collection Assignments
+      description: |
+        Detailed view of collection assignments across VM instances with
+        performance metrics and optimization opportunities.
+      operationId: getDistributionAssignments
+      responses:
+        '200':
+          description: Collection assignments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assignments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        vm_id:
+                          type: string
+                        collections:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              database:
+                                type: string
+                              collection:
+                                type: string
+                              priority:
+                                type: integer
+                              estimated_load:
+                                type: number
+                                format: float
+                  optimization_plan:
+                    type: object
+                    properties:
+                      recommended_changes:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            action:
+                              type: string
+                              enum: ["move", "replicate", "partition"]
+                            collection:
+                              type: string
+                            from_vm:
+                              type: string
+                            to_vm:
+                              type: string
+                            reason:
+                              type: string
+                      expected_improvement:
+                        type: number
+                        format: float
+                        description: Expected load balance improvement percentage
+        '503':
+          description: Collection distributor not available
+
+  /api/distribution/redistribute:
+    post:
+      tags:
+        - Collection Distribution
+      summary: Trigger Manual Redistribution
+      description: |
+        Manually triggers redistribution of collections across VM instances
+        based on current load and performance metrics.
+      operationId: triggerRedistribution
+      responses:
+        '200':
+          description: Redistribution triggered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Collections redistributed successfully"
+                  plan:
+                    type: object
+                    description: Executed redistribution plan
+                    properties:
+                      changes_made:
+                        type: integer
+                        example: 5
+                      collections_moved:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            collection:
+                              type: string
+                            from_vm:
+                              type: string
+                            to_vm:
+                              type: string
+                      expected_improvement:
+                        type: number
+                        format: float
+                        example: 23.5
+        '500':
+          description: Redistribution failed
+        '503':
+          description: Collection distributor not available
+
+  /api/distribution/vms:
+    get:
+      tags:
+        - Collection Distribution
+      summary: VM Status Information
+      description: |
+        Detailed status information for all registered VM instances including
+        performance metrics, connectivity, and capacity information.
+      operationId: getVMStatus
+      responses:
+        '200':
+          description: VM status information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_vms:
+                    type: integer
+                    example: 5
+                  active_vms:
+                    type: integer
+                    example: 4
+                  inactive_vms:
+                    type: integer
+                    example: 1
+                  vms:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        vm_id:
+                          type: string
+                          example: "vm-prod-01"
+                        hostname:
+                          type: string
+                          example: "prod-vm-01.company.com"
+                        status:
+                          type: string
+                          enum: ["online", "offline", "degraded", "maintenance"]
+                        connection_status:
+                          type: string
+                          enum: ["connected", "disconnected", "reconnecting"]
+                        last_seen:
+                          type: string
+                          format: date-time
+                        performance:
+                          type: object
+                          properties:
+                            cpu_usage:
+                              type: number
+                              format: float
+                            memory_usage:
+                              type: number
+                              format: float
+                            disk_usage:
+                              type: number
+                              format: float
+                            throughput_docs_per_sec:
+                              type: number
+                              format: float
+                        assigned_collections:
+                          type: integer
+                          example: 8
+                        capacity:
+                          type: object
+                          properties:
+                            max_collections:
+                              type: integer
+                            max_connections:
+                              type: integer
+                            max_throughput:
+                              type: number
+                              format: float
+                        version:
+                          type: string
+                          example: "2.0.0"
+                        capabilities:
+                          type: array
+                          items:
+                            type: string
+                          example: ["tcp_transport", "compression", "encryption"]
+        '503':
+          description: Collection distributor not available
+
+  # ==================== BUFFER-FREE SYSTEM ====================
+  /api/buffer-free/status:
+    get:
+      tags:
+        - Buffer-Free System
+      summary: Buffer-Free System Status
+      description: |
+        Status information for the buffer-free synchronization system including
+        resume token management and memory usage optimization.
+      operationId: getBufferFreeStatus
+      responses:
+        '200':
+          description: Buffer-free system status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                    example: true
+                  mode:
+                    type: string
+                    enum: ["buffer-free", "traditional", "hybrid"]
+                    example: "buffer-free"
+                  memory_optimization:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        example: true
+                      memory_saved_mb:
+                        type: number
+                        format: float
+                        example: 245.8
+                      buffer_usage_mb:
+                        type: number
+                        format: float
+                        example: 0.0
+                  active_streams:
+                    type: integer
+                    example: 4
+                  resume_tokens_managed:
+                    type: integer
+                    example: 4
+                  performance_impact:
+                    type: object
+                    properties:
+                      latency_improvement_percent:
+                        type: number
+                        format: float
+                        example: 15.2
+                      throughput_improvement_percent:
+                        type: number
+                        format: float
+                        example: 8.7
+
+  /api/buffer-free/tokens:
+    get:
+      tags:
+        - Buffer-Free System
+      summary: Resume Token Status
+      description: |
+        Detailed information about resume tokens managed by the buffer-free system
+        including persistence status and collection coverage.
+      operationId: getTokenStatus
+      responses:
+        '200':
+          description: Resume token status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_tokens:
+                    type: integer
+                    example: 4
+                  tokens:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        collection:
+                          type: string
+                          example: "real_transfer_test.products"
+                        status:
+                          type: string
+                          enum: ["active", "paused", "error"]
+                        last_resume_token:
+                          type: string
+                          description: MongoDB resume token (abbreviated)
+                          example: "8264BEB9000000012B022C..."
+                        last_update:
+                          type: string
+                          format: date-time
+                        documents_processed:
+                          type: integer
+                          example: 15420
+                        processing_rate:
+                          type: number
+                          format: float
+                          description: Documents per second
+                          example: 23.7
+                  persistence_status:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        example: true
+                      last_save:
+                          type: string
+                          format: date-time
+                      save_interval_seconds:
+                        type: integer
+                        example: 5
+
+  # ==================== WEBSOCKET ENDPOINT ====================
+  /ws:
+    get:
+      tags:
+        - WebSocket
+      summary: WebSocket Connection Endpoint
+      description: |
+        WebSocket endpoint for real-time communication between cloud-sync and vm-sync clients.
+        Supports OAuth2 authentication and real-time data streaming.
+        
+        **Connection Protocol:**
+        1. Establish WebSocket connection
+        2. Send OAuth2 authentication message
+        3. Receive authentication confirmation
+        4. Begin real-time data streaming
+        
+        **Authentication Message Format:**
+        ```json
+        {
+          "type": "oauth2_auth",
+          "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        }
+        ```
+      operationId: connectWebSocket
+      responses:
+        '101':
+          description: WebSocket connection established
+        '400':
+          description: Invalid WebSocket request
+        '401':
+          description: Authentication required
+        '403':
+          description: Authentication failed
+
+    # OAuth2 Schemas
+    TokenRequest:
+      type: object
+      required:
+        - grant_type
+        - client_id
+        - client_secret
+      properties:
+        grant_type:
+          type: string
+          enum: ["client_credentials"]
+          description: OAuth2 grant type (only client_credentials supported)
+          example: "client_credentials"
+        client_id:
+          type: string
+          description: OAuth2 client identifier (generated by system)
+          pattern: '^vm_sync_[a-f0-9]{16}$'
+          example: "vm_sync_3e67555ad3836e65"
+        client_secret:
+          type: string
+          description: OAuth2 client secret (64 hex characters)
+          pattern: '^[a-f0-9]{64}$'
+          example: "4684a92c64ad93d075018f0152fc5d0ac2f9d73ba2589b32c30e664e82e21e95"
+        scope:
+          type: string
+          description: Requested scopes (space-separated)
+          example: "sync data:read data:write"
+
+    TokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: JWT access token
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        token_type:
+          type: string
+          enum: ["Bearer"]
+          example: "Bearer"
+        expires_in:
+          type: integer
+          format: int64
+          description: Token expiry time in seconds
+          example: 3599
+        scope:
+          type: string
+          description: Granted scopes
+          example: "[sync data:read data:write]"
+        refresh_token:
+          type: string
+          description: Refresh token (not currently implemented)
+
+    OAuth2Error:
+      type: object
+      properties:
+        error:
+          type: string
+          enum: ["invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope", "server_error"]
+          example: "invalid_client"
+        error_description:
+          type: string
+          description: Human-readable error description
+          example: "Invalid client credentials"
+        error_uri:
+          type: string
+          description: URI to error documentation
+          format: uri
+
+    CreateClientRequest:
+      type: object
+      required:
+        - app_id
+        - name
+        - scopes
+        - vm_metadata
+      properties:
+        app_id:
+          type: string
+          description: Application identifier
+          example: "vm-sync-production"
+        name:
+          type: string
+          description: Human-readable client name
+          example: "Production VM-Sync Instance"
+        description:
+          type: string
+          description: Client description
+          example: "OAuth2 client for production VM synchronization"
+        scopes:
+          type: array
+          items:
+            type: string
+            enum: ["vm-sync", "data:read", "data:write", "stream:create", "stream:read", "stream:write", "metrics:read", "health:read", "config:read", "admin:*"]
+          description: Requested OAuth2 scopes
+          example: ["sync", "data:read", "data:write", "metrics:read"]
+        expires_in:
+          type: integer
+          format: int64
+          description: Client credential expiry time in seconds (optional)
+          example: 31536000
+        vm_metadata:
+          $ref: '#/components/schemas/VMClientMetadata'
+
+    CreateClientResponse:
+      type: object
+      properties:
+        client_id:
+          type: string
+          description: Generated OAuth2 client ID
+          example: "vm_sync_a1b2c3d4e5f6a7b8"
+        client_secret:
+          type: string
+          description: Generated OAuth2 client secret (only returned once)
+          example: "9f8e7d6c5b4a39284756adf123456789abcdef0123456789abcdef0123456789"
+        app_id:
+          type: string
+          example: "vm-sync-production"
+        name:
+          type: string
+          example: "Production VM-Sync Instance"
+        scopes:
+          type: array
+          items:
+            type: string
+          example: ["sync", "data:read", "data:write", "metrics:read"]
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-09-26T12:00:00Z"
+        expires_at:
+          type: string
+          format: date-time
+          description: Client credential expiry (if set)
+
+    ClientCredentialsResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: MongoDB ObjectID
+        client_id:
+          type: string
+          example: "vm_sync_a1b2c3d4e5f6a7b8"
+        client_secret:
+          type: string
+          enum: ["[REDACTED]"]
+          description: Client secret is always redacted in list responses
+        app_id:
+          type: string
+          example: "vm-sync-production"
+        name:
+          type: string
+          example: "Production VM-Sync Instance"
+        description:
+          type: string
+          example: "OAuth2 client for production VM synchronization"
+        scopes:
+          type: array
+          items:
+            type: string
+          example: ["sync", "data:read", "data:write"]
+        active:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_by:
+          type: string
+          example: "admin"
+        vm_metadata:
+          $ref: '#/components/schemas/VMClientMetadata'
+
+    VMClientMetadata:
+      type: object
+      properties:
+        hostname:
+          type: string
+          description: VM hostname
+          example: "prod-vm-01.company.com"
+        max_collections:
+          type: integer
+          description: Maximum collections this VM can handle
+          example: 50
+        supported_streams:
+          type: array
+          items:
+            type: string
+          description: Supported stream types
+          example: ["change_stream", "initial_sync"]
+        capabilities:
+          type: object
+          additionalProperties:
+            type: boolean
+          description: VM capabilities
+          example:
+            tcp_transport: true
+            compression: true
+            encryption: true
+        resource_limits:
+          $ref: '#/components/schemas/ResourceLimits'
+        network_info:
+          $ref: '#/components/schemas/NetworkInfo'
+
+    ResourceLimits:
+      type: object
+      properties:
+        max_memory_mb:
+          type: integer
+          description: Maximum memory usage in MB
+          example: 2048
+        max_concurrency:
+          type: integer
+          description: Maximum concurrent operations
+          example: 10
+        max_bandwidth_mb:
+          type: integer
+          description: Maximum bandwidth usage in MB/s
+          example: 100
+
+    NetworkInfo:
+      type: object
+      properties:
+        tcp_endpoint:
+          type: string
+          description: TCP endpoint for high-performance data transfer
+          example: "tcp://prod-vm-01:9000"
+        http_endpoint:
+          type: string
+          description: HTTP endpoint for REST API
+          example: "http://prod-vm-01:8081"
+        ws_endpoint:
+          type: string
+          description: WebSocket endpoint for real-time communication
+          example: "ws://prod-vm-01:8081/ws"
+
+    # Monitoring Schemas
+    LogEntry:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Log entry timestamp
+          example: "2025-09-26T12:00:00.000Z"
+        stage:
+          type: string
+          description: Application stage/component
+          example: "cloud-sync"
+        action:
+          type: string
+          description: Action being performed
+          example: "data_sync"
+        status:
+          type: string
+          enum: ["success", "error", "warning", "info"]
+          example: "success"
+        message:
+          type: string
+          description: Log message
+          example: "Successfully synchronized 1000 documents"
+        level:
+          type: string
+          enum: ["debug", "info", "warn", "error", "fatal"]
+          example: "info"
+        details:
+          type: object
+          additionalProperties: true
+          description: Additional structured data
+          example:
+            collection: "users"
+            documents_count: 1000
+            duration_ms: 234
+        context:
+          type: object
+          properties:
+            correlation_id:
+              type: string
+              example: "req-123456789"
+            user_id:
+              type: string
+              example: "admin"
+            client_id:
+              type: string
+              example: "vm_sync_a1b2c3d4e5f6a7b8"
+        duration:
+          type: number
+          format: float
+          description: Operation duration in milliseconds
+          example: 234.5
+        stack_trace:
+          type: array
+          items:
+            type: string
+          description: Stack trace for errors
+
+    Alert:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "alert-001"
+        rule_id:
+          type: string
+          example: "high-latency-rule"
+        severity:
+          type: string
+          enum: ["low", "medium", "high", "critical"]
+          example: "high"
+        title:
+          type: string
+          example: "High Latency Detected"
+        message:
+          type: string
+          example: "Average latency exceeds 500ms threshold"
+        status:
+          type: string
+          enum: ["active", "resolved", "acknowledged"]
+          example: "active"
+        triggered_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+          example:
+            current_latency: 750
+            threshold: 500
+            component: "data_sync"
+
+    AlertRule:
+      type: object
+      required:
+        - name
+        - condition
+        - severity
+      properties:
+        id:
+          type: string
+          readOnly: true
+          example: "rule-001"
+        name:
+          type: string
+          description: Rule name
+          example: "High Latency Alert"
+        description:
+          type: string
+          description: Rule description
+          example: "Triggers when average latency exceeds threshold"
+        condition:
+          type: object
+          description: Alert condition configuration
+          properties:
+            metric:
+              type: string
+              example: "avg_latency_ms"
+            operator:
+              type: string
+              enum: ["gt", "lt", "eq", "gte", "lte", "ne"]
+              example: "gt"
+            threshold:
+              type: number
+              example: 500
+            duration:
+              type: integer
+              description: Duration in seconds before triggering
+              example: 300
+        severity:
+          type: string
+          enum: ["low", "medium", "high", "critical"]
+          example: "high"
+        enabled:
+          type: boolean
+          example: true
+        actions:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum: ["email", "webhook", "log"]
+              config:
+                type: object
+                additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+    # Error Response Schema
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error code
+          example: "invalid_request"
+        message:
+          type: string
+          description: Human-readable error message
+          example: "The request is invalid or malformed"
+        details:
+          type: object
+          additionalProperties: true
+          description: Additional error details
+        timestamp:
+          type: string
+          format: date-time
+          description: Error timestamp
+        correlation_id:
+          type: string
+          description: Request correlation ID for tracking
+          example: "req-123456789"
+
+    # Health Check Schema
+    HealthStatus:
+      type: object
+      properties:
+        overall_status:
+          type: string
+          enum: ["healthy", "degraded", "unhealthy"]
+          example: "healthy"
+        components:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                example: "mongodb"
+              status:
+                type: string
+                enum: ["healthy", "degraded", "unhealthy"]
+              message:
+                type: string
+                example: "Connected successfully"
+              last_check:
+                type: string
+                format: date-time
+              response_time_ms:
+                type: number
+                format: float
+        system_info:
+          type: object
+          properties:
+            version:
+              type: string
+              example: "2.0.0"
+            uptime_seconds:
+              type: integer
+              example: 86400
+            memory_usage_mb:
+              type: number
+              format: float
+              example: 512.8
+            cpu_usage_percent:
+              type: number
+              format: float
+              example: 25.4
+
+# ==================== RESPONSE EXAMPLES ====================
+examples:
+  OAuth2TokenSuccess:
+    summary: Successful OAuth2 token response
+    value:
+      access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NTg4ODcxOTYsImV4cCI6MTc1ODg5MDc5NiwibmJmIjoxNzU4ODg3MTk2LCJpc3MiOiJjbG91ZC1zeW5jIiwic3ViIjoidm1fc3luY18zZTY3NTU1YWQzODM2ZTY1IiwiYXVkIjpbInZtLXN5bmMiXSwianRpIjoiZTJjMDU5YWUyY2ZmNjgzYyIsImNsaWVudF9pZCI6InZtX3N5bmNfM2U2NzU1NWFkMzgzNmU2NSIsImNsaWVudF90eXBlIjoidm0tc3luYyIsImFwcF9pZCI6InZtLXN5bmMtdGVzdC13b3JraW5nIiwic2NvcGVzIjpbInN5bmMiLCJkYXRhOnJlYWQiLCJkYXRhOndyaXRlIl0sInZtX21ldGFkYXRhIjp7Imhvc3RuYW1lIjoidGVzdC12bS13b3JraW5nIiwibWF4X2NvbGxlY3Rpb25zIjowLCJzdXBwb3J0ZWRfc3RyZWFtcyI6bnVsbCwiY2FwYWJpbGl0aWVzIjpudWxsLCJyZXNvdXJjZV9saW1pdHMiOnsibWF4X21lbW9yeV9tYiI6MCwibWF4X2NvbmN1cnJlbmN5IjowLCJtYXhfYmFuZHdpZHRoX21iIjowfSwibmV0d29ya19pbmZvIjp7InRjcF9lbmRwb2ludCI6IiIsImh0dHBfZW5kcG9pbnQiOiIiLCJ3c19lbmRwb2ludCI6IiJ9fSwic2VjdXJpdHlfY29udGV4dCI6eyJpcF9hZGRyZXNzIjoiIiwidXNlcl9hZ2VudCI6IiIsInRva2VuX3ZlcnNpb24iOjEsImxhc3RfYWN0aXZpdHkiOiIyMDI1LTA5LTI2VDE3OjE2OjM2Ljg1OTY3MyswNTozMCIsInNlc3Npb25faWQiOiIifX0.9PUwHUZ-pthGPvYW1a5erzRB4wNIEv-lP5dGEA6pwxw"
+      token_type: "Bearer"
+      expires_in: 3599
+      scope: "[sync data:read data:write]"
+
+  HealthCheckSuccess:
+    summary: Healthy system status
+    value:
+      source_mongo: "connected"
+      cloud_sync: "running"
+      vm_sync: "connected"
+      system_health:
+        memory_usage_mb: 45.2
+        cpu_usage_percent: 12.3
+        active_connections: 2
+        uptime_seconds: 86400
+      features:
+        tcp_transport: true
+        encryption: true
+        buffer_free: true
+        oauth2_auth: true
+      components:
+        - name: "mongodb"
+          status: "connected"
+          last_check: "2025-09-26T12:00:00Z"
+        - name: "oauth2_service"
+          status: "running"
+          last_check: "2025-09-26T12:00:00Z"
+
+  DashboardMetricsSuccess:
+    summary: Dashboard metrics response
+    value:
+      dashboard_metrics:
+        total_documents: 150000
+        sync_rate: 245.7
+        active_watchers: 6
+        avg_latency: 23.4
+        backlog_size: 0
+      connection_status:
+        source_mongo: "connected"
+        cloud_sync: "running"
+        vm_sync: "connected"
+      system_info:
+        uptime: "2d 14h 32m"
+        version: "2.0.0"
+        mode: "buffer-free"
+
+  AdaptiveStatsSuccess:
+    summary: Adaptive controller statistics
+    value:
+      is_active: true
+      last_activity: "2025-09-26T12:00:00Z"
+      effectiveness_score: 87.5
+      health_status: "healthy"
+      current_config:
+        fetch_parallelism: 50
+        push_parallelism: 50
+        batch_size: 1000
+      performance_metrics:
+        cpu_usage: 25.4
+        memory_usage: 512.8
+        latency_ms: 45.2
+      optimization_history:
+        - timestamp: "2025-09-26T11:30:00Z"
+          action: "increase_parallelism"
+          old_value: 40
+          new_value: 50
+          reason: "Low CPU utilization detected"
+
+# ==================== TAGS ====================
+tags:
+  - name: OAuth2 Authentication
+    description: |
+      OAuth2 Client Credentials Grant flow for secure API authentication.
+      Supports cryptographically secure client credential generation and JWT token management.
+      
+      **Security Features:**
+      - Client secrets hashed with bcrypt
+      - JWT tokens with HMAC-SHA256 signing
+      - 1-hour token expiry with automatic refresh
+      - Comprehensive scope-based authorization
+      
+      **Supported Scopes:**
+      - `vm-sync`: Core VM synchronization operations
+      - `data:read`, `data:write`: Data access permissions
+      - `stream:create`, `stream:read`, `stream:write`: Stream operations
+      - `metrics:read`, `health:read`: Monitoring access
+      - `config:read`: Configuration access
+      - `admin:*`: Administrative operations
+
+  - name: OAuth2 Administration
+    description: |
+      Administrative endpoints for OAuth2 client management.
+      Requires admin API key authentication.
+      
+      **Operations:**
+      - Create new OAuth2 clients with secure credentials
+      - List existing clients (secrets redacted)
+      - Revoke client credentials
+      
+      **Security:** Admin API Key required (`X-Admin-API-Key`)
+
+  - name: Data Synchronization
+    description: |
+      Core data synchronization endpoints for real-time MongoDB replication.
+      Supports pagination, filtering, resume tokens, and partition management.
+      
+      **Features:**
+      - MongoDB change stream integration
+      - Resume token management for fault tolerance
+      - Batch processing with configurable sizes
+      - Document and field-level filtering
+      - Partition-based distribution
+
+  - name: Sync Control
+    description: |
+      Manual synchronization control and status monitoring.
+      
+      **Capabilities:**
+      - Trigger manual initial sync operations
+      - Monitor sync progress and status
+      - Force resync with resume token bypass
+      - Collection-level sync management
+
+  - name: Health & Monitoring
+    description: |
+      System health checks and comprehensive monitoring endpoints.
+      
+      **Monitoring Areas:**
+      - MongoDB connectivity and performance
+      - Service health and availability
+      - System resource utilization
+      - Feature status and capabilities
+      - Component-level health checks
+
+  - name: Metrics
+    description: |
+      Comprehensive metrics collection and export.
+      
+      **Formats:**
+      - Prometheus/OpenMetrics for monitoring systems
+      - JSON format for dashboard consumption
+      - Real-time and historical data
+      
+      **Metrics Categories:**
+      - Performance metrics (throughput, latency)
+      - Sync metrics (documents, collections)
+      - Error metrics (rates, types)
+      - System metrics (CPU, memory, connections)
+
+  - name: Alerts
+    description: |
+      Alert management and notification system.
+      
+      **Features:**
+      - Configurable alert rules with thresholds
+      - Multiple severity levels
+      - Alert history and acknowledgment
+      - Integration with external notification systems
+
+  - name: Dashboard
+    description: |
+      Web-based dashboard interfaces and supporting APIs.
+      
+      **Interfaces:**
+      - Full-featured dashboard with glassmorphism design
+      - Simplified dashboard for mobile/low-bandwidth
+      - Real-time updates via WebSocket
+      - Interactive system controls
+      
+      **Features:**
+      - Live metrics visualization
+      - Enhanced logging with filtering
+      - System control actions
+      - Chart data for visualization
+
+  - name: Adaptive Controller
+    description: |
+      Intelligent performance optimization system.
+      
+      **Capabilities:**
+      - Automatic performance tuning
+      - Resource utilization optimization
+      - Dynamic parallelism adjustment
+      - Learning-based optimization
+      - Effectiveness measurement and reporting
+
+  - name: Collection Distribution
+    description: |
+      Intelligent collection distribution across VM instances.
+      
+      **Features:**
+      - Automatic load balancing
+      - Performance-based assignment
+      - Manual redistribution capabilities
+      - VM capacity management
+      - Real-time load monitoring
+
+  - name: Buffer-Free System
+    description: |
+      Advanced buffer-free synchronization system for memory optimization.
+      
+      **Benefits:**
+      - Zero memory buffer usage
+      - Improved performance and latency
+      - Resume token management
+      - Real-time status monitoring
+
+  - name: WebSocket
+    description: |
+      Real-time WebSocket communication for live data streaming.
+      
+      **Protocol:**
+      - OAuth2 authentication support
+      - Real-time data updates
+      - Bidirectional communication
+      - Connection status monitoring
+      
+      **Use Cases:**
+      - VM-Sync client connections
+      - Dashboard real-time updates

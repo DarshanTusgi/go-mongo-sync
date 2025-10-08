@@ -1,0 +1,53 @@
+# Build artifacts
+*.log
+*.tmp
+cloud-sync
+vm-sync
+bin/
+
+# Development files
+.git/
+.gitignore
+.env
+.env.*
+
+# Test files
+*_test.go
+test_*.sh
+*-test.yaml
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dependencies
+vendor/
+
+# Temporary files
+tmp/
+temp/
+node_modules/
+
+# Docker files
+docker-compose*.yml
+Dockerfile*
+
+# Scripts
+scripts/
+monitoring/
+
+# Examples (copy selectively)
+examples/*.yaml
+!examples/cloud-config.yaml
+!examples/vm-config.yaml

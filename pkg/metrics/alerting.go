@@ -37,19 +37,19 @@ type Alert struct {
 
 // AlertRule defines conditions for triggering alerts
 type AlertRule struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	MetricType  MetricType `json:"metric_type"`
-	MetricName  string     `json:"metric_name"`
-	Condition   string     `json:"condition"` // "gt", "lt", "eq", "gte", "lte"
-	Threshold   float64    `json:"threshold"`
-	Level       AlertLevel `json:"level"`
-	Enabled     bool       `json:"enabled"`
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Description string        `json:"description"`
+	MetricType  MetricType    `json:"metric_type"`
+	MetricName  string        `json:"metric_name"`
+	Condition   string        `json:"condition"` // "gt", "lt", "eq", "gte", "lte"
+	Threshold   float64       `json:"threshold"`
+	Level       AlertLevel    `json:"level"`
+	Enabled     bool          `json:"enabled"`
 	Cooldown    time.Duration `json:"cooldown"` // Minimum time between alerts
-	Component   string     `json:"component,omitempty"`
-	Database    string     `json:"database,omitempty"`
-	Collection  string     `json:"collection,omitempty"`
+	Component   string        `json:"component,omitempty"`
+	Database    string        `json:"database,omitempty"`
+	Collection  string        `json:"collection,omitempty"`
 }
 
 // AlertHandler defines how alerts should be handled

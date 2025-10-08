@@ -1,9 +1,9 @@
 package cluster
 
 import (
+	"go-data-sync-http/pkg/models"
 	"sync"
 	"time"
-	"go-data-sync-http/pkg/models"
 )
 
 // MetricsCollector collects and manages cluster metrics

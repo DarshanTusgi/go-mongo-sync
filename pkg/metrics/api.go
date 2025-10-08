@@ -23,7 +23,7 @@ type MetricsAPI struct {
 func NewMetricsAPI(metricsCollector *MetricsCollector, alertManager *AlertManager) *MetricsAPI {
 	prometheusExporter := NewPrometheusExporter(metricsCollector)
 	prometheusExporter.StartMetricsUpdater(time.Second * 10) // Update every 10 seconds
-	
+
 	return &MetricsAPI{
 		metricsCollector:   metricsCollector,
 		alertManager:       alertManager,
@@ -35,7 +35,7 @@ func NewMetricsAPI(metricsCollector *MetricsCollector, alertManager *AlertManage
 func (api *MetricsAPI) RegisterRoutes(router *mux.Router) {
 	// Prometheus metrics endpoint
 	router.Handle("/metrics", promhttp.Handler()).Methods("GET")
-	
+
 	// JSON Metrics endpoints
 	router.HandleFunc("/api/metrics", api.handleGetMetrics).Methods("GET")
 	router.HandleFunc("/api/metrics/lag", api.handleGetLagMetrics).Methods("GET")

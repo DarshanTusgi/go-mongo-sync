@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚀 GOD MODE - Real-Time Sync Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .dashboard {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            backdrop-filter: blur(20px);
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.25);
+            padding: 30px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 20px;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .last-updated {
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .section {
+            margin-bottom: 30px;
+            background: rgba(255, 255, 255, 0.7);
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+        }
+
+        .section h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 1.8rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+
+        .card {
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+            border-radius: 12px;
+            padding: 20px;
+            border-left: 5px solid #667eea;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(102, 126, 234, 0.15);
+        }
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+        }
+
+        .card-header {
+            font-weight: 600;
+            color: #495057;
+            margin-bottom: 10px;
+            font-size: 1.1rem;
+        }
+
+        .card-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 5px;
+            word-break: break-all;
+        }
+
+        .card-subtitle {
+            color: #6c757d;
+            font-size: 0.85rem;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .status-connected { background-color: #28a745; }
+        .status-disconnected { background-color: #dc3545; }
+        .status-warning { background-color: #ffc107; }
+        .status-unknown { background-color: #6c757d; }
+
+        .logs-container {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            background: white;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 15px;
+        }
+
+        .log-entry.error {
+            border-left-color: #dc3545;
+        }
+
+        .log-entry.warning {
+            border-left-color: #ffc107;
+        }
+
+        .log-timestamp {
+            font-size: 0.8rem;
+            color: #6c757d;
+            white-space: nowrap;
+        }
+
+        .log-stage {
+            background: #667eea;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            white-space: nowrap;
+        }
+
+        .log-message {
+            flex: 1;
+            color: #495057;
+        }
+
+        .refresh-button {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            margin-bottom: 20px;
+        }
+
+        .refresh-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.3);
+        }
+
+        .loading {
+            text-align: center;
+            color: #667eea;
+            font-style: italic;
+        }
+
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .updating {
+            animation: pulse 1.5s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <div class="header">
+            <h1>🚀 GOD MODE Dashboard</h1>
+            <div class="last-updated" id="lastUpdated">Loading...</div>
+        </div>
+
+        <button class="refresh-button" onclick="dashboard.refreshAll()">🔄 Refresh All Data</button>
+
+        <div id="errorContainer"></div>
+
+        <!-- System Status -->
+        <div class="section">
+            <h2>🖥️ System Status</h2>
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">Source MongoDB</div>
+                    <div class="card-value" id="sourceMongoStatus">
+                        <span class="status-indicator status-unknown"></span>
+                        Loading...
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Cloud Sync Service</div>
+                    <div class="card-value" id="cloudSyncStatus">
+                        <span class="status-indicator status-unknown"></span>
+                        Loading...
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header">VM Sync Service</div>
+                    <div class="card-value" id="vmSyncStatus">
+                        <span class="status-indicator status-unknown"></span>
+                        Loading...
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Target MongoDB</div>
+                    <div class="card-value" id="targetMongoStatus">
+                        <span class="status-indicator status-unknown"></span>
+                        Loading...
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Key Metrics -->
+        <div class="section">
+            <h2>📊 Key Metrics</h2>
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">Total Documents Synced</div>
+                    <div class="card-value" id="totalDocs">Loading...</div>
+                    <div class="card-subtitle">Cumulative sync count</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Current Sync Rate</div>
+                    <div class="card-value" id="syncRate">Loading...</div>
+                    <div class="card-subtitle">Documents per second</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Active Watchers</div>
+                    <div class="card-value" id="activeWatchers">Loading...</div>
+                    <div class="card-subtitle">Change stream monitors</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Connected Clients</div>
+                    <div class="card-value" id="connectedClients">Loading...</div>
+                    <div class="card-subtitle">Active connections</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Sync Mode</div>
+                    <div class="card-value" id="syncMode">Loading...</div>
+                    <div class="card-subtitle">Current operation mode</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">System Uptime</div>
+                    <div class="card-value" id="uptime">Loading...</div>
+                    <div class="card-subtitle">Service availability</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Performance -->
+        <div class="section">
+            <h2>⚡ System Performance</h2>
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">Memory Usage</div>
+                    <div class="card-value" id="memoryUsage">Loading...</div>
+                    <div class="card-subtitle">MB</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">CPU Usage</div>
+                    <div class="card-value" id="cpuUsage">Loading...</div>
+                    <div class="card-subtitle">Percentage</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Average Latency</div>
+                    <div class="card-value" id="avgLatency">Loading...</div>
+                    <div class="card-subtitle">Milliseconds</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Error Rate</div>
+                    <div class="card-value" id="errorRate">Loading...</div>
+                    <div class="card-subtitle">Errors per hour</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Enhanced Logging -->
+        <div class="section">
+            <h2>📋 Enhanced Logging</h2>
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">Total Log Entries</div>
+                    <div class="card-value" id="totalLogEntries">Loading...</div>
+                    <div class="card-subtitle">All time entries</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Error Entries</div>
+                    <div class="card-value" id="errorLogEntries">Loading...</div>
+                    <div class="card-subtitle">Requires attention</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Warning Entries</div>
+                    <div class="card-value" id="warningLogEntries">Loading...</div>
+                    <div class="card-subtitle">Potential issues</div>
+                </div>
+                <div class="card">
+                    <div class="card-header">Last Log Entry</div>
+                    <div class="card-value" id="lastLogEntry">Loading...</div>
+                    <div class="card-subtitle">Most recent activity</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Logs -->
+        <div class="section">
+            <h2>📄 Recent Logs</h2>
+            <div class="logs-container" id="logsContainer">
+                <div class="loading">Loading recent logs...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class SimpleDashboard {
+            constructor() {
+                this.refreshInterval = null;
+                this.init();
+            }
+
+            init() {
+                console.log('🚀 Simple Dashboard initializing...');
+                this.loadAllData();
+                this.startAutoRefresh();
+            }
+
+            async loadAllData() {
+                console.log('📊 Loading all dashboard data...');
+                document.getElementById('lastUpdated').textContent = 'Updating...';
+                
+                try {
+                    await Promise.all([
+                        this.loadMetrics(),
+                        this.loadHealth(),
+                        this.loadLogs()
+                    ]);
+                    this.updateLastUpdated();
+                    this.clearError();
+                } catch (error) {
+                    console.error('❌ Error loading data:', error);
+                    this.showError('Failed to load dashboard data: ' + error.message);
+                }
+            }
+
+            async loadMetrics() {
+                try {
+                    console.log('📈 Loading metrics...');
+                    const response = await fetch('/api/dashboard/metrics');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    
+                    const data = await response.json();
+                    console.log('✅ Metrics loaded:', data);
+                    this.updateMetrics(data);
+                } catch (error) {
+                    console.error('❌ Error loading metrics:', error);
+                    throw error;
+                }
+            }
+
+            async loadHealth() {
+                try {
+                    console.log('🏥 Loading health status...');
+                    const response = await fetch('/health');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    
+                    const data = await response.json();
+                    console.log('✅ Health loaded:', data);
+                    this.updateHealth(data);
+                } catch (error) {
+                    console.error('❌ Error loading health:', error);
+                    throw error;
+                }
+            }
+
+            async loadLogs() {
+                try {
+                    console.log('📋 Loading logs...');
+                    const response = await fetch('/api/dashboard/logs?limit=10');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    
+                    const data = await response.json();
+                    console.log('✅ Logs loaded:', data);
+                    this.updateLogs(data);
+                } catch (error) {
+                    console.error('❌ Error loading logs:', error);
+                    throw error;
+                }
+            }
+
+            updateMetrics(metrics) {
+                console.log('📊 Updating metrics display...');
+                
+                const dashboardMetrics = metrics.dashboard_metrics || {};
+                const systemMetrics = metrics.system_metrics || {};
+                const enhancedLogging = metrics.enhanced_logging || {};
+                const syncStatus = metrics.sync_status || {};
+
+                // Key Metrics
+                this.updateElement('totalDocs', this.formatNumber(dashboardMetrics.total_documents || 0));
+                this.updateElement('syncRate', this.formatNumber(dashboardMetrics.sync_rate || 0, 1));
+                this.updateElement('activeWatchers', dashboardMetrics.active_watchers || 0);
+                this.updateElement('connectedClients', systemMetrics.connected_clients || metrics.connected_clients || 0);
+                this.updateElement('syncMode', syncStatus.sync_mode || metrics.sync_mode || 'Unknown');
+                this.updateElement('uptime', systemMetrics.uptime || 'Unknown');
+
+                // Performance
+                this.updateElement('memoryUsage', this.formatNumber(systemMetrics.memory_usage || 0, 1));
+                this.updateElement('cpuUsage', this.formatNumber(systemMetrics.cpu_usage || 0, 1) + '%');
+                this.updateElement('avgLatency', this.formatNumber(dashboardMetrics.avg_latency || 0, 1));
+                this.updateElement('errorRate', this.formatNumber(dashboardMetrics.error_count || 0));
+
+                // Enhanced Logging
+                this.updateElement('totalLogEntries', enhancedLogging.total_entries || 0);
+                this.updateElement('errorLogEntries', enhancedLogging.error_entries || 0);
+                this.updateElement('warningLogEntries', enhancedLogging.warning_entries || 0);
+                this.updateElement('lastLogEntry', this.formatTimestamp(enhancedLogging.last_entry_time));
+
+                console.log('✅ Metrics display updated');
+            }
+
+            updateHealth(health) {
+                console.log('🏥 Updating health display...');
+                
+                this.updateStatus('sourceMongoStatus', health.source_mongo || 'unknown');
+                this.updateStatus('cloudSyncStatus', health.cloud_sync || 'unknown');
+                this.updateStatus('vmSyncStatus', health.vm_sync || 'unknown');
+                this.updateStatus('targetMongoStatus', health.target_mongo || 'unknown');
+                
+                // Update VM Sync details if available
+                if (health.vm_sync_info) {
+                    this.updateVMSyncDetails(health.vm_sync_info);
+                }
+
+                console.log('✅ Health display updated');
+            }
+            
+            updateVMSyncDetails(vmSyncInfo) {
+                const vmSyncElement = document.getElementById('vmSyncStatus');
+                if (!vmSyncElement) return;
+                
+                const clientCount = vmSyncInfo.connected_clients || 0;
+                const targetDatabases = vmSyncInfo.target_databases || 0;
+                const transportMode = vmSyncInfo.transport_mode || 'HTTP';
+                
+                let statusText = vmSyncInfo.connected_clients > 0 ? 'Connected' : 'Disconnected';
+                let detailsText = '';
+                
+                if (clientCount > 0) {
+                    detailsText = `<div style="font-size: 0.8em; color: #666; margin-top: 5px;">`;
+                    detailsText += `${clientCount} client${clientCount !== 1 ? 's' : ''} • `;
+                    detailsText += `${targetDatabases} target DB${targetDatabases !== 1 ? 's' : ''} • `;
+                    detailsText += `${transportMode}</div>`;
+                    
+                    // Show individual client details if available
+                    if (vmSyncInfo.client_details && vmSyncInfo.client_details.length > 0) {
+                        detailsText += '<div style="font-size: 0.75em; color: #888; margin-top: 3px;">';
+                        vmSyncInfo.client_details.forEach((client, index) => {
+                            if (index < 3) { // Show max 3 clients to avoid clutter
+                                const connectedTime = new Date(client.connected_at).toLocaleTimeString();
+                                detailsText += `• ${client.client_id.split('-')[0]} (${connectedTime})<br>`;
+                            }
+                        });
+                        if (vmSyncInfo.client_details.length > 3) {
+                            detailsText += `• ...and ${vmSyncInfo.client_details.length - 3} more`;
+                        }
+                        detailsText += '</div>';
+                    }
+                }
+                
+                const status = clientCount > 0 ? 'connected' : 'disconnected';
+                vmSyncElement.innerHTML = `<span class="status-indicator status-${status}"></span>${statusText}${detailsText}`;
+            }
+
+            updateLogs(logData) {
+                console.log('📋 Updating logs display...');
+                
+                const container = document.getElementById('logsContainer');
+                if (!logData.logs || logData.logs.length === 0) {
+                    container.innerHTML = '<div class="loading">No recent logs found</div>';
+                    return;
+                }
+
+                container.innerHTML = logData.logs.map(log => `
+                    <div class="log-entry ${log.status}">
+                        <div class="log-timestamp">${this.formatTimestamp(log.timestamp)}</div>
+                        <div class="log-stage">${log.stage}</div>
+                        <div class="log-message">${log.message || log.action}</div>
+                    </div>
+                `).join('');
+
+                console.log('✅ Logs display updated');
+            }
+
+            updateStatus(elementId, status) {
+                const element = document.getElementById(elementId);
+                if (!element) return;
+
+                const indicator = element.querySelector('.status-indicator');
+                if (indicator) {
+                    indicator.className = `status-indicator status-${status}`;
+                }
+
+                let statusText = status.charAt(0).toUpperCase() + status.slice(1);
+                
+                // Add special handling for target MongoDB to show it's managed by VM-sync clients
+                if (elementId === 'targetMongoStatus') {
+                    if (status === 'connected') {
+                        statusText += '<div style="font-size: 0.8em; color: #666; margin-top: 5px;">Via VM-sync clients</div>';
+                    } else {
+                        statusText += '<div style="font-size: 0.8em; color: #666; margin-top: 5px;">No VM-sync connections</div>';
+                    }
+                }
+                
+                element.innerHTML = `<span class="status-indicator status-${status}"></span>${statusText}`;
+            }
+
+            updateElement(id, value) {
+                const element = document.getElementById(id);
+                if (element) {
+                    element.textContent = value;
+                }
+            }
+
+            formatNumber(num, decimals = 0) {
+                if (num === null || num === undefined) return 'N/A';
+                return Number(num).toLocaleString(undefined, {
+                    minimumFractionDigits: decimals,
+                    maximumFractionDigits: decimals
+                });
+            }
+
+            formatTimestamp(timestamp) {
+                if (!timestamp) return 'N/A';
+                try {
+                    const date = new Date(timestamp);
+                    return date.toLocaleString();
+                } catch (error) {
+                    return 'Invalid Date';
+                }
+            }
+
+            updateLastUpdated() {
+                document.getElementById('lastUpdated').textContent = 
+                    'Last updated: ' + new Date().toLocaleString();
+            }
+
+            startAutoRefresh() {
+                this.refreshInterval = setInterval(() => {
+                    console.log('🔄 Auto-refreshing dashboard...');
+                    this.loadAllData();
+                }, 10000); // Refresh every 10 seconds
+            }
+
+            refreshAll() {
+                console.log('🔄 Manual refresh triggered');
+                this.loadAllData();
+            }
+
+            showError(message) {
+                const container = document.getElementById('errorContainer');
+                container.innerHTML = `<div class="error">⚠️ ${message}</div>`;
+            }
+
+            clearError() {
+                document.getElementById('errorContainer').innerHTML = '';
+            }
+
+            destroy() {
+                if (this.refreshInterval) {
+                    clearInterval(this.refreshInterval);
+                }
+            }
+        }
+
+        // Initialize dashboard
+        const dashboard = new SimpleDashboard();
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            dashboard.destroy();
+        });
+    </script>
+</body>
+</html>

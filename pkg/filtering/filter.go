@@ -2,12 +2,12 @@ package filtering
 
 import (
 	"fmt"
-	"regexp"
 	"reflect"
+	"regexp"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
 	"go-data-sync-http/pkg/models"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 // FilterEngine handles field-level and document-level filtering

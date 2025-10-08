@@ -29,19 +29,19 @@ type WatermarkConfig struct {
 
 // Watermark represents the VM-side watermark state
 type Watermark struct {
-	ID                    string               `bson:"_id" json:"id"`
-	ClientID              string               `bson:"client_id" json:"client_id"`
-	Database              string               `bson:"database" json:"database"`
-	Collection            string               `bson:"collection" json:"collection"`
-	LastAppliedEventID    string               `bson:"last_applied_event_id" json:"last_applied_event_id"`
-	LastAppliedSequenceID int64                `bson:"last_applied_sequence_id" json:"last_applied_sequence_id"`
+	ID                     string               `bson:"_id" json:"id"`
+	ClientID               string               `bson:"client_id" json:"client_id"`
+	Database               string               `bson:"database" json:"database"`
+	Collection             string               `bson:"collection" json:"collection"`
+	LastAppliedEventID     string               `bson:"last_applied_event_id" json:"last_applied_event_id"`
+	LastAppliedSequenceID  int64                `bson:"last_applied_sequence_id" json:"last_applied_sequence_id"`
 	LastAppliedClusterTime *primitive.Timestamp `bson:"last_applied_cluster_time" json:"last_applied_cluster_time"`
-	LastAckedSequenceID   int64                `bson:"last_acked_sequence_id" json:"last_acked_sequence_id"`
-	LastAckedBatchID      string               `bson:"last_acked_batch_id" json:"last_acked_batch_id"`
-	SnapshotCompleted     bool                 `bson:"snapshot_completed" json:"snapshot_completed"`
-	SnapshotClusterTime   *primitive.Timestamp `bson:"snapshot_cluster_time" json:"snapshot_cluster_time"`
-	CreatedAt             time.Time            `bson:"created_at" json:"created_at"`
-	UpdatedAt             time.Time            `bson:"updated_at" json:"updated_at"`
+	LastAckedSequenceID    int64                `bson:"last_acked_sequence_id" json:"last_acked_sequence_id"`
+	LastAckedBatchID       string               `bson:"last_acked_batch_id" json:"last_acked_batch_id"`
+	SnapshotCompleted      bool                 `bson:"snapshot_completed" json:"snapshot_completed"`
+	SnapshotClusterTime    *primitive.Timestamp `bson:"snapshot_cluster_time" json:"snapshot_cluster_time"`
+	CreatedAt              time.Time            `bson:"created_at" json:"created_at"`
+	UpdatedAt              time.Time            `bson:"updated_at" json:"updated_at"`
 }
 
 // NewWatermarkManager creates a new watermark manager
@@ -84,14 +84,14 @@ func (wm *WatermarkManager) createIndexes() error {
 
 	indexes := []mongo.IndexModel{
 		{
-			Keys: bson.D{{"client_id", 1}, {"database", 1}, {"collection", 1}},
+			Keys:    bson.D{primitive.E{Key: "client_id", Value: 1}, primitive.E{Key: "database", Value: 1}, primitive.E{Key: "collection", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 		{
-			Keys: bson.D{{"last_applied_sequence_id", 1}},
+			Keys: bson.D{primitive.E{Key: "last_applied_sequence_id", Value: 1}},
 		},
 		{
-			Keys: bson.D{{"last_acked_sequence_id", 1}},
+			Keys: bson.D{primitive.E{Key: "last_acked_sequence_id", Value: 1}},
 		},
 	}
 
@@ -203,9 +203,9 @@ func (wm *WatermarkManager) MarkSnapshotComplete(clientID, database, collection 
 	filter := bson.M{"_id": id}
 	update := bson.M{
 		"$set": bson.M{
-			"snapshot_completed":     true,
+			"snapshot_completed":    true,
 			"snapshot_cluster_time": clusterTime,
-			"updated_at":             time.Now(),
+			"updated_at":            time.Now(),
 		},
 		"$setOnInsert": bson.M{
 			"client_id":  clientID,

@@ -1,0 +1,160 @@
+# VM-sync AUTO-DISTRIBUTION Configuration
+# 
+# 🚀 COLLECTIONS AUTOMATICALLY ASSIGNED BY CLOUD-SYNC 🚀
+# No manual collection configuration needed - eliminates human errors!
+#
+# License Configuration (Environment Variable):
+# VM_SYNC_LICENSE="vm-tag,vm-uuid-456"  # VM-sync license key
+# 
+# This license must be included in the cloud-sync's VM_SYNC_LICENSES
+# environment variable for successful WebSocket authentication.
+
+cloud_sync:
+  # Cloud-sync server endpoints with dynamic path-based routing
+  # Pattern: /{BASE_PATH}-{TENANT_ID}-{COMMUNITY_ID}
+  # Based on .env.example: /cloudsync-737373-828282
+  http_url: "http://localhost:8080/cloudsync-737373-828282"
+  ws_url: "ws://localhost:8080/cloudsync-737373-828282/ws"
+  http_timeout: "600s"  # 10 minutes for large data transfers
+  
+  # OAuth2 authentication (required for vm-sync)
+  oauth2:
+    enabled: true
+    # Option 1: Configure credentials directly (for testing)
+    client_id: "vm_sync_auto_client_001"
+    client_secret: "auto_demo_secret_key_for_testing_only_change_in_production"
+    token_url: "http://localhost:8080/cloudsync-737373-828282/api/auth/token"
+    
+    # Option 2: Leave client_id and client_secret empty to load from local database
+    # (credentials must be registered via admin API first)
+    # client_id: ""
+    # client_secret: ""
+
+mongodb:
+  # Local MongoDB target database
+  uri: "mongodb://localhost:27017/?retryWrites=true&w=majority"
+  timeout: 30s
+
+# 🎯 NO COLLECTIONS FIELD - CLOUD-SYNC AUTO-DISTRIBUTES!
+# Collections are automatically assigned by cloud-sync based on:
+# - VM capacity and load
+# - Network performance
+# - Geographic preferences
+# - Collection size and priority
+
+# VM Capabilities (tells cloud-sync what this VM can handle)
+capabilities:
+  max_collections: 10        # Maximum collections this VM can sync
+  max_concurrency: 4         # Maximum parallel sync operations
+  memory_limit_mb: 2048      # Memory limit in MB
+  preferred_databases: []    # Empty = accept any database
+  excluded_databases: []     # Databases to never sync
+  supports_tcp: true         # Support high-performance TCP transport
+  supports_http: true        # Support HTTP fallback
+
+# Sync configuration
+sync:
+  initial_sync: true
+  realtime_sync: true
+  resumable_initial_sync: true  # Enable to resume from last sync state
+  batch_size: 1000      # Batch size for processing
+  parallel_collections: true
+  max_workers: 8        # Worker threads for processing
+  retry_attempts: 3
+  retry_delay: "5s"
+  
+  # TCP Transport Configuration for high-performance data transfer
+  transport:
+    mode: "tcp"  # Use TCP transport for initial dumps
+    http_fallback: true  # Accept HTTP fallback from cloud-sync
+    compression_type: "zstd"  # Use Zstd compression for best ratio
+    tcp_receiver:
+      listen_addr: "0.0.0.0:9000"  # TCP receiver listen address
+      max_connections: 10
+      read_timeout: 60s
+      write_timeout: 30s
+      buffer_size: 262144  # 256KB
+      disk_checkpoint: true
+      checkpoint_dir: "/tmp/vm-sync-tcp-checkpoints"
+      heartbeat_interval: 30s
+      max_batch_size: 16777216  # 16MB
+      tls_enabled: false
+
+# Encryption configuration (must match cloud-sync)
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  key_id: "cloud-sync-key-001"
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"
+
+# Checkpoint configuration for resume token tracking
+checkpoint:
+  enabled: true
+  database: "vm_sync_checkpoints"
+  collection: "client_resume_tokens"
+  save_interval_seconds: 3
+  cleanup_enabled: true
+  retention_days: 7
+
+# Watermarks configuration for exactly-once semantics
+watermarks:
+  enabled: true
+  database: "vm_sync_watermarks"
+  collection: "sequence_watermarks"
+
+# Sequence configuration for ordered event processing
+sequence:
+  enabled: true
+  database: "vm_sync_sequences"
+  collection: "event_sequences"
+  batch_size: 1000
+  node_id: "vm-sync-auto-node"
+
+# Fence configuration for snapshot consistency
+fence:
+  enabled: true
+
+# Connection and retry configuration
+connection:
+  reconnect_interval: "5s"
+  max_reconnect_attempts: 10
+  connection_timeout: "300s"
+  keepalive_interval: "30s"
+
+# Logging configuration
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  include_timestamps: true
+
+# Performance tuning
+performance:
+  buffer_size: 10000
+  flush_interval: "500ms"
+  max_batch_wait: "5s"
+  compression_enabled: true
+
+# Health check configuration
+health:
+  enabled: true
+  port: 8081
+  path: "/health"
+  interval: "30s"
+
+# Metrics configuration
+metrics:
+  enabled: true
+  port: 8082
+  path: "/metrics"
+  collection_interval: "10s"
+
+# VM Registration (automatically sent to cloud-sync)
+registration:
+  auto_register: true          # Automatically register with cloud-sync
+  announce_capabilities: true  # Send capability information
+  heartbeat_interval: "30s"    # Heartbeat to maintain registration
+  metadata:                    # Optional metadata
+    region: "us-east-1"
+    datacenter: "dc1"
+    environment: "production"

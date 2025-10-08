@@ -10,21 +10,36 @@ import (
 type LogLevel string
 
 const (
+	LevelTrace LogLevel = "trace"
 	LevelDebug LogLevel = "debug"
 	LevelInfo  LogLevel = "info"
 	LevelWarn  LogLevel = "warn"
 	LevelError LogLevel = "error"
+	LevelFatal LogLevel = "fatal"
 )
 
-// LogEntry represents a single log entry
+// LogContext represents the context where the log was generated
+type LogContext struct {
+	File     string `json:"file"`
+	Function string `json:"function"`
+	Line     int    `json:"line"`
+}
+
+// LogEntry represents a single log entry with enhanced debugging info
 type LogEntry struct {
-	Timestamp string    `json:"timestamp"`
-	Stage     string    `json:"stage"`
-	Action    string    `json:"action"`
-	Status    string    `json:"status"`
-	Message   string    `json:"message"`
-	Level     LogLevel  `json:"level"`
-	Details   map[string]interface{} `json:"details,omitempty"`
+	Timestamp     string                 `json:"timestamp"`
+	Stage         string                 `json:"stage"`
+	Action        string                 `json:"action"`
+	Status        string                 `json:"status"`
+	Message       string                 `json:"message"`
+	Level         LogLevel               `json:"level"`
+	Details       map[string]interface{} `json:"details,omitempty"`
+	Context       LogContext             `json:"context,omitempty"`
+	CorrelationID string                 `json:"correlation_id,omitempty"`
+	UserID        string                 `json:"user_id,omitempty"`
+	ClientID      string                 `json:"client_id,omitempty"`
+	Duration      *time.Duration         `json:"duration,omitempty"`
+	StackTrace    []string               `json:"stack_trace,omitempty"`
 }
 
 // Logger handles structured logging for the dashboard

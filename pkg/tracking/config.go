@@ -23,9 +23,6 @@ func LoadTrackingConfig(configPath string) (*TransferConfig, error) {
 	if config.Database == "" {
 		config.Database = "sync_tracking"
 	}
-	if config.TransferCollection == "" {
-		config.TransferCollection = "transfer_records"
-	}
 	if config.StateCollection == "" {
 		config.StateCollection = "client_sync_states"
 	}
@@ -39,11 +36,10 @@ func LoadTrackingConfig(configPath string) (*TransferConfig, error) {
 // DefaultTrackingConfig returns a default tracking configuration
 func DefaultTrackingConfig() *TransferConfig {
 	return &TransferConfig{
-		Enabled:            false,
-		MongoURI:           "mongodb://localhost:27017/?replicaSet=rs0",
-		Database:           "sync_tracking",
-		TransferCollection: "transfer_records",
-		StateCollection:    "client_sync_states",
-		BatchCollection:    "transfer_batches",
+		Enabled:         false,
+		MongoURI:        "mongodb://localhost:27017/?replicaSet=rs0",
+		Database:        "sync_tracking",
+		StateCollection: "client_sync_states",
+		BatchCollection: "transfer_batches",
 	}
 }

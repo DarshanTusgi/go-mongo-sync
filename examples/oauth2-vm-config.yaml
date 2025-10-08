@@ -1,0 +1,91 @@
+# VM-sync configuration with OAuth2 authentication
+# This example shows how to configure vm-sync to use OAuth2 instead of license-based auth
+
+cloud_sync:
+  # Cloud-sync server endpoints
+  http_url: "http://localhost:8080"
+  ws_url: "ws://localhost:8080/ws"
+  http_timeout: "300s"
+  
+  # OAuth2 authentication (preferred over license)
+  oauth2:
+    enabled: true
+    # Option 1: Configure credentials directly (for demo/testing)
+    client_id: "vm-sync-client-123"
+    client_secret: "super-secret-key-456"
+    token_url: "http://localhost:8080/api/auth/token"
+    
+    # Option 2: Leave empty to load from local database
+    # (credentials must be registered via admin API first)
+    # client_id: ""
+    # client_secret: ""
+
+# Local MongoDB target database
+mongodb:
+  uri: "mongodb://localhost:27017"
+  timeout: "30s"
+
+# Collections to sync (you can use wildcards)
+collections:
+  - "inventory.products"
+  - "users.profiles"
+  - "analytics.events"
+
+# Sync configuration
+sync:
+  initial_sync: true
+  realtime_sync: true
+  resumable_initial_sync: true
+  batch_size: 1000
+  parallel_collections: true
+  max_workers: 4
+  
+  # Transport configuration
+  transport:
+    mode: "http"  # Options: "http", "tcp", "websocket"
+    http_fallback: true
+    compression_type: "zstd"
+    
+    # TCP receiver configuration (if mode is "tcp")
+    tcp_receiver:
+      listen_addr: "0.0.0.0:9000"
+      max_connections: 10
+      read_timeout: "120s"
+      write_timeout: "60s"
+      buffer_size: 1048576  # 1MB
+      disk_checkpoint: true
+      checkpoint_dir: "/tmp/vm-sync-tcp-checkpoints"
+      heartbeat_interval: "30s"
+      max_batch_size: 67108864  # 64MB
+
+# Encryption configuration (optional)
+encryption:
+  enabled: false
+  # key: "base64-encoded-32-byte-key"
+  # key_id: "unique-key-identifier"
+
+# Checkpoint configuration for resume capability
+checkpoint:
+  enabled: true
+  database: "vm_sync_checkpoints"
+  collection: "resume_tokens"
+  save_interval: 30
+
+# Watermark configuration for data consistency
+watermarks:
+  enabled: true
+  database: "vm_sync_watermarks"
+  collection: "collection_watermarks"
+  update_interval: 60
+
+# Sequence configuration for ordering
+sequence:
+  enabled: true
+  database: "vm_sync_sequence"
+  collection: "sequence_numbers"
+  batch_size: 100
+  node_id: "vm-sync-node-1"
+
+# Cluster time fence for snapshot consistency
+fence:
+  enabled: true

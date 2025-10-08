@@ -20,12 +20,12 @@ type Task struct {
 
 // WorkerPoolConfig holds configuration for the worker pool
 type WorkerPoolConfig struct {
-	WorkerCount    int           `yaml:"worker_count" json:"worker_count"`
-	QueueSize      int           `yaml:"queue_size" json:"queue_size"`
-	MaxRetries     int           `yaml:"max_retries" json:"max_retries"`
-	RetryDelay     time.Duration `yaml:"retry_delay" json:"retry_delay"`
-	TaskTimeout    time.Duration `yaml:"task_timeout" json:"task_timeout"`
-	EnableMetrics  bool          `yaml:"enable_metrics" json:"enable_metrics"`
+	WorkerCount     int           `yaml:"worker_count" json:"worker_count"`
+	QueueSize       int           `yaml:"queue_size" json:"queue_size"`
+	MaxRetries      int           `yaml:"max_retries" json:"max_retries"`
+	RetryDelay      time.Duration `yaml:"retry_delay" json:"retry_delay"`
+	TaskTimeout     time.Duration `yaml:"task_timeout" json:"task_timeout"`
+	EnableMetrics   bool          `yaml:"enable_metrics" json:"enable_metrics"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout" json:"shutdown_timeout"`
 }
 
@@ -44,14 +44,14 @@ func DefaultWorkerPoolConfig() *WorkerPoolConfig {
 
 // WorkerPoolStats holds statistics about the worker pool
 type WorkerPoolStats struct {
-	ActiveWorkers   int32     `json:"active_workers"`
-	QueuedTasks     int32     `json:"queued_tasks"`
-	ProcessedTasks  int64     `json:"processed_tasks"`
-	FailedTasks     int64     `json:"failed_tasks"`
-	RetryTasks      int64     `json:"retry_tasks"`
-	AverageLatency  float64   `json:"average_latency_ms"`
-	LastProcessed   time.Time `json:"last_processed"`
-	StartTime       time.Time `json:"start_time"`
+	ActiveWorkers  int32     `json:"active_workers"`
+	QueuedTasks    int32     `json:"queued_tasks"`
+	ProcessedTasks int64     `json:"processed_tasks"`
+	FailedTasks    int64     `json:"failed_tasks"`
+	RetryTasks     int64     `json:"retry_tasks"`
+	AverageLatency float64   `json:"average_latency_ms"`
+	LastProcessed  time.Time `json:"last_processed"`
+	StartTime      time.Time `json:"start_time"`
 }
 
 // WorkerPool manages a pool of workers for parallel task processing
@@ -71,11 +71,11 @@ type WorkerPool struct {
 
 // Worker represents a single worker in the pool
 type Worker struct {
-	id       int
-	pool     *WorkerPool
-	active   int32
-	ctx      context.Context
-	cancel   context.CancelFunc
+	id     int
+	pool   *WorkerPool
+	active int32
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewWorkerPool creates a new worker pool

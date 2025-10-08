@@ -12,15 +12,15 @@ import (
 
 // RetryConfig holds configuration for retry logic
 type RetryConfig struct {
-	MaxAttempts      int           `yaml:"max_attempts" json:"max_attempts"`
-	InitialDelay     time.Duration `yaml:"initial_delay" json:"initial_delay"`
-	MaxDelay         time.Duration `yaml:"max_delay" json:"max_delay"`
-	BackoffFactor    float64       `yaml:"backoff_factor" json:"backoff_factor"`
-	JitterEnabled    bool          `yaml:"jitter_enabled" json:"jitter_enabled"`
-	RetryableErrors  []string      `yaml:"retryable_errors" json:"retryable_errors"`
-	NonRetryableErrors []string    `yaml:"non_retryable_errors" json:"non_retryable_errors"`
-	OnRetry          func(attempt int, err error, delay time.Duration)
-	IsRetryable      func(error) bool
+	MaxAttempts        int           `yaml:"max_attempts" json:"max_attempts"`
+	InitialDelay       time.Duration `yaml:"initial_delay" json:"initial_delay"`
+	MaxDelay           time.Duration `yaml:"max_delay" json:"max_delay"`
+	BackoffFactor      float64       `yaml:"backoff_factor" json:"backoff_factor"`
+	JitterEnabled      bool          `yaml:"jitter_enabled" json:"jitter_enabled"`
+	RetryableErrors    []string      `yaml:"retryable_errors" json:"retryable_errors"`
+	NonRetryableErrors []string      `yaml:"non_retryable_errors" json:"non_retryable_errors"`
+	OnRetry            func(attempt int, err error, delay time.Duration)
+	IsRetryable        func(error) bool
 }
 
 // DefaultRetryConfig returns default retry configuration
@@ -51,12 +51,12 @@ func DefaultRetryConfig() *RetryConfig {
 
 // RetryStats holds statistics about retry operations
 type RetryStats struct {
-	TotalAttempts    uint64    `json:"total_attempts"`
-	SuccessfulRetries uint64   `json:"successful_retries"`
-	FailedRetries    uint64    `json:"failed_retries"`
-	AverageAttempts  float64   `json:"average_attempts"`
-	LastRetry        time.Time `json:"last_retry"`
-	TotalDelay       time.Duration `json:"total_delay"`
+	TotalAttempts     uint64        `json:"total_attempts"`
+	SuccessfulRetries uint64        `json:"successful_retries"`
+	FailedRetries     uint64        `json:"failed_retries"`
+	AverageAttempts   float64       `json:"average_attempts"`
+	LastRetry         time.Time     `json:"last_retry"`
+	TotalDelay        time.Duration `json:"total_delay"`
 }
 
 // RetryManager manages retry logic with exponential backoff
@@ -244,12 +244,12 @@ func (rm *RetryManager) updateAverageAttempts(attempts int) {
 
 // contains checks if a string contains a substring (case-insensitive)
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && 
-		(s == substr || 
-		 len(s) > len(substr) && 
-		 (s[:len(substr)] == substr || 
-		  s[len(s)-len(substr):] == substr ||
-		  findSubstring(s, substr)))
+	return len(s) >= len(substr) &&
+		(s == substr ||
+			len(s) > len(substr) &&
+				(s[:len(substr)] == substr ||
+					s[len(s)-len(substr):] == substr ||
+					findSubstring(s, substr)))
 }
 
 // findSubstring performs case-insensitive substring search

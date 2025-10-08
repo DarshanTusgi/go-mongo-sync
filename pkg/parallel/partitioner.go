@@ -13,12 +13,12 @@ import (
 
 // Partition represents a range of ObjectIds for parallel processing
 type Partition struct {
-	ID       int                `json:"id"`
+	ID       int                 `json:"id"`
 	MinID    *primitive.ObjectID `json:"min_id,omitempty"`
 	MaxID    *primitive.ObjectID `json:"max_id,omitempty"`
-	IsFirst  bool               `json:"is_first"`
-	IsLast   bool               `json:"is_last"`
-	EstCount int64              `json:"est_count"`
+	IsFirst  bool                `json:"is_first"`
+	IsLast   bool                `json:"is_last"`
+	EstCount int64               `json:"est_count"`
 }
 
 // PartitionConfig holds configuration for partitioning
@@ -138,9 +138,9 @@ func (p *Partitioner) getObjectIdBoundaries(ctx context.Context, coll *mongo.Col
 
 	// Use aggregation to sample ObjectIds and find boundaries
 	pipeline := []bson.D{
-		{{"$sample", bson.D{{"size", numPartitions * 100}}}}, // Sample more than needed
-		{{"$project", bson.D{{"_id", 1}}}},
-		{{"$sort", bson.D{{"_id", 1}}}},
+		{primitive.E{Key: "$sample", Value: bson.D{primitive.E{Key: "size", Value: numPartitions * 100}}}}, // Sample more than needed
+		{primitive.E{Key: "$project", Value: bson.D{primitive.E{Key: "_id", Value: 1}}}},
+		{primitive.E{Key: "$sort", Value: bson.D{primitive.E{Key: "_id", Value: 1}}}},
 	}
 
 	cursor, err := coll.Aggregate(ctx, pipeline)
@@ -183,20 +183,20 @@ func (p *Partitioner) BuildPartitionFilter(partition *Partition) bson.D {
 	if partition.MinID != nil && partition.MaxID != nil {
 		// Middle partition: minID < _id <= maxID
 		filter = bson.D{
-			{"_id", bson.D{
-				{"$gt", *partition.MinID},
-				{"$lte", *partition.MaxID},
+			primitive.E{Key: "_id", Value: bson.D{
+				primitive.E{Key: "$gt", Value: *partition.MinID},
+				primitive.E{Key: "$lte", Value: *partition.MaxID},
 			}},
 		}
 	} else if partition.MinID != nil {
 		// Last partition: _id > minID
 		filter = bson.D{
-			{"_id", bson.D{{"$gt", *partition.MinID}}},
+			primitive.E{Key: "_id", Value: bson.D{primitive.E{Key: "$gt", Value: *partition.MinID}}},
 		}
 	} else if partition.MaxID != nil {
 		// First partition: _id <= maxID
 		filter = bson.D{
-			{"_id", bson.D{{"$lte", *partition.MaxID}}},
+			primitive.E{Key: "_id", Value: bson.D{primitive.E{Key: "$lte", Value: *partition.MaxID}}},
 		}
 	}
 	// If both are nil, return empty filter (entire collection)

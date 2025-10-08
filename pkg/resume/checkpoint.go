@@ -14,30 +14,30 @@ import (
 
 // CheckpointManager manages resume tokens and synchronization checkpoints
 type CheckpointManager struct {
-	mu           sync.RWMutex
-	client       *mongo.Client
-	database     string
-	collection   string
-	checkpoints  map[string]*Checkpoint
+	mu              sync.RWMutex
+	client          *mongo.Client
+	database        string
+	collection      string
+	checkpoints     map[string]*Checkpoint
 	persistInterval time.Duration
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 }
 
 // Checkpoint represents a synchronization checkpoint for a collection
 type Checkpoint struct {
-	ID               string             `bson:"_id" json:"id"`
-	Database         string             `bson:"database" json:"database"`
-	Collection       string             `bson:"collection" json:"collection"`
-	ResumeToken      bson.Raw           `bson:"resume_token" json:"resume_token"`
-	LastEventTime    time.Time          `bson:"last_event_time" json:"last_event_time"`
-	LastEventID      primitive.ObjectID `bson:"last_event_id,omitempty" json:"last_event_id,omitempty"`
-	ProcessedCount   int64              `bson:"processed_count" json:"processed_count"`
-	LastUpdated      time.Time          `bson:"last_updated" json:"last_updated"`
-	Status           string             `bson:"status" json:"status"` // "active", "paused", "error"
-	ErrorMessage     string             `bson:"error_message,omitempty" json:"error_message,omitempty"`
-	Version          int                `bson:"version" json:"version"`
+	ID             string             `bson:"_id" json:"id"`
+	Database       string             `bson:"database" json:"database"`
+	Collection     string             `bson:"collection" json:"collection"`
+	ResumeToken    bson.Raw           `bson:"resume_token,omitempty" json:"resume_token,omitempty"`
+	LastEventTime  time.Time          `bson:"last_event_time" json:"last_event_time"`
+	LastEventID    primitive.ObjectID `bson:"last_event_id,omitempty" json:"last_event_id,omitempty"`
+	ProcessedCount int64              `bson:"processed_count" json:"processed_count"`
+	LastUpdated    time.Time          `bson:"last_updated" json:"last_updated"`
+	Status         string             `bson:"status" json:"status"` // "active", "paused", "error"
+	ErrorMessage   string             `bson:"error_message,omitempty" json:"error_message,omitempty"`
+	Version        int                `bson:"version" json:"version"`
 }
 
 // CheckpointConfig holds configuration for checkpoint management
@@ -125,7 +125,10 @@ func (cm *CheckpointManager) UpdateCheckpoint(database, collection string, resum
 		cm.checkpoints[key] = checkpoint
 	}
 
-	checkpoint.ResumeToken = resumeToken
+	// Only update resume token if it's valid (not nil and has content)
+	if resumeToken != nil && len(resumeToken) > 0 {
+		checkpoint.ResumeToken = resumeToken
+	}
 	checkpoint.LastEventTime = eventTime
 	checkpoint.ProcessedCount++
 	checkpoint.LastUpdated = time.Now()
@@ -164,6 +167,31 @@ func (cm *CheckpointManager) ClearCheckpointError(database, collection string) {
 		checkpoint.LastUpdated = time.Now()
 		checkpoint.Version++
 	}
+}
+
+// DeleteCheckpoint removes a checkpoint for a specific collection
+func (cm *CheckpointManager) DeleteCheckpoint(database, collection string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	id := fmt.Sprintf("%s.%s", database, collection)
+
+	// Remove from memory
+	delete(cm.checkpoints, id)
+
+	// Remove from database if client is available
+	if cm.client != nil {
+		coll := cm.client.Database(cm.database).Collection(cm.collection)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		_, err := coll.DeleteOne(ctx, bson.M{"_id": id})
+		if err != nil {
+			return fmt.Errorf("failed to delete checkpoint from database: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // GetAllCheckpoints returns all checkpoints
@@ -214,6 +242,10 @@ func (cm *CheckpointManager) persistCheckpoints() error {
 	checkpoints := make([]*Checkpoint, 0, len(cm.checkpoints))
 	for _, checkpoint := range cm.checkpoints {
 		copy := *checkpoint
+		// Ensure nil or empty resume tokens are handled properly
+		if copy.ResumeToken != nil && len(copy.ResumeToken) == 0 {
+			copy.ResumeToken = nil
+		}
 		checkpoints = append(checkpoints, &copy)
 	}
 	cm.mu.RUnlock()
@@ -289,10 +321,10 @@ func (cm *CheckpointManager) GetStats() map[string]interface{} {
 	defer cm.mu.RUnlock()
 
 	stats := map[string]interface{}{
-		"total_checkpoints": len(cm.checkpoints),
+		"total_checkpoints":  len(cm.checkpoints),
 		"active_checkpoints": 0,
-		"error_checkpoints": 0,
-		"total_processed": int64(0),
+		"error_checkpoints":  0,
+		"total_processed":    int64(0),
 	}
 
 	for _, checkpoint := range cm.checkpoints {

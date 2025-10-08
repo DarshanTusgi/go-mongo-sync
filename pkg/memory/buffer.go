@@ -1,5 +1,13 @@
 package memory
 
+// DEPRECATED: This buffer system has been replaced by the buffer-free
+// resume token approach in pkg/resume/. This file is kept for backward
+// compatibility during migration period.
+//
+// The buffer-free approach eliminates memory explosion during peak hours
+// by using MongoDB-native resume tokens instead of in-memory buffering.
+// See docs/BUFFER_FREE_ARCHITECTURE.md for details.
+
 import (
 	"bytes"
 	"compress/gzip"
@@ -10,13 +18,13 @@ import (
 
 // ChangeEvent represents a change event in the buffer
 type ChangeEvent struct {
-	ID          string                 `json:"id"`
-	OperationType string               `json:"operation_type"`
-	Namespace   string                 `json:"namespace"`
-	DocumentKey map[string]interface{} `json:"document_key"`
-	FullDocument map[string]interface{} `json:"full_document,omitempty"`
-	Timestamp   time.Time              `json:"timestamp"`
-	Size        int                    `json:"size"`
+	ID            string                 `json:"id"`
+	OperationType string                 `json:"operation_type"`
+	Namespace     string                 `json:"namespace"`
+	DocumentKey   map[string]interface{} `json:"document_key"`
+	FullDocument  map[string]interface{} `json:"full_document,omitempty"`
+	Timestamp     time.Time              `json:"timestamp"`
+	Size          int                    `json:"size"`
 }
 
 // Buffer manages a collection of change events with memory-efficient storage
@@ -34,10 +42,10 @@ type Buffer struct {
 // NewBuffer creates a new buffer
 func NewBuffer(key string, maxEvents, flushSize int) *Buffer {
 	return &Buffer{
-		key:       key,
-		events:    make([]*ChangeEvent, 0, maxEvents),
-		maxEvents: maxEvents,
-		flushSize: flushSize,
+		key:        key,
+		events:     make([]*ChangeEvent, 0, maxEvents),
+		maxEvents:  maxEvents,
+		flushSize:  flushSize,
 		compressed: true,
 	}
 }
@@ -126,11 +134,11 @@ func (b *Buffer) Flush() {
 		// Create copy of events for callback
 		eventsCopy := make([]*ChangeEvent, len(b.events))
 		copy(eventsCopy, b.events)
-		
+
 		// Clear buffer
 		b.events = b.events[:0]
 		b.totalSize = 0
-		
+
 		// Call flush callback
 		go b.flushCallback(eventsCopy)
 	}
@@ -152,11 +160,11 @@ func (b *Buffer) triggerFlush() {
 		// Create copy of events for callback
 		eventsCopy := make([]*ChangeEvent, len(b.events))
 		copy(eventsCopy, b.events)
-		
+
 		// Clear buffer
 		b.events = b.events[:0]
 		b.totalSize = 0
-		
+
 		// Call flush callback
 		b.flushCallback(eventsCopy)
 	}
@@ -178,11 +186,11 @@ func (b *Buffer) Compress() ([]byte, error) {
 
 	var buf bytes.Buffer
 	gzWriter := gzip.NewWriter(&buf)
-	
+
 	if _, err := gzWriter.Write(data); err != nil {
 		return nil, err
 	}
-	
+
 	if err := gzWriter.Close(); err != nil {
 		return nil, err
 	}

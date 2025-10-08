@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -87,7 +88,7 @@ func (g *Generator) initializeCounter() error {
 
 	// Create index for better performance
 	indexModel := mongo.IndexModel{
-		Keys: bson.D{{"node_id", 1}},
+		Keys:    bson.D{primitive.E{Key: "node_id", Value: 1}},
 		Options: options.Index().SetUnique(true),
 	}
 	_, err := g.collection.Indexes().CreateOne(ctx, indexModel)
@@ -229,11 +230,11 @@ func (g *Generator) Close() error {
 
 // BatchInfo returns information about the current batch
 type BatchInfo struct {
-	NodeID      string `json:"node_id"`
-	Current     int64  `json:"current"`
-	Max         int64  `json:"max"`
-	Remaining   int64  `json:"remaining"`
-	BatchSize   int64  `json:"batch_size"`
+	NodeID    string `json:"node_id"`
+	Current   int64  `json:"current"`
+	Max       int64  `json:"max"`
+	Remaining int64  `json:"remaining"`
+	BatchSize int64  `json:"batch_size"`
 }
 
 // GetBatchInfo returns information about the current sequence batch

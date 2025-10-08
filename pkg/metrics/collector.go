@@ -47,25 +47,25 @@ type ThroughputMetrics struct {
 
 // HealthMetrics tracks operational health
 type HealthMetrics struct {
-	Component         string    `json:"component"`
-	Status            string    `json:"status"` // healthy, degraded, unhealthy
+	Component         string        `json:"component"`
+	Status            string        `json:"status"` // healthy, degraded, unhealthy
 	Uptime            time.Duration `json:"uptime"`
-	LastHealthCheck   time.Time `json:"last_health_check"`
-	ConnectedClients  int       `json:"connected_clients"`
-	ActiveConnections int       `json:"active_connections"`
-	MemoryUsage       int64     `json:"memory_usage"`
-	CPUUsage          float64   `json:"cpu_usage"`
+	LastHealthCheck   time.Time     `json:"last_health_check"`
+	ConnectedClients  int           `json:"connected_clients"`
+	ActiveConnections int           `json:"active_connections"`
+	MemoryUsage       int64         `json:"memory_usage"`
+	CPUUsage          float64       `json:"cpu_usage"`
 }
 
 // ErrorMetrics tracks error rates and types
 type ErrorMetrics struct {
-	Database      string            `json:"database"`
-	Collection    string            `json:"collection"`
-	ErrorType     string            `json:"error_type"`
-	ErrorCount    int64             `json:"error_count"`
-	ErrorRate     float64           `json:"error_rate"`
-	LastError     string            `json:"last_error"`
-	LastErrorTime time.Time         `json:"last_error_time"`
+	Database      string                 `json:"database"`
+	Collection    string                 `json:"collection"`
+	ErrorType     string                 `json:"error_type"`
+	ErrorCount    int64                  `json:"error_count"`
+	ErrorRate     float64                `json:"error_rate"`
+	LastError     string                 `json:"last_error"`
+	LastErrorTime time.Time              `json:"last_error_time"`
 	ErrorDetails  map[string]interface{} `json:"error_details,omitempty"`
 }
 
@@ -81,10 +81,10 @@ type MetricsCollector struct {
 	startTime         time.Time
 
 	// Event counters for throughput calculation
-	eventCounters     map[string]*EventCounter
-	bytesCounters     map[string]*BytesCounter
-	docsCounters      map[string]*DocsCounter
-	batchCounters     map[string]*BatchCounter
+	eventCounters map[string]*EventCounter
+	bytesCounters map[string]*BytesCounter
+	docsCounters  map[string]*DocsCounter
+	batchCounters map[string]*BatchCounter
 
 	// External metrics
 	activeWatchersCount int
@@ -116,10 +116,10 @@ type DocsCounter struct {
 
 // BatchCounter tracks batches processed over time windows
 type BatchCounter struct {
-	mu           sync.Mutex
-	totalBatches int64
+	mu            sync.Mutex
+	totalBatches  int64
 	recentBatches []timestampedCount
-	windowSize   time.Duration
+	windowSize    time.Duration
 }
 
 type timestampedCount struct {

@@ -91,8 +91,6 @@ func (lv *LicenseValidator) GetCloudLicense() *LicenseKey {
 	return lv.cloudLicense
 }
 
-
-
 // LoadVMLicense loads a VM license from the VM_SYNC_LICENSE environment variable
 func LoadVMLicense() (*LicenseKey, error) {
 	return loadLicenseFromEnv("VM_SYNC_LICENSE")

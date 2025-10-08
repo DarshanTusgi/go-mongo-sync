@@ -12,13 +12,12 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// TransferTracker manages transfer tracking operations
+// TransferTracker manages watermark-based tracking operations
 type TransferTracker struct {
-	client             *mongo.Client
-	config             *TransferConfig
-	transferCollection *mongo.Collection
-	stateCollection    *mongo.Collection
-	batchCollection    *mongo.Collection
+	client          *mongo.Client
+	config          *TransferConfig
+	stateCollection *mongo.Collection
+	batchCollection *mongo.Collection
 }
 
 // NewTransferTracker creates a new transfer tracker instance
@@ -39,16 +38,14 @@ func NewTransferTracker(config *TransferConfig) (*TransferTracker, error) {
 	}
 
 	db := client.Database(config.Database)
-	transferColl := db.Collection(config.TransferCollection)
 	stateColl := db.Collection(config.StateCollection)
 	batchColl := db.Collection(config.BatchCollection)
 
 	tracker := &TransferTracker{
-		client:             client,
-		config:             config,
-		transferCollection: transferColl,
-		stateCollection:    stateColl,
-		batchCollection:    batchColl,
+		client:          client,
+		config:          config,
+		stateCollection: stateColl,
+		batchCollection: batchColl,
 	}
 
 	// Create indexes for better performance
@@ -64,23 +61,10 @@ func NewTransferTracker(config *TransferConfig) (*TransferTracker, error) {
 func (tt *TransferTracker) createIndexes() error {
 	ctx := context.Background()
 
-	// Index for transfer records
-	transferIndexes := []mongo.IndexModel{
-		{
-			Keys: bson.D{{"client_id", 1}, {"database", 1}, {"collection", 1}},
-		},
-		{
-			Keys: bson.D{{"document_id", 1}, {"client_id", 1}},
-		},
-		{
-			Keys: bson.D{{"transfer_batch_id", 1}},
-		},
-	}
-
 	// Index for client sync state
 	stateIndexes := []mongo.IndexModel{
 		{
-			Keys: bson.D{{"client_id", 1}, {"database", 1}, {"collection", 1}},
+			Keys:    bson.D{primitive.E{Key: "client_id", Value: 1}, primitive.E{Key: "database", Value: 1}, primitive.E{Key: "collection", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 	}
@@ -88,19 +72,15 @@ func (tt *TransferTracker) createIndexes() error {
 	// Index for transfer batches
 	batchIndexes := []mongo.IndexModel{
 		{
-			Keys: bson.D{{"batch_id", 1}},
+			Keys:    bson.D{primitive.E{Key: "batch_id", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 		{
-			Keys: bson.D{{"client_id", 1}, {"status", 1}},
+			Keys: bson.D{primitive.E{Key: "client_id", Value: 1}, primitive.E{Key: "status", Value: 1}},
 		},
 	}
 
 	// Create indexes
-	if _, err := tt.transferCollection.Indexes().CreateMany(ctx, transferIndexes); err != nil {
-		return fmt.Errorf("failed to create transfer indexes: %v", err)
-	}
-
 	if _, err := tt.stateCollection.Indexes().CreateMany(ctx, stateIndexes); err != nil {
 		return fmt.Errorf("failed to create state indexes: %v", err)
 	}
@@ -117,122 +97,30 @@ func (tt *TransferTracker) IsEnabled() bool {
 	return tt.config.Enabled
 }
 
-// IsDocumentTransferred checks if a document has already been transferred to a client
-func (tt *TransferTracker) IsDocumentTransferred(clientID, database, collection string, documentID primitive.ObjectID) (bool, error) {
-	if !tt.config.Enabled {
-		return false, nil
-	}
-
-	ctx := context.Background()
-	filter := bson.M{
-		"client_id":   clientID,
-		"database":    database,
-		"collection":  collection,
-		"document_id": documentID,
-	}
-
-	count, err := tt.transferCollection.CountDocuments(ctx, filter)
-	if err != nil {
-		return false, fmt.Errorf("failed to check document transfer status: %v", err)
-	}
-
-	return count > 0, nil
-}
-
-// GetUntransferredDocuments returns document IDs that haven't been transferred to a client
-func (tt *TransferTracker) GetUntransferredDocuments(clientID, database, collection string, allDocumentIDs []primitive.ObjectID) ([]primitive.ObjectID, error) {
-	if !tt.config.Enabled {
-		return allDocumentIDs, nil
-	}
-
-	// If no document IDs provided, return empty slice
-	if len(allDocumentIDs) == 0 {
-		return []primitive.ObjectID{}, nil
-	}
-
-	ctx := context.Background()
-	filter := bson.M{
-		"client_id":  clientID,
-		"database":   database,
-		"collection": collection,
-		"document_id": bson.M{"$in": allDocumentIDs},
-	}
-
-	cursor, err := tt.transferCollection.Find(ctx, filter, options.Find().SetProjection(bson.M{"document_id": 1}))
-	if err != nil {
-		return nil, fmt.Errorf("failed to query transferred documents: %v", err)
-	}
-	defer cursor.Close(ctx)
-
-	transferredIDs := make(map[primitive.ObjectID]bool)
-	for cursor.Next(ctx) {
-		var record TransferRecord
-		if err := cursor.Decode(&record); err != nil {
-			continue
-		}
-		transferredIDs[record.DocumentID] = true
-	}
-
-	var untransferred []primitive.ObjectID
-	for _, id := range allDocumentIDs {
-		if !transferredIDs[id] {
-			untransferred = append(untransferred, id)
-		}
-	}
-
-	return untransferred, nil
-}
-
-// StartTransferBatch creates a new transfer batch record
+// StartTransferBatch creates a new transfer batch record (legacy method, use StartWatermarkBatch for new implementations)
 func (tt *TransferTracker) StartTransferBatch(clientID, database, collection string, documentCount int) (string, error) {
 	if !tt.config.Enabled {
+		log.Printf("DEBUG: StartTransferBatch called but tracking is disabled")
 		return "", nil
 	}
 
-	batchID := fmt.Sprintf("%s_%s_%s_%d", clientID, database, collection, time.Now().Unix())
-	batch := TransferBatch{
-		BatchID:       batchID,
-		ClientID:      clientID,
-		Database:      database,
-		Collection:    collection,
-		DocumentCount: documentCount,
-		StartedAt:     time.Now(),
-		Status:        TransferStatusInProgress,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+	// Try to get existing watermark for this client
+	watermark, err := tt.GetWatermark(clientID, database, collection)
+	if err != nil {
+		log.Printf("Warning: Failed to get watermark for legacy batch: %v", err)
 	}
 
-	ctx := context.Background()
-	if _, err := tt.batchCollection.InsertOne(ctx, batch); err != nil {
-		return "", fmt.Errorf("failed to create transfer batch: %v", err)
+	// If no watermark exists, create a basic one for legacy compatibility
+	if watermark == nil {
+		watermark = &WatermarkState{
+			SyncMode:           SyncModeInitial,
+			DocumentsProcessed: 0,
+			LastUpdated:        time.Now(),
+		}
 	}
 
-	return batchID, nil
-}
-
-// RecordTransfer records that a document has been successfully transferred
-func (tt *TransferTracker) RecordTransfer(clientID, database, collection string, documentID primitive.ObjectID, batchID string) error {
-	if !tt.config.Enabled {
-		return nil
-	}
-
-	record := TransferRecord{
-		ClientID:        clientID,
-		Database:        database,
-		Collection:      collection,
-		DocumentID:      documentID,
-		TransferredAt:   time.Now(),
-		TransferBatchID: batchID,
-		CreatedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
-	}
-
-	ctx := context.Background()
-	if _, err := tt.transferCollection.InsertOne(ctx, record); err != nil {
-		return fmt.Errorf("failed to record transfer: %v", err)
-	}
-
-	return nil
+	// Use the new watermark-based batch creation
+	return tt.StartWatermarkBatch(clientID, database, collection, documentCount, watermark)
 }
 
 // CompleteTransferBatch marks a transfer batch as completed
@@ -282,7 +170,7 @@ func (tt *TransferTracker) FailTransferBatch(batchID string, errorMsg string) er
 	return nil
 }
 
-// UpdateClientSyncState updates the sync state for a client
+// UpdateClientSyncState updates the sync state for a client (legacy method)
 func (tt *TransferTracker) UpdateClientSyncState(clientID, database, collection string, lastDocumentID *primitive.ObjectID, documentsTransferred int64, initialSyncCompleted bool) error {
 	if !tt.config.Enabled {
 		return nil
@@ -297,9 +185,9 @@ func (tt *TransferTracker) UpdateClientSyncState(clientID, database, collection 
 
 	update := bson.M{
 		"$set": bson.M{
-			"last_synced_at":               time.Now(),
-			"initial_sync_completed":        initialSyncCompleted,
-			"updated_at":                   time.Now(),
+			"last_synced_at":         time.Now(),
+			"initial_sync_completed": initialSyncCompleted,
+			"updated_at":             time.Now(),
 		},
 		"$inc": bson.M{
 			"total_documents_transferred": documentsTransferred,
@@ -308,6 +196,13 @@ func (tt *TransferTracker) UpdateClientSyncState(clientID, database, collection 
 
 	if lastDocumentID != nil {
 		update["$set"].(bson.M)["last_synced_document_id"] = *lastDocumentID
+		// Also update watermark if it exists
+		if state, err := tt.GetClientSyncState(clientID, database, collection); err == nil && state != nil && state.Watermark != nil {
+			state.Watermark.LastDocumentID = lastDocumentID
+			state.Watermark.DocumentsProcessed += documentsTransferred
+			state.Watermark.LastUpdated = time.Now()
+			update["$set"].(bson.M)["watermark"] = state.Watermark
+		}
 	}
 
 	opts := options.Update().SetUpsert(true)
@@ -315,6 +210,45 @@ func (tt *TransferTracker) UpdateClientSyncState(clientID, database, collection 
 		return fmt.Errorf("failed to update client sync state: %v", err)
 	}
 
+	return nil
+}
+
+// UpdateClientSyncStateWithWatermark updates client sync state using watermark tracking
+func (tt *TransferTracker) UpdateClientSyncStateWithWatermark(clientID, database, collection string, watermark *WatermarkState, documentsTransferred int64) error {
+	if !tt.config.Enabled || watermark == nil {
+		return nil
+	}
+
+	ctx := context.Background()
+	filter := bson.M{
+		"client_id":  clientID,
+		"database":   database,
+		"collection": collection,
+	}
+
+	// Update watermark progress
+	watermark.UpdateProgress(documentsTransferred)
+
+	update := bson.M{
+		"$set": bson.M{
+			"watermark":                  watermark,
+			"last_synced_at":             time.Now(),
+			"initial_sync_completed":     watermark.IsCompleted(),
+			"last_processed_optime":      watermark.OperationTime,
+			"last_processed_document_id": watermark.LastDocumentID,
+			"updated_at":                 time.Now(),
+		},
+		"$inc": bson.M{
+			"total_documents_transferred": documentsTransferred,
+		},
+	}
+
+	opts := options.Update().SetUpsert(true)
+	if _, err := tt.stateCollection.UpdateOne(ctx, filter, update, opts); err != nil {
+		return fmt.Errorf("failed to update client sync state with watermark: %v", err)
+	}
+
+	log.Printf("Updated watermark for client %s: mode=%s, docs_processed=%d", clientID, watermark.SyncMode, watermark.DocumentsProcessed)
 	return nil
 }
 
@@ -348,5 +282,153 @@ func (tt *TransferTracker) Close() error {
 	if tt.client != nil {
 		return tt.client.Disconnect(context.Background())
 	}
+	return nil
+}
+
+// Watermark-based tracking methods
+
+// InitializeWatermark initializes watermark tracking for a client collection
+func (tt *TransferTracker) InitializeWatermark(clientID, database, collection string, syncMode string) (*WatermarkState, error) {
+	if !tt.config.Enabled {
+		return nil, nil
+	}
+
+	watermark := &WatermarkState{
+		SyncMode:           syncMode,
+		DocumentsProcessed: 0,
+		LastUpdated:        time.Now(),
+	}
+
+	// Create or update client sync state with watermark
+	ctx := context.Background()
+	filter := bson.M{
+		"client_id":  clientID,
+		"database":   database,
+		"collection": collection,
+	}
+
+	update := bson.M{
+		"$set": bson.M{
+			"watermark":      watermark,
+			"last_synced_at": time.Now(),
+			"updated_at":     time.Now(),
+		},
+		"$setOnInsert": bson.M{
+			"client_id":                   clientID,
+			"database":                    database,
+			"collection":                  collection,
+			"total_documents_transferred": int64(0),
+			"initial_sync_completed":      false,
+			"created_at":                  time.Now(),
+		},
+	}
+
+	opts := options.Update().SetUpsert(true)
+	if _, err := tt.stateCollection.UpdateOne(ctx, filter, update, opts); err != nil {
+		return nil, fmt.Errorf("failed to initialize watermark: %v", err)
+	}
+
+	log.Printf("Initialized watermark for client %s, database %s, collection %s, mode %s", clientID, database, collection, syncMode)
+	return watermark, nil
+}
+
+// UpdateWatermark updates the watermark position for a client
+func (tt *TransferTracker) UpdateWatermark(clientID, database, collection string, watermark *WatermarkState) error {
+	if !tt.config.Enabled || watermark == nil {
+		return nil
+	}
+
+	ctx := context.Background()
+	filter := bson.M{
+		"client_id":  clientID,
+		"database":   database,
+		"collection": collection,
+	}
+
+	watermark.LastUpdated = time.Now()
+	update := bson.M{
+		"$set": bson.M{
+			"watermark":      watermark,
+			"last_synced_at": time.Now(),
+			"updated_at":     time.Now(),
+		},
+	}
+
+	if _, err := tt.stateCollection.UpdateOne(ctx, filter, update); err != nil {
+		return fmt.Errorf("failed to update watermark: %v", err)
+	}
+
+	return nil
+}
+
+// GetWatermark retrieves the current watermark for a client
+func (tt *TransferTracker) GetWatermark(clientID, database, collection string) (*WatermarkState, error) {
+	if !tt.config.Enabled {
+		return nil, nil
+	}
+
+	state, err := tt.GetClientSyncState(clientID, database, collection)
+	if err != nil {
+		return nil, err
+	}
+	if state == nil || state.Watermark == nil {
+		return nil, nil
+	}
+
+	return state.Watermark, nil
+}
+
+// StartWatermarkBatch creates a new watermark-based transfer batch
+func (tt *TransferTracker) StartWatermarkBatch(clientID, database, collection string, documentCount int, startWatermark *WatermarkState) (string, error) {
+	if !tt.config.Enabled {
+		return "", nil
+	}
+
+	batchID := fmt.Sprintf("%s_%s_%s_%d", clientID, database, collection, time.Now().Unix())
+	batch := TransferBatch{
+		BatchID:        batchID,
+		ClientID:       clientID,
+		Database:       database,
+		Collection:     collection,
+		DocumentCount:  documentCount,
+		StartWatermark: startWatermark,
+		SyncMode:       startWatermark.SyncMode,
+		StartedAt:      time.Now(),
+		Status:         TransferStatusInProgress,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	ctx := context.Background()
+	if _, err := tt.batchCollection.InsertOne(ctx, batch); err != nil {
+		return "", fmt.Errorf("failed to create watermark batch: %v", err)
+	}
+
+	log.Printf("Started watermark batch %s for client %s, mode %s, documents %d", batchID, clientID, startWatermark.SyncMode, documentCount)
+	return batchID, nil
+}
+
+// CompleteWatermarkBatch completes a watermark batch and updates the watermark
+func (tt *TransferTracker) CompleteWatermarkBatch(batchID string, endWatermark *WatermarkState) error {
+	if !tt.config.Enabled || batchID == "" {
+		return nil
+	}
+
+	ctx := context.Background()
+	completedAt := time.Now()
+	update := bson.M{
+		"$set": bson.M{
+			"status":        TransferStatusCompleted,
+			"end_watermark": endWatermark,
+			"completed_at":  completedAt,
+			"updated_at":    completedAt,
+		},
+	}
+
+	filter := bson.M{"batch_id": batchID}
+	if _, err := tt.batchCollection.UpdateOne(ctx, filter, update); err != nil {
+		return fmt.Errorf("failed to complete watermark batch: %v", err)
+	}
+
 	return nil
 }

@@ -1,12 +1,11 @@
-# Multi-stage Dockerfile for vm-sync
-# Build stage
-FROM golang:1.21-alpine AS builder
-
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
+# Multi-stage build for vm-sync
+FROM golang:1.24-alpine AS builder
 
 # Set working directory
 WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata make
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -17,58 +16,43 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application
+# Build the binary with optimizations
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags='-w -s -extldflags "-static"' \
     -a -installsuffix cgo \
-    -o vm-sync \
-    ./cmd/vm-sync
+    -o vm-sync ./cmd/vm-sync
 
-# Runtime stage
-FROM alpine:latest
+# Final stage - minimal runtime image
+FROM alpine:3.20
 
 # Install runtime dependencies
-RUN apk --no-cache add ca-certificates tzdata wget
+RUN apk --no-cache add ca-certificates wget curl
 
-# Create non-root user
-RUN addgroup -g 1001 -S appgroup && \
-    adduser -u 1001 -S appuser -G appgroup
+# Create non-root user for security
+RUN addgroup -g 1001 -S vmsync && \
+    adduser -u 1001 -S vmsync -G vmsync
 
 # Set working directory
 WORKDIR /app
 
-# Copy binary from builder stage
+# Copy binary from builder
 COPY --from=builder /app/vm-sync .
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
-# Copy configuration examples
-COPY --from=builder /app/examples/vm-config.yaml ./examples/
-
-# Create directories for logs, data, and resume state
-RUN mkdir -p /app/logs /app/data /app/state && \
-    chown -R appuser:appgroup /app
+# Create directories with proper permissions
+RUN mkdir -p /app/logs /app/state /app/checkpoints && \
+    chown -R vmsync:vmsync /app
 
 # Switch to non-root user
-USER appuser
+USER vmsync
 
-# Health check - check if process is running
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD pgrep vm-sync > /dev/null || exit 1
+# Expose ports (health check and metrics)
+EXPOSE 8081 8082 9000
 
-# Set default environment variables
-ENV LOG_LEVEL=info
-ENV LOG_FORMAT=json
-ENV SYNC_INITIAL=true
-ENV SYNC_BATCH_SIZE=1000
-ENV SYNC_WORKERS=4
-
-# Volume for persistent data
-VOLUME ["/app/data", "/app/state"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD pgrep vm-sync || exit 1
 
 # Default command
-CMD ["./vm-sync", "-config", "examples/vm-config.yaml"]
-
-# Labels for metadata
-LABEL maintainer="Go Data Sync Team"
-LABEL version="1.0.0"
-LABEL description="VM synchronization client for Go Data Sync"
-LABEL component="vm-sync"
+ENTRYPOINT ["./vm-sync"]
+CMD ["-config", "/app/config.yaml"]

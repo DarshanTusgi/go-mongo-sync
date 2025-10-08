@@ -1,0 +1,77 @@
+# Build Artifacts and Binaries
+bin/
+/cloud-sync
+/vm-sync
+*.exe
+*.so
+*.dll
+*.dylib
+
+# Test Files and Scripts
+test_*.sh
+setup_*.sh
+trigger_*.sh
+*test*.sh
+
+# Logs and Debug Files
+*.log
+*test*.log
+*-test.log
+debug_*.log
+trace_*.log
+
+# Test Configurations
+test-*.yaml
+*-test.yaml
+config-*-tcp.yaml
+test_config_*.yaml
+
+# Development and Testing
+node_modules/
+*.test
+coverage.out
+coverage.html
+.coverage/
+
+# Temporary Files
+*.tmp
+*.temp
+*~
+*.bak
+*.backup
+.DS_Store
+**/Thumbs.db
+
+# Environment Files (keep .env.example)
+.env
+.env.local
+.env.production
+.env.development
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Runtime Files
+pid
+*.pid
+*.seed
+
+# State and Cache Directories
+/state/
+/cache/
+/data/
+
+# Documentation Build
+docs/build/
+docs/_build/
+
+# Benchmarks and Profiling
+benchmark_*.txt
+cpu.prof
+mem.prof
+trace.out

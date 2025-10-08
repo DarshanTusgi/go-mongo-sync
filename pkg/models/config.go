@@ -61,12 +61,13 @@ type CloudSyncSettings struct {
 
 // SyncConfig represents synchronization settings
 type SyncConfig struct {
-	InitialSync        bool `yaml:"initial_sync"`
-	RealtimeSync       bool `yaml:"realtime_sync"`
-	ResumableInitialSync bool `yaml:"resumable_initial_sync"` // Enable resumable initial sync to avoid full re-sync on restart
-	BatchSize          int  `yaml:"batch_size"`
-	ParallelCollections bool `yaml:"parallel_collections"`
-	MaxWorkers         int  `yaml:"max_workers"`
+	InitialSync          bool            `yaml:"initial_sync"`
+	RealtimeSync         bool            `yaml:"realtime_sync"`
+	ResumableInitialSync bool            `yaml:"resumable_initial_sync"` // Enable resumable initial sync to avoid full re-sync on restart
+	BatchSize            int             `yaml:"batch_size"`
+	ParallelCollections  bool            `yaml:"parallel_collections"`
+	MaxWorkers           int             `yaml:"max_workers"`
+	Transport            TransportConfig `yaml:"transport"` // Transport configuration for initial data dump
 }
 
 // DatabaseConfig represents configuration for a specific database
@@ -124,34 +125,31 @@ type CheckpointConfig struct {
 	RetentionDays  int    `yaml:"retention_days"`
 }
 
-// TrackingConfig holds configuration for the transfer tracking system
+// TrackingConfig holds configuration for the watermark-based tracking system
 type TrackingConfig struct {
-	Enabled            bool   `yaml:"enabled"`
-	Database           string `yaml:"database"`
-	TransferCollection string `yaml:"transfer_collection"`
-	StateCollection    string `yaml:"state_collection"`
-	BatchCollection    string `yaml:"batch_collection"`
+	Enabled         bool   `yaml:"enabled"`
+	Database        string `yaml:"database"`
+	StateCollection string `yaml:"state_collection"`
+	BatchCollection string `yaml:"batch_collection"`
 }
-
-
 
 // InternalClusterConfig defines internal clustering settings
 type InternalClusterConfig struct {
-	Enabled           bool                    `yaml:"enabled" json:"enabled"`
-	EventCoordinator  EventCoordinatorConfig  `yaml:"event_coordinator" json:"event_coordinator"`
-	EventBuffer       EventBufferConfig       `yaml:"event_buffer" json:"event_buffer"`
-	WorkerPool        WorkerPoolConfig        `yaml:"worker_pool" json:"worker_pool"`
-	Metrics           MetricsConfig           `yaml:"metrics" json:"metrics"`
+	Enabled          bool                   `yaml:"enabled" json:"enabled"`
+	EventCoordinator EventCoordinatorConfig `yaml:"event_coordinator" json:"event_coordinator"`
+	EventBuffer      EventBufferConfig      `yaml:"event_buffer" json:"event_buffer"`
+	WorkerPool       WorkerPoolConfig       `yaml:"worker_pool" json:"worker_pool"`
+	Metrics          MetricsConfig          `yaml:"metrics" json:"metrics"`
 }
 
 // EventCoordinatorConfig holds configuration for the event coordinator
 type EventCoordinatorConfig struct {
-	InputQueueSize    int           `yaml:"input_queue_size" json:"input_queue_size"`
-	OutputQueueSize   int           `yaml:"output_queue_size" json:"output_queue_size"`
-	BatchSize         int           `yaml:"batch_size" json:"batch_size"`
-	BatchTimeout      time.Duration `yaml:"batch_timeout" json:"batch_timeout"`
-	DistributionMode  string        `yaml:"distribution_mode" json:"distribution_mode"` // "broadcast", "round_robin", "hash"
-	EnableDedup       bool          `yaml:"enable_dedup" json:"enable_dedup"`
+	InputQueueSize   int           `yaml:"input_queue_size" json:"input_queue_size"`
+	OutputQueueSize  int           `yaml:"output_queue_size" json:"output_queue_size"`
+	BatchSize        int           `yaml:"batch_size" json:"batch_size"`
+	BatchTimeout     time.Duration `yaml:"batch_timeout" json:"batch_timeout"`
+	DistributionMode string        `yaml:"distribution_mode" json:"distribution_mode"` // "broadcast", "round_robin", "hash"
+	EnableDedup      bool          `yaml:"enable_dedup" json:"enable_dedup"`
 }
 
 // EventBufferConfig holds configuration for the event buffer
@@ -171,10 +169,10 @@ type WorkerPoolConfig struct {
 
 // MetricsConfig holds configuration for metrics collection
 type MetricsConfig struct {
-	Enabled           bool          `yaml:"enabled" json:"enabled"`
+	Enabled            bool          `yaml:"enabled" json:"enabled"`
 	CollectionInterval time.Duration `yaml:"collection_interval" json:"collection_interval"`
-	RetentionPeriod   time.Duration `yaml:"retention_period" json:"retention_period"`
-	ExportEndpoint    string        `yaml:"export_endpoint" json:"export_endpoint"`
+	RetentionPeriod    time.Duration `yaml:"retention_period" json:"retention_period"`
+	ExportEndpoint     string        `yaml:"export_endpoint" json:"export_endpoint"`
 }
 
 // WatermarkConfig holds configuration for watermark management
@@ -199,4 +197,42 @@ type SequenceConfig struct {
 type FenceConfig struct {
 	Enabled  bool   `yaml:"enabled" json:"enabled"`
 	MongoURI string `yaml:"mongo_uri" json:"mongo_uri"`
+}
+
+// TransportConfig defines transport layer settings for data transfer
+type TransportConfig struct {
+	Mode            string            `yaml:"mode" json:"mode"`                                     // "tcp" or "http"
+	TCPSender       TCPSenderConfig   `yaml:"tcp_sender,omitempty" json:"tcp_sender,omitempty"`     // TCP sender config for cloud-sync
+	TCPReceiver     TCPReceiverConfig `yaml:"tcp_receiver,omitempty" json:"tcp_receiver,omitempty"` // TCP receiver config for vm-sync
+	HTTPFallback    bool              `yaml:"http_fallback" json:"http_fallback"`                   // Enable HTTP fallback if TCP fails
+	CompressionType string            `yaml:"compression_type" json:"compression_type"`             // "zstd", "lz4", or "none"
+}
+
+// TCPSenderConfig defines TCP sender configuration
+type TCPSenderConfig struct {
+	Address       string        `yaml:"address" json:"address"`               // Target address for TCP connection
+	ParallelConns int           `yaml:"parallel_conns" json:"parallel_conns"` // Number of parallel connections
+	WindowSize    int           `yaml:"window_size" json:"window_size"`       // Sliding window size
+	BatchTimeout  time.Duration `yaml:"batch_timeout" json:"batch_timeout"`   // Timeout for batch operations
+	ConnTimeout   time.Duration `yaml:"conn_timeout" json:"conn_timeout"`     // Connection timeout
+	KeepAlive     time.Duration `yaml:"keep_alive" json:"keep_alive"`         // Keep alive duration
+	MaxRetries    int           `yaml:"max_retries" json:"max_retries"`       // Maximum retry attempts
+	RetryBackoff  time.Duration `yaml:"retry_backoff" json:"retry_backoff"`   // Retry backoff duration
+	BufferSize    int           `yaml:"buffer_size" json:"buffer_size"`       // Buffer size for connections
+	MaxBatchSize  int           `yaml:"max_batch_size" json:"max_batch_size"` // Maximum batch size
+	TLSEnabled    bool          `yaml:"tls_enabled" json:"tls_enabled"`       // Enable TLS encryption
+}
+
+// TCPReceiverConfig defines TCP receiver configuration
+type TCPReceiverConfig struct {
+	ListenAddr        string        `yaml:"listen_addr" json:"listen_addr"`               // Address to listen on
+	MaxConnections    int           `yaml:"max_connections" json:"max_connections"`       // Maximum concurrent connections
+	ReadTimeout       time.Duration `yaml:"read_timeout" json:"read_timeout"`             // Read timeout
+	WriteTimeout      time.Duration `yaml:"write_timeout" json:"write_timeout"`           // Write timeout
+	BufferSize        int           `yaml:"buffer_size" json:"buffer_size"`               // Buffer size
+	DiskCheckpoint    bool          `yaml:"disk_checkpoint" json:"disk_checkpoint"`       // Enable disk-based checkpointing
+	CheckpointDir     string        `yaml:"checkpoint_dir" json:"checkpoint_dir"`         // Directory for checkpoints
+	HeartbeatInterval time.Duration `yaml:"heartbeat_interval" json:"heartbeat_interval"` // Heartbeat interval
+	MaxBatchSize      int           `yaml:"max_batch_size" json:"max_batch_size"`         // Maximum batch size
+	TLSEnabled        bool          `yaml:"tls_enabled" json:"tls_enabled"`               // Enable TLS encryption
 }

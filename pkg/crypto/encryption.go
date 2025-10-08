@@ -38,7 +38,7 @@ func (em *EncryptionManager) Initialize(config models.EncryptionConfig) error {
 	// Decode base64 key or use raw string
 	var key []byte
 	var err error
-	
+
 	if decoded, decodeErr := base64.StdEncoding.DecodeString(config.Key); decodeErr == nil {
 		key = decoded
 	} else {

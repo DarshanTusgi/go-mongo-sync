@@ -2,9 +2,9 @@ package cluster
 
 import (
 	"context"
+	"go-data-sync-http/pkg/models"
 	"sync"
 	"time"
-	"go-data-sync-http/pkg/models"
 )
 
 // WorkerPool manages a pool of workers for processing change events
@@ -30,11 +30,11 @@ type WorkerPoolConfig struct {
 
 // WorkerPoolStats holds statistics for the worker pool
 type WorkerPoolStats struct {
-	mu                sync.RWMutex
-	TotalProcessed    int64 `json:"total_processed"`
-	TotalErrors       int64 `json:"total_errors"`
-	CurrentQueueSize  int   `json:"current_queue_size"`
-	ActiveWorkers     int   `json:"active_workers"`
+	mu                 sync.RWMutex
+	TotalProcessed     int64         `json:"total_processed"`
+	TotalErrors        int64         `json:"total_errors"`
+	CurrentQueueSize   int           `json:"current_queue_size"`
+	ActiveWorkers      int           `json:"active_workers"`
 	AverageProcessTime time.Duration `json:"average_process_time"`
 }
 
