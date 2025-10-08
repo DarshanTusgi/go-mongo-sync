@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -337,8 +338,14 @@ func (rc *receiverConnection) handleLoop() {
 			rc.conn.SetReadDeadline(time.Now().Add(rc.receiver.config.ReadTimeout))
 
 			// Read header
-			_, err := rc.conn.Read(headerBuf)
+			n, err := rc.conn.Read(headerBuf)
 			if err != nil {
+				// Handle EOF gracefully - this happens when health checks connect and immediately close
+				if err == io.EOF && n == 0 {
+					// Connection closed cleanly without sending data (likely a health check)
+					// Don't log this as an error since it's expected behavior
+					return
+				}
 				rc.receiver.handleError(fmt.Errorf("failed to read header: %w", err))
 				return
 			}
@@ -441,8 +448,39 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 		}
 	}
 
-	// Parse BSON documents from payload
-	docs, err := rc.parseBSONDocs(payload)
+	// CRITICAL FIX: Extract stream name from payload prefix
+	// Format: [stream_name_length:4][stream_name][bson_documents]
+	var actualStreamName string
+	var actualPayload []byte
+	
+	if len(payload) >= 4 {
+		// Try to extract stream name from prefix
+		streamNameLength := binary.BigEndian.Uint32(payload[:4])
+		if streamNameLength > 0 && streamNameLength < 1000 && len(payload) >= int(4+streamNameLength) {
+			// Extract stream name
+			actualStreamName = string(payload[4 : 4+streamNameLength])
+			actualPayload = payload[4+streamNameLength:]
+			
+			// Update stream state with actual name
+			state.mu.Lock()
+			if state.streamName != actualStreamName {
+				log.Printf("📋 STREAM NAME DISCOVERED: %s (was %s)", actualStreamName, state.streamName)
+				state.streamName = actualStreamName
+			}
+			state.mu.Unlock()
+		} else {
+			// No stream name prefix, use original payload
+			actualStreamName = state.streamName
+			actualPayload = payload
+		}
+	} else {
+		// Payload too short, use original
+		actualStreamName = state.streamName
+		actualPayload = payload
+	}
+
+	// Parse BSON documents from actual payload
+	docs, err := rc.parseBSONDocs(actualPayload)
 	if err != nil {
 		rc.receiver.handleError(fmt.Errorf("failed to parse BSON documents: %w", err))
 		return
@@ -455,14 +493,14 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 
 	// Call batch handler
 	if rc.receiver.batchHandler != nil {
-		if err := rc.receiver.batchHandler(state.streamName, frame.Header.BatchSeq, docs); err != nil {
+		if err := rc.receiver.batchHandler(actualStreamName, frame.Header.BatchSeq, docs); err != nil {
 			rc.receiver.handleError(fmt.Errorf("batch handler error: %w", err))
 			return
 		}
 	}
 
-	// Update checkpoint
-	rc.receiver.SetCheckpoint(state.streamName, frame.Header.BatchSeq)
+	// Update checkpoint with actual stream name
+	rc.receiver.SetCheckpoint(actualStreamName, frame.Header.BatchSeq)
 
 	// Send ACK
 	rc.sendAck(frame.Header.StreamID, frame.Header.BatchSeq)

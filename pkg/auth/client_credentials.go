@@ -42,20 +42,20 @@ func (s *ClientCredentialsService) CreateClient(ctx context.Context, req CreateC
 	// Generate client ID and secret
 	clientID := s.generateClientID()
 	clientSecret := s.generateClientSecret()
-	
+
 	// Hash the client secret for storage
 	hashedSecret, err := bcrypt.GenerateFromPassword([]byte(clientSecret), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hash client secret: %w", err)
 	}
-	
+
 	now := time.Now()
 	var expiresAt *time.Time
 	if req.ExpiresIn != nil {
 		expiry := now.Add(time.Duration(*req.ExpiresIn) * time.Second)
 		expiresAt = &expiry
 	}
-	
+
 	// Create client credentials document
 	credentials := ClientCredentials{
 		ID:           primitive.NewObjectID(),
@@ -72,14 +72,14 @@ func (s *ClientCredentialsService) CreateClient(ctx context.Context, req CreateC
 		CreatedBy:    createdBy,
 		VMMetadata:   req.VMMetadata,
 	}
-	
+
 	// Store in database
 	collection := s.mongoClient.Database(s.database).Collection(s.collection)
 	_, err = collection.InsertOne(ctx, credentials)
 	if err != nil {
 		return nil, fmt.Errorf("failed to store client credentials: %w", err)
 	}
-	
+
 	return &CreateClientResponse{
 		ClientID:     clientID,
 		ClientSecret: clientSecret, // Return plain text secret (only time it's visible)
@@ -97,7 +97,7 @@ func (s *ClientCredentialsService) GetToken(ctx context.Context, req TokenReques
 	if req.GrantType != "client_credentials" {
 		return nil, fmt.Errorf("unsupported grant type: %s", req.GrantType)
 	}
-	
+
 	// Find client credentials
 	collection := s.mongoClient.Database(s.database).Collection(s.collection)
 	var credentials ClientCredentials
@@ -111,31 +111,31 @@ func (s *ClientCredentialsService) GetToken(ctx context.Context, req TokenReques
 		}
 		return nil, fmt.Errorf("failed to find client: %w", err)
 	}
-	
+
 	// Check if client has expired
 	if credentials.ExpiresAt != nil && time.Now().After(*credentials.ExpiresAt) {
 		return nil, fmt.Errorf("client credentials have expired")
 	}
-	
+
 	// Verify client secret
 	err = bcrypt.CompareHashAndPassword([]byte(credentials.ClientSecret), []byte(req.ClientSecret))
 	if err != nil {
 		return nil, fmt.Errorf("invalid client credentials")
 	}
-	
+
 	// Generate JWT token
 	token, expiresAt, err := s.generateJWT(credentials)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
-	
+
 	// Update last used timestamp
 	collection.UpdateOne(ctx, bson.M{"client_id": req.ClientID}, bson.M{
 		"$set": bson.M{"updated_at": time.Now()},
 	})
-	
+
 	expiresIn := time.Until(expiresAt).Seconds()
-	
+
 	return &TokenResponse{
 		AccessToken: token,
 		TokenType:   "Bearer",
@@ -147,7 +147,7 @@ func (s *ClientCredentialsService) GetToken(ctx context.Context, req TokenReques
 // ValidateToken validates JWT token and returns claims
 func (s *ClientCredentialsService) ValidateToken(tokenString string) (*TokenClaims, error) {
 	fmt.Printf("🔍 DEBUG: Validating token (first 20 chars): %s...\n", tokenString[:min(20, len(tokenString))])
-	
+
 	token, err := jwt.ParseWithClaims(tokenString, &TokenClaims{}, func(token *jwt.Token) (interface{}, error) {
 		// Verify signing method
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -155,18 +155,18 @@ func (s *ClientCredentialsService) ValidateToken(tokenString string) (*TokenClai
 		}
 		return s.jwtSecret, nil
 	})
-	
+
 	if err != nil {
 		fmt.Printf("🔍 DEBUG: Token parsing failed: %v\n", err)
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
-	
+
 	claims, ok := token.Claims.(*TokenClaims)
 	if !ok || !token.Valid {
 		fmt.Printf("🔍 DEBUG: Token claims invalid or token not valid. Claims OK: %v, Token Valid: %v\n", ok, token.Valid)
 		return nil, fmt.Errorf("invalid token claims")
 	}
-	
+
 	// Check expiration with debug info
 	now := time.Now().Unix()
 	fmt.Printf("🔍 DEBUG: Token expiration check - Now: %d, Expires: %d, Diff: %d seconds\n", now, claims.ExpiresAt, claims.ExpiresAt-now)
@@ -174,7 +174,7 @@ func (s *ClientCredentialsService) ValidateToken(tokenString string) (*TokenClai
 		fmt.Printf("🔍 DEBUG: Token expired by %d seconds\n", now-claims.ExpiresAt)
 		return nil, fmt.Errorf("token has expired")
 	}
-	
+
 	fmt.Printf("🔍 DEBUG: Token validation successful for client: %s\n", claims.ClientID)
 	return claims, nil
 }
@@ -199,18 +199,18 @@ func (s *ClientCredentialsService) ListClients(ctx context.Context) ([]ClientCre
 		return nil, err
 	}
 	defer cursor.Close(ctx)
-	
+
 	var clients []ClientCredentials
 	err = cursor.All(ctx, &clients)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Remove sensitive data
 	for i := range clients {
 		clients[i].ClientSecret = "[REDACTED]"
 	}
-	
+
 	return clients, nil
 }
 
@@ -232,7 +232,7 @@ func (s *ClientCredentialsService) generateClientSecret() string {
 func (s *ClientCredentialsService) generateJWT(credentials ClientCredentials) (string, time.Time, error) {
 	now := time.Now()
 	expiresAt := now.Add(1 * time.Hour) // 1 hour token validity
-	
+
 	claims := TokenClaims{
 		// Standard JWT claims (RFC 7519)
 		IssuedAt:  now.Unix(),
@@ -242,7 +242,7 @@ func (s *ClientCredentialsService) generateJWT(credentials ClientCredentials) (s
 		Subject:   credentials.ClientID,
 		Audience:  s.audience,
 		JWTID:     generateJTI(),
-		
+
 		// Custom claims for TCP protocol
 		ClientID:   credentials.ClientID,
 		ClientType: "vm-sync",
@@ -254,13 +254,13 @@ func (s *ClientCredentialsService) generateJWT(credentials ClientCredentials) (s
 			LastActivity: now,
 		},
 	}
-	
+
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(s.jwtSecret)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	
+
 	return tokenString, expiresAt, nil
 }
 

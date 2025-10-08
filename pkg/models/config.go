@@ -201,11 +201,12 @@ type FenceConfig struct {
 
 // TransportConfig defines transport layer settings for data transfer
 type TransportConfig struct {
-	Mode            string            `yaml:"mode" json:"mode"`                                     // "tcp" or "http"
-	TCPSender       TCPSenderConfig   `yaml:"tcp_sender,omitempty" json:"tcp_sender,omitempty"`     // TCP sender config for cloud-sync
-	TCPReceiver     TCPReceiverConfig `yaml:"tcp_receiver,omitempty" json:"tcp_receiver,omitempty"` // TCP receiver config for vm-sync
-	HTTPFallback    bool              `yaml:"http_fallback" json:"http_fallback"`                   // Enable HTTP fallback if TCP fails
-	CompressionType string            `yaml:"compression_type" json:"compression_type"`             // "zstd", "lz4", or "none"
+	Mode              string            `yaml:"mode" json:"mode"`                                           // "tcp" or "http"
+	TCPSender         TCPSenderConfig   `yaml:"tcp_sender,omitempty" json:"tcp_sender,omitempty"`           // TCP sender config for cloud-sync
+	TCPReceiver       TCPReceiverConfig `yaml:"tcp_receiver,omitempty" json:"tcp_receiver,omitempty"`       // TCP receiver config for vm-sync
+	HTTPFallback      bool              `yaml:"http_fallback" json:"http_fallback"`                         // Enable HTTP fallback if TCP fails
+	CompressionType   string            `yaml:"compression_type" json:"compression_type"`                   // "zstd", "lz4", or "none"
+	HealthMonitor     time.Duration     `yaml:"health_monitor" json:"health_monitor"`                       // TCP health monitor interval (default: 30s)
 }
 
 // TCPSenderConfig defines TCP sender configuration

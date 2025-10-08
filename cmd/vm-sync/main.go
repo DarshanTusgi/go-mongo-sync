@@ -259,30 +259,41 @@ func getOrAssignStreamMapping(stream string) (database, collection string, err e
 
 // mapSourceToTarget maps source collection to target collection based on configuration
 func mapSourceToTarget(sourceCollection string) (targetDatabase, targetCollection string, err error) {
+	log.Printf("🔍 DEBUG MAP: Input sourceCollection='%s'", sourceCollection)
+	log.Printf("🔍 DEBUG MAP: Available config.Collections=%v", config.Collections)
+	
 	// Check each configured collection mapping
-	for _, collMapping := range config.Collections {
+	for i, collMapping := range config.Collections {
+		log.Printf("🔍 DEBUG MAP: Checking mapping %d: '%s'", i, collMapping)
 		// Handle both formats: "source" and "source:target"
 		parts := strings.Split(collMapping, ":")
 		sourcePattern := strings.TrimSpace(parts[0])
+		log.Printf("🔍 DEBUG MAP: sourcePattern='%s' vs sourceCollection='%s'", sourcePattern, sourceCollection)
 
 		if sourcePattern == sourceCollection {
+			log.Printf("✅ DEBUG MAP: MATCH FOUND for '%s'", sourceCollection)
 			if len(parts) > 1 {
 				// Use target mapping
 				targetPattern := strings.TrimSpace(parts[1])
 				targetParts := strings.Split(targetPattern, ".")
+				log.Printf("🔍 DEBUG MAP: targetPattern='%s', targetParts=%v", targetPattern, targetParts)
 				if len(targetParts) == 2 {
+					log.Printf("✅ DEBUG MAP: SUCCESS -> targetDatabase='%s', targetCollection='%s'", targetParts[0], targetParts[1])
 					return targetParts[0], targetParts[1], nil
 				}
 			} else {
 				// Use same as source
 				sourceParts := strings.Split(sourceCollection, ".")
+				log.Printf("🔍 DEBUG MAP: No target mapping, using source. sourceParts=%v", sourceParts)
 				if len(sourceParts) == 2 {
+					log.Printf("✅ DEBUG MAP: SUCCESS (same as source) -> targetDatabase='%s', targetCollection='%s'", sourceParts[0], sourceParts[1])
 					return sourceParts[0], sourceParts[1], nil
 				}
 			}
 		}
 	}
 
+	log.Printf("🔴 DEBUG MAP: NO MAPPING FOUND for '%s'", sourceCollection)
 	return "", "", fmt.Errorf("no mapping found for source collection: %s", sourceCollection)
 }
 
@@ -324,6 +335,7 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 
 	// Map source collection to target collection based on configuration
 	fullSourceCollection := fmt.Sprintf("%s.%s", sourceDatabase, sourceCollection)
+	log.Printf("🔍 DEBUG MAPPING: Attempting to map fullSourceCollection='%s'", fullSourceCollection)
 	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
 	if err != nil {
 		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)

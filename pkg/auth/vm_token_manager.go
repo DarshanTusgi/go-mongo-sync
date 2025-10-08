@@ -17,19 +17,19 @@ import (
 
 // VMTokenManager handles token management for VM-Sync clients
 type VMTokenManager struct {
-	mongoClient     *mongo.Client
-	database        string
-	cloudSyncURL    string
-	httpClient      *http.Client
-	
+	mongoClient  *mongo.Client
+	database     string
+	cloudSyncURL string
+	httpClient   *http.Client
+
 	// Token cache
-	mu          sync.RWMutex
+	mu           sync.RWMutex
 	currentToken string
 	expiresAt    time.Time
-	
+
 	// Credentials
 	credentials VMStoredCredentials
-	
+
 	// Auto-refresh
 	refreshTicker *time.Ticker
 	stopChan      chan struct{}
@@ -57,19 +57,19 @@ func (tm *VMTokenManager) StoreCredentials(ctx context.Context, appID, clientID,
 		UpdatedAt:    time.Now(),
 		Active:       true,
 	}
-	
+
 	collection := tm.mongoClient.Database(tm.database).Collection("vm_credentials")
-	
+
 	// Upsert credentials (replace if exists)
 	filter := bson.M{"app_id": appID}
 	update := bson.M{"$set": credentials}
 	opts := options.Update().SetUpsert(true)
-	
+
 	_, err := collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
 		return fmt.Errorf("failed to store credentials: %w", err)
 	}
-	
+
 	tm.credentials = credentials
 	return nil
 }
@@ -77,20 +77,20 @@ func (tm *VMTokenManager) StoreCredentials(ctx context.Context, appID, clientID,
 // LoadCredentials loads stored credentials from VM local database
 func (tm *VMTokenManager) LoadCredentials(ctx context.Context, appID string) error {
 	collection := tm.mongoClient.Database(tm.database).Collection("vm_credentials")
-	
+
 	var credentials VMStoredCredentials
 	err := collection.FindOne(ctx, bson.M{
 		"app_id": appID,
 		"active": true,
 	}).Decode(&credentials)
-	
+
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return fmt.Errorf("no credentials found for app_id: %s", appID)
 		}
 		return fmt.Errorf("failed to load credentials: %w", err)
 	}
-	
+
 	tm.credentials = credentials
 	return nil
 }
@@ -106,7 +106,7 @@ func (tm *VMTokenManager) GetValidToken(ctx context.Context) (string, error) {
 		return token, nil
 	}
 	tm.mu.RUnlock()
-	
+
 	fmt.Printf("🔍 DEBUG: Token cache miss or expired, refreshing token...\n")
 	// Need to refresh token
 	return tm.refreshToken(ctx)
@@ -122,12 +122,12 @@ func (tm *VMTokenManager) GetFreshToken(ctx context.Context) (string, error) {
 func (tm *VMTokenManager) refreshToken(ctx context.Context) (string, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	
+
 	// Double-check in case another goroutine already refreshed
 	if tm.currentToken != "" && time.Now().Add(5*time.Minute).Before(tm.expiresAt) {
 		return tm.currentToken, nil
 	}
-	
+
 	// Prepare token request
 	tokenReq := TokenRequest{
 		GrantType:    "client_credentials",
@@ -135,72 +135,72 @@ func (tm *VMTokenManager) refreshToken(ctx context.Context) (string, error) {
 		ClientSecret: tm.credentials.ClientSecret,
 		Scope:        "vm-sync data:read data:write stream:create stream:read stream:write metrics:read health:read",
 	}
-	
+
 	reqBody, err := json.Marshal(tokenReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal token request: %w", err)
 	}
-	
+
 	// Make HTTP request to cloud-sync
 	url := fmt.Sprintf("%s/api/auth/token", tm.cloudSyncURL)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create HTTP request: %w", err)
 	}
-	
+
 	httpReq.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := tm.httpClient.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to request token: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("token request failed with status: %d", resp.StatusCode)
 	}
-	
+
 	var tokenResp TokenResponse
 	err = json.NewDecoder(resp.Body).Decode(&tokenResp)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode token response: %w", err)
 	}
-	
+
 	// Update internal state
 	tm.currentToken = tokenResp.AccessToken
 	tm.expiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-	
+
 	// Cache token in database
 	err = tm.cacheToken(ctx, tokenResp)
 	if err != nil {
 		// Log error but don't fail - token is still valid in memory
 		fmt.Printf("Warning: failed to cache token: %v\n", err)
 	}
-	
+
 	return tm.currentToken, nil
 }
 
 // cacheToken stores token in VM local database
 func (tm *VMTokenManager) cacheToken(ctx context.Context, tokenResp TokenResponse) error {
 	tokenCache := VMTokenCache{
-		ID:          primitive.NewObjectID(),
-		AppID:       tm.credentials.AppID,
-		ClientID:    tm.credentials.ClientID,
-		AccessToken: tokenResp.AccessToken,
+		ID:           primitive.NewObjectID(),
+		AppID:        tm.credentials.AppID,
+		ClientID:     tm.credentials.ClientID,
+		AccessToken:  tokenResp.AccessToken,
 		RefreshToken: tokenResp.RefreshToken,
-		ExpiresAt:   time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
-		Scopes:      []string{tokenResp.Scope},
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		ExpiresAt:    time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
+		Scopes:       []string{tokenResp.Scope},
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
-	
+
 	collection := tm.mongoClient.Database(tm.database).Collection("vm_token_cache")
-	
+
 	// Replace existing token cache for this app
 	filter := bson.M{"app_id": tm.credentials.AppID}
 	update := bson.M{"$set": tokenCache}
 	opts := options.Update().SetUpsert(true)
-	
+
 	_, err := collection.UpdateOne(ctx, filter, update, opts)
 	return err
 }
@@ -209,7 +209,7 @@ func (tm *VMTokenManager) cacheToken(ctx context.Context, tokenResp TokenRespons
 func (tm *VMTokenManager) StartAutoRefresh(ctx context.Context) {
 	// Refresh token every 15 minutes (more aggressive than 30 minutes)
 	tm.refreshTicker = time.NewTicker(15 * time.Minute)
-	
+
 	go func() {
 		for {
 			select {
@@ -218,13 +218,13 @@ func (tm *VMTokenManager) StartAutoRefresh(ctx context.Context) {
 				refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				_, err := tm.refreshToken(refreshCtx)
 				cancel() // Always cancel the context
-				
+
 				if err != nil {
 					fmt.Printf("Auto token refresh failed: %v\n", err)
 				} else {
 					fmt.Printf("Token auto-refreshed successfully at %v\n", time.Now().Format("2006-01-02 15:04:05"))
 				}
-				
+
 			case <-tm.stopChan:
 				tm.refreshTicker.Stop()
 				return
@@ -244,7 +244,7 @@ func (tm *VMTokenManager) StopAutoRefresh() {
 func (tm *VMTokenManager) IsTokenValid() bool {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-	
+
 	return tm.currentToken != "" && time.Now().Before(tm.expiresAt)
 }
 

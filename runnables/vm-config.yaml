@@ -18,8 +18,8 @@ cloud_sync:
   # Production URLs - Using path-based routing with BASE_PATH-TENANT_ID-COMMUNITY_ID
   # Cloud-sync is configured with BASE_PATH="cloudsync", TENANT_ID="737373", COMMUNITY_ID="828282"
   # This creates the path prefix: /cloudsync-737373-828282
-  http_url: "http://localhost:8080/cloudsync-737373-828282"
-  ws_url: "ws://localhost:8080/cloudsync-737373-828282/ws"
+  http_url: "http://localhost:8080"
+  ws_url: "ws://localhost:8080/ws"
   http_timeout: "600s"  # 10 minutes for large data transfers
   
   # OAuth2 authentication (required for vm-sync)
@@ -28,7 +28,7 @@ cloud_sync:
     # Using live-generated credentials
     client_id: "vm_sync_33730300798c7635"
     client_secret: "f5574391677d130886ff1ba016de18942b5bf362749e7d3d750259bfaa284e80"
-    token_url: "http://localhost:8080/cloudsync-737373-828282/api/auth/token"
+    token_url: "http://localhost:8080/api/auth/token"
 
 mongodb:
   # Development URI (replace with ${MONGODB_URI} for production)

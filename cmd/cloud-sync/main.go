@@ -107,6 +107,11 @@ var (
 	vmSyncConnectedOnce bool                 // Track if vm-sync has connected at least once
 	vmSyncMutex         sync.RWMutex         // Protect vm-sync connection state
 
+	// Initial dump completion tracking - CRITICAL for preventing duplicate data
+	initialDumpCompleted     = make(chan bool, 1) // Signal when initial dump is finished
+	initialDumpCompletedOnce bool                 // Track if initial dump has completed
+	initialDumpMutex         sync.RWMutex         // Protect initial dump completion state
+
 	// Memory management for change buffering (LEGACY - BEING REPLACED)
 	memoryManager *memory.Manager // Memory manager for change buffering
 	changeBuffer  *memory.Buffer  // Buffer for changes during disconnection
@@ -156,6 +161,38 @@ var (
 	clientsMutex        sync.RWMutex
 	maxConnectionsPerIP int = 10
 )
+
+// initializeTCPTransportWithRetry initializes TCP transport with retry mechanism
+func initializeTCPTransportWithRetry() error {
+	// Check if TCP transport is enabled in config
+	if config.Sync.Transport.Mode != "tcp" {
+		log.Printf("TCP transport disabled, using mode: %s", config.Sync.Transport.Mode)
+		return nil
+	}
+
+	// Retry TCP initialization up to 5 times with backoff
+	for attempt := 1; attempt <= 5; attempt++ {
+		log.Printf("🔄 TCP INIT ATTEMPT %d/5: Trying to connect to vm-sync at %s", attempt, config.Sync.Transport.TCPSender.Address)
+
+		if err := initializeTCPTransport(); err != nil {
+			log.Printf("❌ TCP INIT ATTEMPT %d FAILED: %v", attempt, err)
+
+			if attempt < 5 {
+				// Exponential backoff: 2s, 4s, 8s, 16s
+				backoff := time.Duration(attempt*2) * time.Second
+				log.Printf("⏳ TCP RETRY: waiting %v before attempt %d", backoff, attempt+1)
+				time.Sleep(backoff)
+			} else {
+				return fmt.Errorf("TCP initialization failed after %d attempts: %w", attempt, err)
+			}
+		} else {
+			log.Printf("✅ TCP INIT SUCCESS: Connected on attempt %d", attempt)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("TCP initialization failed after all retry attempts")
+}
 
 // initializeTCPTransport initializes the TCP transport for high-performance data transfer
 func initializeTCPTransport() error {
@@ -251,14 +288,81 @@ func initializeTCPTransport() error {
 	return nil
 }
 
-// testTCPConnection tests if we can connect to the TCP receiver
+// testTCPConnection tests if the TCP receiver is accepting connections without interfering with the protocol
 func testTCPConnection(address string) error {
-	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+	// Just check if the port is listening without creating a full connection
+	// This avoids interfering with the TCP receiver's protocol handling
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 	if err != nil {
-		return err
+		return fmt.Errorf("TCP port not reachable: %w", err)
 	}
+	
+	// Immediately close without sending any data to avoid protocol interference
+	// The VM-sync receiver will see this as a brief connection that closed gracefully
 	conn.Close()
+	
 	return nil
+}
+
+// startTCPHealthMonitor monitors TCP transport health and attempts reconnection
+func startTCPHealthMonitor() {
+	// Use configured interval or default to 30 seconds
+	interval := config.Sync.Transport.HealthMonitor
+	if interval == 0 {
+		interval = 30 * time.Second
+	}
+	
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	
+	log.Printf("🐆 TCP HEALTH MONITOR: Started (check interval: %v)", interval)
+	
+	for {
+		select {
+		case <-ticker.C:
+			// Only try to reconnect if TCP is configured as primary but not currently enabled
+			if config.Sync.Transport.Mode == "tcp" && !tcpTransportEnabled {
+				log.Printf("🔍 TCP HEALTH CHECK: Attempting to reconnect to %s", config.Sync.Transport.TCPSender.Address)
+				
+				if err := testTCPConnection(config.Sync.Transport.TCPSender.Address); err == nil {
+					log.Printf("✨ TCP AVAILABLE: VM-sync detected! Reinitializing TCP transport...")
+					
+					// Attempt to reinitialize TCP transport
+					if err := initializeTCPTransport(); err != nil {
+						log.Printf("❌ TCP REINIT FAILED: %v", err)
+					} else {
+						log.Printf("✅ TCP RECONNECTED: TCP transport reinitialized successfully!")
+						log.Printf("🚀 TCP TRANSPORT RESTORED: Ready for high-performance data transfer")
+					}
+				} else {
+					log.Printf("🔶 TCP UNAVAILABLE: VM-sync still not reachable (%v)", err)
+				}
+			} else if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled {
+				// TCP is working fine, reduce monitoring frequency to avoid interference
+				log.Printf("✅ TCP HEALTHY: TCP transport is operational, reducing health check frequency")
+				
+				// Switch to much less frequent monitoring when TCP is working
+				ticker.Reset(5 * time.Minute) // Check every 5 minutes instead of 30 seconds
+				
+				// Optional: Skip actual connection test when TCP is working to avoid interference
+				// The main data transfer will detect if TCP fails anyway
+				continue
+			} else if config.Sync.Transport.Mode == "tcp" {
+				// TCP is enabled, verify it's still working
+				if err := testTCPConnection(config.Sync.Transport.TCPSender.Address); err != nil {
+					log.Printf("⚠️ TCP CONNECTION LOST: %v", err)
+					tcpTransportEnabled = false
+					if tcpSender != nil {
+						if closeErr := tcpSender.Close(); closeErr != nil {
+							log.Printf("Error closing TCP sender: %v", closeErr)
+						}
+						tcpSender = nil
+					}
+					log.Printf("📴 TCP DEGRADED: Switched to HTTP transport mode")
+				}
+			}
+		}
+	}
 }
 
 func main() {
@@ -514,14 +618,25 @@ func main() {
 		"eliminates_manual_config": true,
 	})
 
-	// Initialize TCP transport if enabled
-	if err := initializeTCPTransport(); err != nil {
-		log.Printf("WARNING: Failed to initialize TCP transport: %v", err)
+	// Initialize TCP transport if enabled with retry mechanism
+	if err := initializeTCPTransportWithRetry(); err != nil {
+		log.Printf("WARNING: Failed to initialize TCP transport after retries: %v", err)
 		log.Printf("DEGRADED MODE: Using HTTP transport for data transfer")
 		tcpTransportEnabled = false
+		
+		// Start TCP transport health monitor if TCP is configured as primary
+		if config.Sync.Transport.Mode == "tcp" {
+			log.Printf("🔍 TCP MONITOR: Starting TCP transport health monitor for automatic reconnection")
+			go startTCPHealthMonitor()
+		}
 	} else if tcpTransportEnabled {
 		log.Println("TCP transport initialized successfully")
 		appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
+		
+		// Start TCP transport health monitor even when initially successful
+		if config.Sync.Transport.Mode == "tcp" {
+			go startTCPHealthMonitor()
+		}
 	}
 
 	// Enable self-optimization for Cloud Sync
@@ -556,29 +671,13 @@ func main() {
 		}
 	}
 
-	// Start change stream monitoring only if MongoDB is connected
-	if mongoConnected {
-		// Start change stream monitoring using buffer-free approach
-		if bufferFreeHandler != nil {
-			log.Println("🎯 BUFFER-FREE: Starting buffer-free change stream monitoring...")
-			for _, database := range config.MongoDB.Databases {
-				if !database.Enabled {
-					continue
-				}
-				for _, collection := range database.Collections {
-					if err := bufferFreeHandler.StartCollectionWatch(database.Name, collection.Name); err != nil {
-						log.Printf("⚠️  Failed to start buffer-free watch for %s.%s: %v", database.Name, collection.Name, err)
-					} else {
-						log.Printf("✅ BUFFER-FREE: Started watch for %s.%s (zero memory buffer)", database.Name, collection.Name)
-					}
-				}
-			}
-			log.Println("🚀 BUFFER-FREE: All collections monitoring with resume tokens (no memory buffers)")
-		} else {
-			// Fallback to traditional change stream monitoring if buffer-free handler not available
-			log.Println("⚠️  FALLBACK: Using traditional change stream monitoring (with memory buffers)")
-			go monitorChangeStreamsTraditional()
-		}
+	// DISABLED: Real-time sync completely disabled to focus on initial dump only
+	// Change stream initialization moved to prevent any real-time sync duplication
+	if false && mongoConnected { // Completely disabled
+		log.Println("🚀 SEQUENCED STARTUP: Real-time sync will start AFTER initial dump completes")
+		log.Println("⏳ WAITING: Change streams will be initialized after bulk data transfer finishes")
+		// Change stream initialization moved to startRealTimeSync() function
+		// This prevents duplicate data during initial dump
 	} else {
 		log.Println("DEGRADED MODE: Change stream monitoring disabled - MongoDB unavailable")
 	}
@@ -978,8 +1077,87 @@ func startPushBasedSync() {
 		log.Println("⚠️  Timeout waiting for vm-sync connection, proceeding with sync anyway")
 	}
 
+	// CRITICAL: For TCP mode, wait for TCP transport to be ready before initial dump
+	if config.Sync.Transport.Mode == "tcp" {
+		log.Println("🔍 TCP READINESS CHECK: Verifying TCP transport is ready for initial dump...")
+		
+		// Try up to 10 times with 3-second intervals (30 seconds total)
+		for attempt := 1; attempt <= 10; attempt++ {
+			if tcpTransportEnabled && tcpSender != nil {
+				log.Printf("✅ TCP READY: TCP transport is available for initial dump (attempt %d)", attempt)
+				break
+			}
+			
+			if attempt == 10 {
+				log.Printf("⚠️  TCP TIMEOUT: TCP transport not ready after %d attempts, proceeding anyway", attempt)
+				break
+			}
+			
+			log.Printf("⏳ TCP WAIT: TCP transport not ready, waiting 3s (attempt %d/10)...", attempt)
+			time.Sleep(3 * time.Second)
+		}
+	}
+
 	log.Println("📊 Starting sync process for all configured collections...")
 	startSyncProcess()
+
+	// CRITICAL: Signal that initial dump is completed
+	initialDumpMutex.Lock()
+	if !initialDumpCompletedOnce {
+		initialDumpCompletedOnce = true
+		select {
+		case initialDumpCompleted <- true:
+			log.Println("✅ INITIAL DUMP COMPLETED: Signaling real-time sync to start")
+		default:
+			// Channel already has a value
+		}
+	}
+	initialDumpMutex.Unlock()
+
+	// Start real-time synchronization AFTER initial dump completion
+	go startRealTimeSync()
+}
+
+// startRealTimeSync starts change stream monitoring AFTER initial dump completion
+// This prevents data duplication between initial dump and real-time sync
+func startRealTimeSync() {
+	log.Println("⏳ WAITING: Real-time sync waiting for initial dump completion...")
+
+	// Wait for initial dump to complete before starting change streams
+	select {
+	case <-initialDumpCompleted:
+		log.Println("✅ INITIAL DUMP COMPLETED: Starting real-time change stream monitoring")
+	case <-time.After(30 * time.Minute): // Timeout after 30 minutes
+		log.Println("⚠️  Timeout waiting for initial dump completion, starting real-time sync anyway")
+	}
+
+	// Now it's safe to start change streams - no data duplication risk
+	if mongoClient != nil {
+		// Start change stream monitoring using buffer-free approach
+		if bufferFreeHandler != nil {
+			log.Println("🎯 BUFFER-FREE: Starting buffer-free change stream monitoring...")
+			for _, database := range config.MongoDB.Databases {
+				if !database.Enabled {
+					continue
+				}
+				for _, collection := range database.Collections {
+					if err := bufferFreeHandler.StartCollectionWatch(database.Name, collection.Name); err != nil {
+						log.Printf("⚠️  Failed to start buffer-free watch for %s.%s: %v", database.Name, collection.Name, err)
+					} else {
+						log.Printf("✅ BUFFER-FREE: Started watch for %s.%s (zero memory buffer)", database.Name, collection.Name)
+					}
+				}
+			}
+			log.Println("🚀 BUFFER-FREE: All collections monitoring with resume tokens (no memory buffers)")
+		} else {
+			// Fallback to traditional change stream monitoring if buffer-free handler not available
+			log.Println("⚠️  FALLBACK: Using traditional change stream monitoring (with memory buffers)")
+			go monitorChangeStreamsTraditional()
+		}
+		log.Println("✅ SEQUENCED STARTUP COMPLETE: Real-time sync active after initial dump")
+	} else {
+		log.Println("DEGRADED MODE: Change stream monitoring disabled - MongoDB unavailable")
+	}
 }
 
 // startCatchUpSync handles catch-up synchronization for reconnected vm-sync clients
@@ -1470,8 +1648,14 @@ func pushCollectionDataWithResume(vmSyncEndpoint, database, collection string) e
 	// Check if resumable initial sync is enabled from config
 	resumableEnabled := config.Sync.ResumableInitialSync
 
-	log.Printf("Processing initial sync request for %s.%s (resumable: %v, tracker enabled: %v, transport: %s)",
-		database, collection, resumableEnabled, transferTracker != nil && transferTracker.IsEnabled(), config.Sync.Transport.Mode)
+	log.Printf("Processing initial sync request for %s.%s (resumable: %v, tracker enabled: %v, transport: %s, force_initial_sync: %v)",
+		database, collection, resumableEnabled, transferTracker != nil && transferTracker.IsEnabled(), config.Sync.Transport.Mode, forceInitialSync)
+
+	// NEW: If force initial sync is enabled, always perform full sync
+	if forceInitialSync {
+		log.Printf("FORCE INITIAL SYNC: Performing full sync for %s.%s regardless of existing state", database, collection)
+		return pushCollectionData(vmSyncEndpoint, database, collection)
+	}
 
 	if !resumableEnabled || transferTracker == nil || !transferTracker.IsEnabled() {
 		log.Printf("Resumable sync disabled or transfer tracker unavailable, performing full sync for %s.%s", database, collection)
@@ -1512,6 +1696,13 @@ func pushCollectionDataWithResume(vmSyncEndpoint, database, collection string) e
 
 	log.Printf("Sync state check for %s.%s: hasCheckpoint=%v, syncState exists=%v, initialSyncCompleted=%v, transport=%s",
 		database, collection, hasCheckpoint, syncState != nil, syncState != nil && syncState.InitialSyncCompleted, config.Sync.Transport.Mode)
+
+	// NEW: If force initial sync is enabled, ignore existing sync state
+	if forceInitialSync {
+		log.Printf("FORCE INITIAL SYNC: Ignoring existing sync state for %s.%s, performing INITIAL BULK TRANSFER via %s",
+			database, collection, strings.ToUpper(config.Sync.Transport.Mode))
+		return pushCollectionData(vmSyncEndpoint, database, collection)
+	}
 
 	// IMPORTANT: For new vm-sync clients, we MUST perform initial bulk transfer
 	// This is the core fix for the architecture limitation
@@ -1684,13 +1875,20 @@ func pushIncrementalPageInternal(ctx context.Context, vmSyncEndpoint, database, 
 	}
 	defer cursor.Close(ctx)
 
-	// Try TCP transport first if enabled
-	if tcpTransportEnabled && tcpSender != nil {
+	// TCP IS PRIMARY: Force TCP transport for incremental data
+	if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled && tcpSender != nil {
+		log.Printf("🚀 FORCE TCP PRIMARY: Using TCP transport for incremental sync %s.%s page %d", database, collection, pageNumber+1)
 		return pushIncrementalPageTCP(ctx, cursor, database, collection, pageNumber, totalPages)
 	}
 
-	// Fall back to HTTP transport
-	return pushIncrementalPageHTTP(ctx, cursor, vmSyncEndpoint, database, collection, pageNumber, totalPages)
+	// FALLBACK: Only use HTTP if TCP is not the configured primary mode
+	if config.Sync.Transport.Mode != "tcp" {
+		log.Printf("📡 HTTP FALLBACK: Using HTTP transport for incremental sync %s.%s page %d", database, collection, pageNumber+1)
+		return pushIncrementalPageHTTP(ctx, cursor, vmSyncEndpoint, database, collection, pageNumber, totalPages)
+	}
+
+	// ERROR: TCP is primary mode but not available
+	return 0, fmt.Errorf("TCP is configured as primary transport but not available (enabled=%v, sender=%v)", tcpTransportEnabled, tcpSender != nil)
 }
 
 // pushIncrementalPageTCP pushes incremental data via TCP transport
@@ -1722,14 +1920,15 @@ func pushIncrementalPageTCP(ctx context.Context, cursor *mongo.Cursor, database,
 		log.Printf("🚀 TCP INCREMENTAL SENDING: %s.%s - %d docs (%s)", database, collection, len(documents), formatBytes(totalBytes))
 
 		if err := tcpSender.SendBatch(streamName, documents); err != nil {
-			// If TCP fails and HTTP fallback is enabled, fall back to HTTP
-			if config.Sync.Transport.HTTPFallback {
+			// Only fall back to HTTP if TCP is NOT the primary mode and HTTP fallback is enabled
+			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {
 				log.Printf("❌ TCP INCREMENTAL FAILED -> HTTP FALLBACK: %s.%s page %d: %v", database, collection, pageNumber, err)
 				// Reset cursor for HTTP fallback - note: this is a limitation, we can't rewind cursor
 				// For now, return error and let caller handle retry
 				return 0, fmt.Errorf("TCP transport failed and cursor cannot be rewound for HTTP fallback: %v", err)
 			}
-			return 0, fmt.Errorf("TCP transport failed: %v", err)
+			// TCP is primary mode - do not fall back, return error
+			return 0, fmt.Errorf("TCP transport failed (primary mode, no fallback): %v", err)
 		}
 
 		// Calculate incremental TCP metrics
@@ -1775,7 +1974,9 @@ func pushIncrementalPageHTTP(ctx context.Context, cursor *mongo.Cursor, vmSyncEn
 		return 0, fmt.Errorf("failed to marshal page result: %v", err)
 	}
 
-	resp, err := http.Post(vmSyncEndpoint, "application/bson", bytes.NewBuffer(bsonData))
+	// Create correct URL with proper endpoint path
+	url := fmt.Sprintf("%s/api/v1/push/%s/%s", vmSyncEndpoint, database, collection)
+	resp, err := http.Post(url, "application/bson", bytes.NewBuffer(bsonData))
 	if err != nil {
 		return 0, fmt.Errorf("failed to send incremental data: %v", err)
 	}
@@ -1792,13 +1993,20 @@ func pushIncrementalPageHTTP(ctx context.Context, cursor *mongo.Cursor, vmSyncEn
 }
 
 func pushSinglePage(ctx context.Context, vmSyncEndpoint, database, collection string, pageNumber, pageSize, totalPages int) error {
-	// Check if TCP transport is enabled and working
-	if tcpTransportEnabled && tcpSender != nil {
+	// TCP IS PRIMARY: Force TCP transport if configured as primary
+	if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled && tcpSender != nil {
+		log.Printf("🚀 FORCE TCP PRIMARY: Using TCP transport for initial sync %s.%s page %d", database, collection, pageNumber)
 		return pushSinglePageTCP(ctx, database, collection, pageNumber, pageSize, totalPages)
 	}
 
-	// Fall back to HTTP transport
-	return pushSinglePageHTTP(ctx, vmSyncEndpoint, database, collection, pageNumber, pageSize, totalPages)
+	// FALLBACK: Only use HTTP if TCP is not the configured primary mode
+	if config.Sync.Transport.Mode != "tcp" {
+		log.Printf("📡 HTTP FALLBACK: Using HTTP transport for initial sync %s.%s page %d", database, collection, pageNumber)
+		return pushSinglePageHTTP(ctx, vmSyncEndpoint, database, collection, pageNumber, pageSize, totalPages)
+	}
+
+	// ERROR: TCP is primary mode but not available
+	return fmt.Errorf("TCP is configured as primary transport but not available (enabled=%v, sender=%v)", tcpTransportEnabled, tcpSender != nil)
 }
 
 // pushSinglePageTCP pushes a single page using TCP transport
@@ -1871,12 +2079,13 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 		log.Printf("🚀 TCP SENDING: %s.%s page %d - %d docs (%s)", database, collection, pageNumber, len(documents), formatBytes(totalBytes))
 
 		if err := tcpSender.SendBatch(streamName, documents); err != nil {
-			// If TCP fails and HTTP fallback is enabled, fall back to HTTP
-			if config.Sync.Transport.HTTPFallback {
+			// Only fall back to HTTP if TCP is NOT the primary mode and HTTP fallback is enabled
+			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {
 				log.Printf("❌ TCP FAILED -> HTTP FALLBACK: %s.%s page %d: %v", database, collection, pageNumber, err)
 				return pushSinglePageHTTP(ctx, getVMSyncHTTPEndpoint(), database, collection, pageNumber, pageSize, totalPages)
 			}
-			return fmt.Errorf("TCP transport failed: %v", err)
+			// TCP is primary mode - do not fall back, return error
+			return fmt.Errorf("TCP transport failed (primary mode, no fallback): %v", err)
 		}
 
 		// Calculate TCP transfer metrics
@@ -4881,9 +5090,10 @@ func getSystemErrorRate() float64 {
 
 // TriggerSyncRequest represents the request body for manual sync trigger
 type TriggerSyncRequest struct {
-	Databases   []string `json:"databases,omitempty"`    // Optional: specific databases to sync
-	Collections []string `json:"collections,omitempty"`  // Optional: specific collections to sync (format: "db.collection")
-	ForceResync bool     `json:"force_resync,omitempty"` // Optional: force full resync even if initial sync completed
+	Databases        []string `json:"databases,omitempty"`          // Optional: specific databases to sync
+	Collections      []string `json:"collections,omitempty"`        // Optional: specific collections to sync (format: "db.collection")
+	ForceResync      bool     `json:"force_resync,omitempty"`       // Optional: force full resync even if initial sync completed
+	ForceInitialSync bool     `json:"force_initial_sync,omitempty"` // NEW: Force initial sync regardless of existing state
 }
 
 // SyncStatusResponse represents the sync status response
@@ -4917,6 +5127,7 @@ var (
 	currentSyncError       string
 	collectionSyncStatuses = make(map[string]*CollectionSyncInfo)
 	syncStatusMutex        sync.RWMutex
+	forceInitialSync       = true  // Flag to force initial sync regardless of existing state
 )
 
 // handleTriggerInitialSync handles manual triggering of initial data sync
@@ -5041,6 +5252,16 @@ func performManualSync(req TriggerSyncRequest) error {
 	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
 	if vmSyncEndpoint == "" {
 		vmSyncEndpoint = "http://localhost:8081"
+	}
+
+	// NEW: Set force initial sync flag if requested
+	if req.ForceInitialSync {
+		log.Printf("FORCE INITIAL SYNC: Enabling force initial sync mode")
+		forceInitialSync = true
+		defer func() {
+			forceInitialSync = false // Reset after sync completes
+			log.Printf("FORCE INITIAL SYNC: Disabled force initial sync mode")
+		}()
 	}
 
 	log.Printf("📊 MANUAL SYNC: Starting sync to vm-sync at: %s", vmSyncEndpoint)

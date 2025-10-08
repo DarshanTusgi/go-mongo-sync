@@ -106,10 +106,11 @@ sync:
   # TCP Transport Configuration for high-performance data transfer
   transport:
     mode: "tcp"  # Use TCP transport for initial dumps ("http" for legacy mode)
-    http_fallback: true  # Fall back to HTTP if TCP fails
+    http_fallback: false  # DO NOT fall back to HTTP if TCP fails - TCP is PRIMARY
     compression_type: "zstd"  # Use Zstd compression for best ratio
+    health_monitor: "30s"  # TCP health monitor interval (checks for VM-sync availability)
     tcp_sender:
-      address: "localhost:9000"  # vm-sync TCP receiver address
+      address: "127.0.0.1:9000"  # vm-sync TCP receiver address (use 127.0.0.1 not localhost)
       parallel_conns: 4
       window_size: 64
       batch_timeout: 5s

@@ -98,7 +98,7 @@ websocket:
 # Sync configuration
 sync:
   initial_sync: true
-  realtime_sync: true
+  realtime_sync: false
   resumable_initial_sync: true  # Enable resumable initial sync to avoid full re-sync on restart
   batch_size: 1000
   parallel_collections: true

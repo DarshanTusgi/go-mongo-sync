@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -398,6 +399,22 @@ func (s *tcpSender) sendStandardBatch(stream string, batch [][]byte, async bool,
 	if err != nil {
 		return fmt.Errorf("failed to concatenate BSON documents: %w", err)
 	}
+
+	// CRITICAL FIX: Prepend stream name to payload so receiver can identify the collection
+	// Format: [stream_name_length:4][stream_name][bson_documents]
+	streamNameBytes := []byte(stream)
+	streamNameLength := uint32(len(streamNameBytes))
+	
+	// Create payload with stream name prefix
+	lengthBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthBytes, streamNameLength)
+	
+	finalPayload := make([]byte, 0, 4+len(streamNameBytes)+len(payload))
+	finalPayload = append(finalPayload, lengthBytes...)
+	finalPayload = append(finalPayload, streamNameBytes...)
+	finalPayload = append(finalPayload, payload...)
+	
+	payload = finalPayload
 
 	// Check batch size limit
 	if len(payload) > s.config.MaxBatchSize {

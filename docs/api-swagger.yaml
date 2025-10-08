@@ -38,7 +38,6 @@ servers:
 
 security:
   - BearerAuth: []
-  - AdminAPIKey: []
 
 paths:
   # ==================== OAUTH2 AUTHENTICATION ====================
@@ -176,10 +175,9 @@ paths:
         - Client Secret: 32 random bytes, hex-encoded (64 characters)
         - Secret stored as bcrypt hash in database
         
-        **Requires Admin API Key:** `X-Admin-API-Key: admin-api-key-placeholder`
+        **Note:** This endpoint is publicly accessible for testing purposes via Swagger UI.
       operationId: createOAuth2Client
-      security:
-        - AdminAPIKey: []
+      security: []
       requestBody:
         required: true
         content:
@@ -224,7 +222,7 @@ paths:
         Client secrets are shown as "[REDACTED]" for security.
       operationId: listOAuth2Clients
       security:
-        - AdminAPIKey: []
+        - AdminKeyAuth: []
       responses:
         '200':
           description: List of OAuth2 clients
@@ -255,7 +253,7 @@ paths:
         Existing tokens remain valid until expiry.
       operationId: revokeOAuth2Client
       security:
-        - AdminAPIKey: []
+        - AdminKeyAuth: []
       parameters:
         - name: client_id
           in: path
@@ -1101,11 +1099,11 @@ components:
     AdminKeyAuth:
       type: apiKey
       in: header
-      name: X-Admin-Key
+      name: X-Admin-API-Key
       description: |
         Admin API key for administrative operations. Set via environment variable.
         
-        **Usage:** `X-Admin-Key: <admin_key>`
+        **Usage:** `X-Admin-API-Key: <admin_key>`
     
     LicenseAuth:
       type: apiKey
@@ -3420,14 +3418,15 @@ tags:
   - name: OAuth2 Administration
     description: |
       Administrative endpoints for OAuth2 client management.
-      Requires admin API key authentication.
       
       **Operations:**
-      - Create new OAuth2 clients with secure credentials
-      - List existing clients (secrets redacted)
-      - Revoke client credentials
+      - Create new OAuth2 clients with secure credentials (public for testing)
+      - List existing clients (secrets redacted) - requires admin API key
+      - Revoke client credentials - requires admin API key
       
-      **Security:** Admin API Key required (`X-Admin-API-Key`)
+      **Security Notes:**
+      - Client creation is publicly accessible via Swagger UI for testing
+      - Admin operations require `X-Admin-API-Key` header
 
   - name: Data Synchronization
     description: |
