@@ -469,6 +469,430 @@ paths:
         '401':
           description: Authentication required
 
+  /api/sync/replace:
+    post:
+      tags:
+        - Sync Control
+      summary: Trigger Full Database Replacement
+      description: |
+        Triggers complete database replacement for specified collections or entire databases.
+        This endpoint implements API-triggered full database replacement strategy which:
+        
+        **Operations Performed:**
+        1. **Clear Target Collections**: Drops or truncates target collections
+        2. **Reset Resume Tokens**: Clears all checkpoints and resume tokens
+        3. **Full Data Transfer**: Initiates complete data replacement from source
+        4. **Verification**: Validates data integrity after replacement
+        
+        **Use Cases:**
+        - Database schema changes requiring full refresh
+        - Data corruption recovery
+        - Environment synchronization (dev/staging/prod)
+        - Major version upgrades
+        - Initial deployment data seeding
+        
+        **Safety Features:**
+        - Dry-run mode for validation without execution
+        - Backup creation before replacement (optional)
+        - Progress tracking and rollback capabilities
+        - Concurrent operation prevention
+      operationId: triggerFullDatabaseReplace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - operation_type
+              properties:
+                operation_type:
+                  type: string
+                  enum: ["collection", "database", "all"]
+                  description: Scope of replacement operation
+                  example: "collection"
+                targets:
+                  type: array
+                  description: Specific targets for replacement
+                  items:
+                    type: object
+                    properties:
+                      source_database:
+                        type: string
+                        description: Source database name
+                        example: "production_db"
+                      source_collection:
+                        type: string
+                        description: Source collection name (required for collection type)
+                        example: "users"
+                      target_database:
+                        type: string
+                        description: Target database name
+                        example: "local_sync_db"
+                      target_collection:
+                        type: string
+                        description: Target collection name
+                        example: "users"
+                options:
+                  type: object
+                  properties:
+                    dry_run:
+                      type: boolean
+                      default: false
+                      description: Validate operation without executing
+                    create_backup:
+                      type: boolean
+                      default: true
+                      description: Create backup before replacement
+                    backup_location:
+                      type: string
+                      description: Backup storage location
+                      example: "s3://backups/full-replace-20240101"
+                    verify_after_replace:
+                      type: boolean
+                      default: true
+                      description: Verify data integrity after replacement
+                    batch_size:
+                      type: integer
+                      minimum: 100
+                      maximum: 10000
+                      default: 1000
+                      description: Batch size for data transfer
+                    parallel_workers:
+                      type: integer
+                      minimum: 1
+                      maximum: 16
+                      default: 4
+                      description: Number of parallel workers
+                    timeout_minutes:
+                      type: integer
+                      minimum: 5
+                      maximum: 1440
+                      default: 60
+                      description: Operation timeout in minutes
+                    preserve_indexes:
+                      type: boolean
+                      default: true
+                      description: Preserve collection indexes during replacement
+                    preserve_metadata:
+                      type: boolean
+                      default: true
+                      description: Preserve collection metadata
+                filters:
+                  type: object
+                  description: Data filtering options
+                  properties:
+                    document_filter:
+                      type: object
+                      description: MongoDB query filter for source documents
+                      example:
+                        status: "active"
+                        created_at: { "$gte": "2024-01-01T00:00:00Z" }
+                    field_filter:
+                      type: object
+                      properties:
+                        include_fields:
+                          type: array
+                          items:
+                            type: string
+                          description: Fields to include in replacement
+                          example: ["_id", "name", "email", "status"]
+                        exclude_fields:
+                          type: array
+                          items:
+                            type: string
+                          description: Fields to exclude from replacement
+                          example: ["internal_notes", "debug_info"]
+            example:
+              operation_type: "collection"
+              targets:
+                - source_database: "production_db"
+                  source_collection: "users"
+                  target_database: "local_sync_db"
+                  target_collection: "users"
+                - source_database: "production_db"
+                  source_collection: "orders"
+                  target_database: "local_sync_db"
+                  target_collection: "orders"
+              options:
+                dry_run: false
+                create_backup: true
+                verify_after_replace: true
+                batch_size: 2000
+                parallel_workers: 6
+                timeout_minutes: 120
+              filters:
+                document_filter:
+                  status: "active"
+                field_filter:
+                  include_fields: ["_id", "name", "email", "status", "created_at"]
+      responses:
+        '200':
+          description: Full database replacement initiated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  operation_id:
+                    type: string
+                    description: Unique identifier for tracking the operation
+                    example: "replace_op_20240101_123456"
+                  message:
+                    type: string
+                    example: "Full database replacement initiated for 2 collections"
+                  targets_processed:
+                    type: integer
+                    example: 2
+                  estimated_duration_minutes:
+                    type: integer
+                    description: Estimated completion time
+                    example: 45
+                  operation_details:
+                    type: object
+                    properties:
+                      dry_run:
+                        type: boolean
+                      backup_created:
+                        type: boolean
+                      backup_location:
+                        type: string
+                      total_collections:
+                        type: integer
+                      start_time:
+                        type: string
+                        format: date-time
+                  tracking_endpoints:
+                    type: object
+                    properties:
+                      status_url:
+                        type: string
+                        example: "/api/sync/replace/status/replace_op_20240101_123456"
+                      progress_url:
+                        type: string
+                        example: "/api/sync/replace/progress/replace_op_20240101_123456"
+                      cancel_url:
+                        type: string
+                        example: "/api/sync/replace/cancel/replace_op_20240101_123456"
+        '400':
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "invalid_parameters"
+                  message:
+                    type: string
+                    example: "operation_type is required"
+                  validation_errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        field:
+                          type: string
+                        error:
+                          type: string
+                    example:
+                      - field: "targets[0].source_collection"
+                        error: "required when operation_type is 'collection'"
+        '401':
+          description: Authentication required
+        '409':
+          description: Another replacement operation is already in progress
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "operation_in_progress"
+                  message:
+                    type: string
+                    example: "Another full database replacement is currently running"
+                  active_operation_id:
+                    type: string
+                    example: "replace_op_20240101_120000"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  message:
+                    type: string
+                  operation_id:
+                    type: string
+
+  /api/sync/replace/status/{operation_id}:
+    get:
+      tags:
+        - Sync Control
+      summary: Get Full Database Replacement Status
+      description: |
+        Returns the current status of a full database replacement operation.
+        Provides detailed progress information, performance metrics, and any errors encountered.
+      operationId: getFullReplaceStatus
+      parameters:
+        - name: operation_id
+          in: path
+          required: true
+          description: Operation identifier returned from replace initiation
+          schema:
+            type: string
+            example: "replace_op_20240101_123456"
+      responses:
+        '200':
+          description: Replacement operation status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operation_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: ["pending", "running", "completed", "failed", "cancelled"]
+                    example: "running"
+                  progress:
+                    type: object
+                    properties:
+                      overall_percentage:
+                        type: number
+                        format: float
+                        example: 67.5
+                      collections_completed:
+                        type: integer
+                        example: 2
+                      collections_total:
+                        type: integer
+                        example: 3
+                      documents_processed:
+                        type: integer
+                        example: 150000
+                      documents_total:
+                        type: integer
+                        example: 220000
+                      current_collection:
+                        type: string
+                        example: "production_db.orders"
+                  performance:
+                    type: object
+                    properties:
+                      documents_per_second:
+                        type: number
+                        format: float
+                        example: 1250.0
+                      bytes_per_second:
+                        type: number
+                        format: float
+                        example: 2048000
+                      estimated_completion:
+                        type: string
+                        format: date-time
+                        example: "2024-01-01T14:30:00Z"
+                  timing:
+                    type: object
+                    properties:
+                      started_at:
+                        type: string
+                        format: date-time
+                      estimated_completion_at:
+                        type: string
+                        format: date-time
+                      elapsed_seconds:
+                        type: integer
+                      remaining_seconds:
+                        type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: string
+                          format: date-time
+                        collection:
+                          type: string
+                        error_type:
+                          type: string
+                        message:
+                          type: string
+                        retry_count:
+                          type: integer
+        '404':
+          description: Operation not found
+        '401':
+          description: Authentication required
+
+  /api/sync/replace/cancel/{operation_id}:
+    post:
+      tags:
+        - Sync Control
+      summary: Cancel Full Database Replacement
+      description: |
+        Cancels an ongoing full database replacement operation.
+        Performs cleanup and optionally restores from backup if available.
+      operationId: cancelFullReplace
+      parameters:
+        - name: operation_id
+          in: path
+          required: true
+          description: Operation identifier
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                restore_from_backup:
+                  type: boolean
+                  default: false
+                  description: Restore data from backup after cancellation
+                cleanup_partial_data:
+                  type: boolean
+                  default: true
+                  description: Clean up partially transferred data
+      responses:
+        '200':
+          description: Operation cancelled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  cancelled_at:
+                    type: string
+                    format: date-time
+                  cleanup_performed:
+                    type: boolean
+                  backup_restored:
+                    type: boolean
+        '400':
+          description: Cannot cancel operation in current state
+        '404':
+          description: Operation not found
+        '401':
+          description: Authentication required
+
   # ==================== HEALTH AND MONITORING ====================
   /health:
     get:
@@ -3393,6 +3817,292 @@ examples:
           old_value: 40
           new_value: 50
           reason: "Low CPU utilization detected"
+
+    # ==================== FULL DATABASE REPLACEMENT SCHEMAS ====================
+    FullReplaceRequest:
+      type: object
+      required:
+        - operation_type
+        - targets
+      properties:
+        operation_type:
+          type: string
+          enum: ["collection", "database", "all"]
+          description: Scope of replacement operation
+        targets:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReplaceTarget'
+        options:
+          $ref: '#/components/schemas/ReplaceOptions'
+        filters:
+          $ref: '#/components/schemas/ReplaceFilters'
+
+    ReplaceTarget:
+      type: object
+      required:
+        - source_database
+        - target_database
+      properties:
+        source_database:
+          type: string
+          description: Source database name
+          example: "production_db"
+        source_collection:
+          type: string
+          description: Source collection name (required for collection type)
+          example: "users"
+        target_database:
+          type: string
+          description: Target database name
+          example: "local_sync_db"
+        target_collection:
+          type: string
+          description: Target collection name
+          example: "users"
+
+    ReplaceOptions:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+          default: false
+          description: Validate operation without executing
+        create_backup:
+          type: boolean
+          default: true
+          description: Create backup before replacement
+        backup_location:
+          type: string
+          description: Backup storage location
+          example: "s3://backups/full-replace-20240101"
+        verify_after_replace:
+          type: boolean
+          default: true
+          description: Verify data integrity after replacement
+        batch_size:
+          type: integer
+          minimum: 100
+          maximum: 10000
+          default: 1000
+          description: Batch size for data transfer
+        parallel_workers:
+          type: integer
+          minimum: 1
+          maximum: 16
+          default: 4
+          description: Number of parallel workers
+        timeout_minutes:
+          type: integer
+          minimum: 5
+          maximum: 1440
+          default: 60
+          description: Operation timeout in minutes
+        preserve_indexes:
+          type: boolean
+          default: true
+          description: Preserve collection indexes during replacement
+        preserve_metadata:
+          type: boolean
+          default: true
+          description: Preserve collection metadata
+
+    ReplaceFilters:
+      type: object
+      properties:
+        document_filter:
+          type: object
+          description: MongoDB query filter for source documents
+          example:
+            status: "active"
+            created_at: { "$gte": "2024-01-01T00:00:00Z" }
+        field_filter:
+          $ref: '#/components/schemas/FieldFilter'
+
+    FieldFilter:
+      type: object
+      properties:
+        include_fields:
+          type: array
+          items:
+            type: string
+          description: Fields to include in replacement
+          example: ["_id", "name", "email", "status"]
+        exclude_fields:
+          type: array
+          items:
+            type: string
+          description: Fields to exclude from replacement
+          example: ["internal_notes", "debug_info"]
+
+    FullReplaceResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        operation_id:
+          type: string
+          description: Unique identifier for tracking the operation
+          example: "replace_op_20240101_123456"
+        message:
+          type: string
+          example: "Full database replacement initiated for 2 collections"
+        targets_processed:
+          type: integer
+          example: 2
+        estimated_duration_minutes:
+          type: integer
+          description: Estimated completion time
+          example: 45
+        operation_details:
+          $ref: '#/components/schemas/OperationDetails'
+        tracking_endpoints:
+          $ref: '#/components/schemas/TrackingEndpoints'
+
+    OperationDetails:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        backup_created:
+          type: boolean
+        backup_location:
+          type: string
+        total_collections:
+          type: integer
+        start_time:
+          type: string
+          format: date-time
+
+    TrackingEndpoints:
+      type: object
+      properties:
+        status_url:
+          type: string
+          example: "/api/sync/replace/status/replace_op_20240101_123456"
+        progress_url:
+          type: string
+          example: "/api/sync/replace/progress/replace_op_20240101_123456"
+        cancel_url:
+          type: string
+          example: "/api/sync/replace/cancel/replace_op_20240101_123456"
+
+    FullReplaceStatus:
+      type: object
+      properties:
+        operation_id:
+          type: string
+          example: "replace_op_20240101_123456"
+        status:
+          type: string
+          enum: ["pending", "running", "completed", "failed", "cancelled"]
+          example: "running"
+        progress:
+          $ref: '#/components/schemas/ReplaceProgress'
+        performance:
+          $ref: '#/components/schemas/ReplacePerformance'
+        timing:
+          $ref: '#/components/schemas/ReplaceTiming'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReplaceError'
+
+    ReplaceProgress:
+      type: object
+      properties:
+        overall_percentage:
+          type: number
+          format: float
+          example: 67.5
+        collections_completed:
+          type: integer
+          example: 2
+        collections_total:
+          type: integer
+          example: 3
+        documents_processed:
+          type: integer
+          example: 150000
+        documents_total:
+          type: integer
+          example: 220000
+        current_collection:
+          type: string
+          example: "production_db.orders"
+
+    ReplacePerformance:
+      type: object
+      properties:
+        documents_per_second:
+          type: number
+          format: float
+          example: 1250.0
+        bytes_per_second:
+          type: number
+          format: float
+          example: 2048000
+        estimated_completion:
+          type: string
+          format: date-time
+          example: "2024-01-01T14:30:00Z"
+
+    ReplaceTiming:
+      type: object
+      properties:
+        started_at:
+          type: string
+          format: date-time
+        estimated_completion_at:
+          type: string
+          format: date-time
+        elapsed_seconds:
+          type: integer
+        remaining_seconds:
+          type: integer
+
+    ReplaceError:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        collection:
+          type: string
+        error_type:
+          type: string
+        message:
+          type: string
+        retry_count:
+          type: integer
+
+    ReplaceCancelRequest:
+      type: object
+      properties:
+        restore_from_backup:
+          type: boolean
+          default: false
+          description: Restore data from backup after cancellation
+        cleanup_partial_data:
+          type: boolean
+          default: true
+          description: Clean up partially transferred data
+
+    ReplaceCancelResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        cancelled_at:
+          type: string
+          format: date-time
+        cleanup_performed:
+          type: boolean
+        backup_restored:
+          type: boolean
 
 # ==================== TAGS ====================
 tags:

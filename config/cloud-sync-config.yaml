@@ -98,19 +98,19 @@ websocket:
 # Sync configuration
 sync:
   initial_sync: true
-  realtime_sync: false  # Disabled in favor of scheduler-based sync
-  scheduler_sync: true  # Enable configurable scheduler-based synchronization
-  scheduler_interval: "5m"  # 5 minutes for testing (configurable: 30m, 1h, etc.)
+  realtime_sync: false  # DISABLED - incremental sync must use HTTP
+  scheduler_sync: true  # ENABLED for HTTP-based incremental sync
+  scheduler_interval: "30s"  # Quick interval for testing real-time feel
   resumable_initial_sync: true  # Enable resumable initial sync to avoid full re-sync on restart
   batch_size: 1000
   parallel_collections: true
   max_workers: 4
   # TCP Transport Configuration for high-performance data transfer
   transport:
-    mode: "tcp"  # Use TCP transport for initial dumps ("http" for legacy mode)
-    http_fallback: false  # DO NOT fall back to HTTP if TCP fails - TCP is PRIMARY
-    compression_type: "zstd"  # Use Zstd compression for best ratio
-    health_monitor: "30s"  # TCP health monitor interval (checks for VM-sync availability)
+    mode: "tcp"  # Use TCP for initial/full sync (bulk data)
+    http_fallback: true  # Enable HTTP fallback for incremental sync
+    compression_type: "zstd"  # Use Zstd compression
+    health_monitor: "30s"  # Transport health monitor interval
     tcp_sender:
       address: "127.0.0.1:9000"  # vm-sync TCP receiver address (use 127.0.0.1 not localhost)
       parallel_conns: 4

@@ -37,7 +37,6 @@ import (
 	"go-data-sync-http/pkg/fence"
 	"go-data-sync-http/pkg/filtering"
 	"go-data-sync-http/pkg/logging"
-	"go-data-sync-http/pkg/memory"
 	"go-data-sync-http/pkg/metrics"
 	"go-data-sync-http/pkg/models"
 	"go-data-sync-http/pkg/parallel"
@@ -112,12 +111,7 @@ var (
 	initialDumpCompletedOnce bool                 // Track if initial dump has completed
 	initialDumpMutex         sync.RWMutex         // Protect initial dump completion state
 
-	// Memory management for change buffering (LEGACY - BEING REPLACED)
-	memoryManager *memory.Manager // Memory manager for change buffering
-	changeBuffer  *memory.Buffer  // Buffer for changes during disconnection
-	bufferMutex   sync.RWMutex    // Protect buffer operations
-
-	// Buffer-free resume token system (REPLACES MEMORY BUFFERS)
+	// Buffer-free resume token system (NO MEMORY BUFFERS)
 	tokenManager      *resume.TokenManager            // Resume token manager for buffer-free sync
 	bufferFreeHandler *resume.BufferFreeChangeHandler // Buffer-free change handler
 
@@ -296,11 +290,11 @@ func testTCPConnection(address string) error {
 	if err != nil {
 		return fmt.Errorf("TCP port not reachable: %w", err)
 	}
-	
+
 	// Immediately close without sending any data to avoid protocol interference
 	// The VM-sync receiver will see this as a brief connection that closed gracefully
 	conn.Close()
-	
+
 	return nil
 }
 
@@ -311,22 +305,22 @@ func startTCPHealthMonitor() {
 	if interval == 0 {
 		interval = 30 * time.Second
 	}
-	
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	
+
 	log.Printf("🐆 TCP HEALTH MONITOR: Started (check interval: %v)", interval)
-	
+
 	for {
 		select {
 		case <-ticker.C:
 			// Only try to reconnect if TCP is configured as primary but not currently enabled
 			if config.Sync.Transport.Mode == "tcp" && !tcpTransportEnabled {
 				log.Printf("🔍 TCP HEALTH CHECK: Attempting to reconnect to %s", config.Sync.Transport.TCPSender.Address)
-				
+
 				if err := testTCPConnection(config.Sync.Transport.TCPSender.Address); err == nil {
 					log.Printf("✨ TCP AVAILABLE: VM-sync detected! Reinitializing TCP transport...")
-					
+
 					// Attempt to reinitialize TCP transport
 					if err := initializeTCPTransport(); err != nil {
 						log.Printf("❌ TCP REINIT FAILED: %v", err)
@@ -340,10 +334,10 @@ func startTCPHealthMonitor() {
 			} else if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled {
 				// TCP is working fine, reduce monitoring frequency to avoid interference
 				log.Printf("✅ TCP HEALTHY: TCP transport is operational, reducing health check frequency")
-				
+
 				// Switch to much less frequent monitoring when TCP is working
 				ticker.Reset(5 * time.Minute) // Check every 5 minutes instead of 30 seconds
-				
+
 				// Optional: Skip actual connection test when TCP is working to avoid interference
 				// The main data transfer will detect if TCP fails anyway
 				continue
@@ -446,10 +440,18 @@ func main() {
 			checkpointMgr = nil
 			config.Checkpoint.Enabled = false
 		} else {
-			log.Println("Checkpoint manager initialized successfully")
+			log.Println("✅ Checkpoint manager initialized successfully")
+			log.Printf("📋 CHECKPOINT CONFIG: Database: %s, Collection: %s, SaveInterval: %vs", 
+				config.Checkpoint.Database, config.Checkpoint.Collection, config.Checkpoint.SaveInterval)
 		}
 	} else {
-		log.Println("Checkpoint manager disabled or MongoDB unavailable")
+		log.Printf("⚠️  CHECKPOINT DISABLED: Enabled=%v, MongoDB Connected=%v", config.Checkpoint.Enabled, mongoConnected)
+		if config.Checkpoint.Database == "" {
+			log.Printf("🚫 CHECKPOINT CONFIG MISSING: Database field is empty in config")
+		}
+		if config.Checkpoint.Collection == "" {
+			log.Printf("🚫 CHECKPOINT CONFIG MISSING: Collection field is empty in config")
+		}
 	}
 
 	// Initialize transfer tracker with graceful fallback
@@ -583,6 +585,29 @@ func main() {
 		"peak_hour_ready":          true,
 	})
 
+	// EARLY INIT: Initialize TCP transport before dependent components to avoid race conditions
+	// This ensures TCP is ready before initial dump starts and other sync components depend on it
+	log.Println("🚀 TCP INIT: Initializing TCP transport for initial dump readiness...")
+	if err := initializeTCPTransportWithRetry(); err != nil {
+		log.Printf("WARNING: Failed to initialize TCP transport after retries: %v", err)
+		log.Printf("DEGRADED MODE: Using HTTP transport for data transfer")
+		tcpTransportEnabled = false
+
+		// Start TCP transport health monitor if TCP is configured as primary
+		if config.Sync.Transport.Mode == "tcp" {
+			log.Printf("🔍 TCP MONITOR: Starting TCP transport health monitor for automatic reconnection")
+			go startTCPHealthMonitor()
+		}
+	} else if tcpTransportEnabled {
+		log.Println("✅ TCP TRANSPORT: Initialized successfully - ready for initial dump")
+		appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
+
+		// Start TCP transport health monitor even when initially successful
+		if config.Sync.Transport.Mode == "tcp" {
+			go startTCPHealthMonitor()
+		}
+	}
+
 	// Initialize adaptive system components with graceful fallback
 	log.Println("Initializing adaptive system...")
 	cloudSyncIntegration, err = adaptive.NewCloudSyncIntegration("cloud-sync-node")
@@ -618,27 +643,6 @@ func main() {
 		"eliminates_manual_config": true,
 	})
 
-	// Initialize TCP transport if enabled with retry mechanism
-	if err := initializeTCPTransportWithRetry(); err != nil {
-		log.Printf("WARNING: Failed to initialize TCP transport after retries: %v", err)
-		log.Printf("DEGRADED MODE: Using HTTP transport for data transfer")
-		tcpTransportEnabled = false
-		
-		// Start TCP transport health monitor if TCP is configured as primary
-		if config.Sync.Transport.Mode == "tcp" {
-			log.Printf("🔍 TCP MONITOR: Starting TCP transport health monitor for automatic reconnection")
-			go startTCPHealthMonitor()
-		}
-	} else if tcpTransportEnabled {
-		log.Println("TCP transport initialized successfully")
-		appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
-		
-		// Start TCP transport health monitor even when initially successful
-		if config.Sync.Transport.Mode == "tcp" {
-			go startTCPHealthMonitor()
-		}
-	}
-
 	// Enable self-optimization for Cloud Sync
 	enableSelfOptimization()
 	appLogger.Info("cloud-sync", "startup", "Self-optimization system enabled", nil)
@@ -671,9 +675,9 @@ func main() {
 		}
 	}
 
-	// DISABLED: Real-time sync completely disabled to focus on initial dump only
+	// ENABLED: Real-time sync will start after initial dump completes
 	// Change stream initialization moved to prevent any real-time sync duplication
-	if false && mongoConnected { // Completely disabled
+	if mongoConnected {
 		log.Println("🚀 SEQUENCED STARTUP: Real-time sync will start AFTER initial dump completes")
 		log.Println("⏳ WAITING: Change streams will be initialized after bulk data transfer finishes")
 		// Change stream initialization moved to startRealTimeSync() function
@@ -756,6 +760,9 @@ func main() {
 	// Buffer-free resume token system routes
 	apiRouter.HandleFunc("/api/buffer-free/status", handleBufferFreeStatus).Methods("GET")
 	apiRouter.HandleFunc("/api/buffer-free/tokens", handleTokenStatus).Methods("GET")
+
+	// Initial sync API endpoint - triggers full database replacement
+	apiRouter.HandleFunc("/api/sync/initial", handleInitialSync).Methods("POST")
 
 	// Serve static files for dashboard
 	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./web/static/"))))
@@ -1077,60 +1084,120 @@ func startPushBasedSync() {
 		log.Println("⚠️  Timeout waiting for vm-sync connection, proceeding with sync anyway")
 	}
 
-	// CRITICAL: For TCP mode, wait for TCP transport to be ready before initial dump
+	// CRITICAL: Enhanced TCP readiness verification for initial dump reliability
 	if config.Sync.Transport.Mode == "tcp" {
 		log.Println("🔍 TCP READINESS CHECK: Verifying TCP transport is ready for initial dump...")
-		
-		// Try up to 10 times with 3-second intervals (30 seconds total)
-		for attempt := 1; attempt <= 10; attempt++ {
+
+		// Enhanced readiness check with shorter intervals but more attempts for better reliability
+		for attempt := 1; attempt <= 15; attempt++ {
 			if tcpTransportEnabled && tcpSender != nil {
-				log.Printf("✅ TCP READY: TCP transport is available for initial dump (attempt %d)", attempt)
+				log.Printf("✅ TCP READY: TCP transport confirmed ready for initial dump (attempt %d)", attempt)
 				break
 			}
-			
-			if attempt == 10 {
-				log.Printf("⚠️  TCP TIMEOUT: TCP transport not ready after %d attempts, proceeding anyway", attempt)
+
+			if attempt == 15 {
+				log.Printf("⚠️ TCP TIMEOUT: TCP transport not ready after %d attempts, will use HTTP fallback", attempt)
+				log.Printf("🚑 FALLBACK: Initial dump will proceed with HTTP transport for reliability")
 				break
 			}
-			
-			log.Printf("⏳ TCP WAIT: TCP transport not ready, waiting 3s (attempt %d/10)...", attempt)
-			time.Sleep(3 * time.Second)
+
+			log.Printf("⏳ TCP WAIT: TCP transport not ready, waiting 2s (attempt %d/15)...", attempt)
+			time.Sleep(2 * time.Second)
 		}
+	} else {
+		log.Println("🌐 HTTP MODE: Using HTTP transport for initial dump")
 	}
 
 	log.Println("📊 Starting sync process for all configured collections...")
 	startSyncProcess()
 
-	// CRITICAL: Signal that initial dump is completed
+	// CRITICAL: Enhanced signal that initial dump is completed with safety checks
 	initialDumpMutex.Lock()
 	if !initialDumpCompletedOnce {
 		initialDumpCompletedOnce = true
+		log.Println("🔄 INITIAL DUMP: Signaling completion to real-time sync...")
 		select {
 		case initialDumpCompleted <- true:
-			log.Println("✅ INITIAL DUMP COMPLETED: Signaling real-time sync to start")
+			log.Println("✅ INITIAL DUMP COMPLETED: Real-time sync signaled successfully")
 		default:
-			// Channel already has a value
+			// Channel already has a value - this is expected behavior
+			log.Println("🔄 INITIAL DUMP: Signal channel already notified")
 		}
+	} else {
+		log.Println("⚠️ INITIAL DUMP: Already completed, skipping duplicate signal")
 	}
 	initialDumpMutex.Unlock()
 
-	// Start real-time synchronization AFTER initial dump completion
+	// Start real-time synchronization AFTER initial dump completion with enhanced safety
+	log.Println("🚀 SEQUENCED STARTUP: Starting real-time sync goroutine...")
 	go startRealTimeSync()
 }
 
-// startRealTimeSync starts change stream monitoring AFTER initial dump completion
-// This prevents data duplication between initial dump and real-time sync
+// startRealTimeSync starts scheduler-based synchronization AFTER initial dump completion
+// This prevents data duplication between initial dump and incremental sync with enhanced safety
 func startRealTimeSync() {
-	log.Println("⏳ WAITING: Real-time sync waiting for initial dump completion...")
+	log.Println("⏳ SEQUENCED SYNC: Incremental sync waiting for initial dump completion...")
 
-	// Wait for initial dump to complete before starting change streams
+	// Enhanced safety: Wait for initial dump to complete before starting incremental sync
 	select {
 	case <-initialDumpCompleted:
-		log.Println("✅ INITIAL DUMP COMPLETED: Starting real-time change stream monitoring")
-	case <-time.After(30 * time.Minute): // Timeout after 30 minutes
-		log.Println("⚠️  Timeout waiting for initial dump completion, starting real-time sync anyway")
+		log.Println("✅ INITIAL DUMP VERIFIED: Starting scheduler-based incremental synchronization")
+		log.Println("🛡️ DATA SAFETY: No duplication risk - initial dump completed first")
+	case <-time.After(45 * time.Minute): // Extended timeout for large datasets
+		log.Println("⚠️ TIMEOUT: Waiting for initial dump completion timed out after 45 minutes")
+		log.Println("🚑 FALLBACK: Starting incremental sync anyway to ensure continuity")
 	}
 
+	// Check if scheduler-based sync is enabled with improved logic
+	if config.Sync.SchedulerSync {
+		log.Printf("📅 SCHEDULER: Starting incremental sync with interval: %v", config.Sync.SchedulerInterval)
+		startSchedulerBasedSync()
+	} else if config.Sync.RealtimeSync {
+		// Fallback to real-time change streams if scheduler is not enabled
+		log.Println("🎯 REAL-TIME: Starting traditional change stream monitoring...")
+		startChangeStreamMonitoring()
+	} else {
+		log.Println("💤 SYNC DISABLED: Neither scheduler nor real-time sync is enabled")
+		log.Println("⚠️ WARNING: System is in initial-dump-only mode")
+	}
+}
+
+// startSchedulerBasedSync starts scheduler-based incremental synchronization
+func startSchedulerBasedSync() {
+	if config.Sync.SchedulerInterval <= 0 {
+		log.Println("⚠️  Invalid scheduler interval, defaulting to 30 minutes")
+		config.Sync.SchedulerInterval = 30 * time.Minute
+	}
+
+	log.Printf("📅 SCHEDULER: Starting with %v interval", config.Sync.SchedulerInterval)
+
+	// Start the scheduler in a goroutine
+	go func() {
+		ticker := time.NewTicker(config.Sync.SchedulerInterval)
+		defer ticker.Stop()
+
+		// Run initial incremental sync immediately
+		log.Println("🚀 SCHEDULER: Running initial incremental sync...")
+		runIncrementalSync()
+
+		// Then run on schedule
+		for {
+			select {
+			case <-ticker.C:
+				log.Printf("📅 SCHEDULER: Running scheduled incremental sync (interval: %v)", config.Sync.SchedulerInterval)
+				runIncrementalSync()
+			case <-context.Background().Done():
+				log.Println("📅 SCHEDULER: Stopping scheduler due to context cancellation")
+				return
+			}
+		}
+	}()
+
+	log.Println("✅ SCHEDULER: Incremental sync scheduler started successfully")
+}
+
+// startChangeStreamMonitoring starts traditional change stream monitoring (fallback)
+func startChangeStreamMonitoring() {
 	// Now it's safe to start change streams - no data duplication risk
 	if mongoClient != nil {
 		// Start change stream monitoring using buffer-free approach
@@ -1159,6 +1226,815 @@ func startRealTimeSync() {
 		log.Println("DEGRADED MODE: Change stream monitoring disabled - MongoDB unavailable")
 	}
 }
+
+// runIncrementalSync performs an incremental synchronization by detecting changes
+// runIncrementalSync runs MongoDB change stream based incremental sync (industry standard approach)
+func runIncrementalSync() {
+	start := time.Now()
+	log.Println("📄 INCREMENTAL SYNC: Starting MongoDB change stream detection...")
+
+	// Industry pattern: Process each collection with dedicated change streams
+	var totalChanges int
+	var syncErrors []string
+
+	for _, database := range config.MongoDB.Databases {
+		if !database.Enabled {
+			continue
+		}
+		for _, collection := range database.Collections {
+			if !collection.Enabled {
+				continue
+			}
+
+			// Use proper MongoDB change streams with resume tokens (like Debezium)
+			changes, err := detectAndSyncWithChangeStream(database.Name, collection.Name)
+			if err != nil {
+				errorMsg := fmt.Sprintf("Failed to sync changes for %s.%s: %v", database.Name, collection.Name, err)
+				log.Printf("🔴 INCREMENTAL SYNC ERROR: %s", errorMsg)
+				syncErrors = append(syncErrors, errorMsg)
+				continue
+			}
+
+			if changes > 0 {
+				log.Printf("🔄 INCREMENTAL SYNC: Processed %d changes in %s.%s", changes, database.Name, collection.Name)
+				totalChanges += changes
+			}
+		}
+	}
+
+	duration := time.Since(start)
+	if len(syncErrors) > 0 {
+		log.Printf("⚠️  INCREMENTAL SYNC COMPLETED with %d errors in %v - Processed %d total changes", len(syncErrors), duration, totalChanges)
+		for _, errMsg := range syncErrors {
+			log.Printf("  • %s", errMsg)
+		}
+	} else {
+		log.Printf("✅ INCREMENTAL SYNC COMPLETED successfully in %v - Processed %d total changes", duration, totalChanges)
+	}
+}
+
+// detectAndSyncWithChangeStream implements the industry-standard single stream pattern
+// Used by Debezium and other CDC platforms - combines detection and sync in one stream
+func detectAndSyncWithChangeStream(database, collection string) (int, error) {
+	coll := mongoClient.Database(database).Collection(collection)
+	// Use shorter timeout than scheduler interval to prevent blocking
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// Get resume token from checkpoint (industry standard persistence pattern)
+	var watchOptions *options.ChangeStreamOptions
+	var startFromToken bson.Raw
+	
+	if checkpointMgr != nil {
+		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil && len(checkpoint.ResumeToken) > 0 {
+			startFromToken = checkpoint.ResumeToken
+			watchOptions = options.ChangeStream().SetResumeAfter(startFromToken).SetFullDocument(options.UpdateLookup)
+			log.Printf("🎯 RESUME TOKEN: Resuming change stream for %s.%s from checkpoint", database, collection)
+		} else {
+			// No resume token - start fresh from current time
+			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+			log.Printf("🎆 NEW STREAM: Starting fresh change stream for %s.%s", database, collection)
+		}
+	} else {
+		// No checkpoint manager
+		watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+		log.Printf("⚠️  NO CHECKPOINT: Starting temporary change stream for %s.%s", database, collection)
+	}
+
+	// Create change stream with error recovery (Debezium pattern)
+	changeStream, err := coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
+	if err != nil {
+		// Handle resume token invalidation gracefully (industry best practice)
+		if isInvalidateResumeTokenError(err) && len(startFromToken) > 0 {
+			log.Printf("🔄 RESUME TOKEN INVALID: Starting fresh stream for %s.%s", database, collection)
+			if checkpointMgr != nil {
+				// Clear invalid resume token
+				if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+					log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+				}
+			}
+			// Retry with fresh stream
+			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
+		}
+		
+		if err != nil {
+			return 0, fmt.Errorf("failed to create change stream: %w", err)
+		}
+	}
+	defer changeStream.Close(ctx)
+
+	// Single stream pattern: detect and sync in one pass (like Debezium)
+	var documents [][]byte
+	totalBytes := 0
+	changeCount := 0
+	lastResumeToken := startFromToken
+	operationCounts := map[string]int{
+		"insert": 0, "update": 0, "delete": 0, "replace": 0,
+	}
+
+	// Process ALL change events in real-time
+	for changeStream.Next(ctx) {
+		var changeEvent bson.M
+		if err := changeStream.Decode(&changeEvent); err != nil {
+			log.Printf("⚠️  Failed to decode change event: %v", err)
+			continue
+		}
+
+		// Update resume token immediately (critical for fault tolerance)
+		lastResumeToken = changeStream.ResumeToken()
+		changeCount++
+
+		// Track operation type
+		if opType, ok := changeEvent["operationType"].(string); ok {
+			operationCounts[opType]++
+			log.Printf("📄 CHANGE DETECTED: %s operation on %s.%s", opType, database, collection)
+		}
+
+		// Extract document for insert/update/replace operations
+		if fullDoc, ok := changeEvent["fullDocument"]; ok {
+			docBytes, err := bson.Marshal(fullDoc)
+			if err != nil {
+				log.Printf("⚠️  Failed to marshal document: %v", err)
+				continue
+			}
+			documents = append(documents, docBytes)
+			totalBytes += len(docBytes)
+		} else if opType, ok := changeEvent["operationType"].(string); ok && opType == "delete" {
+			// Handle delete operations
+			deleteMarker := bson.M{
+				"_operation":  "delete",
+				"_documentKey": changeEvent["documentKey"],
+				"_timestamp":   time.Now(),
+			}
+			docBytes, err := bson.Marshal(deleteMarker)
+			if err != nil {
+				log.Printf("⚠️  Failed to marshal delete marker: %v", err)
+				continue
+			}
+			documents = append(documents, docBytes)
+			totalBytes += len(docBytes)
+		}
+	}
+
+	// Handle timeout gracefully (normal behavior)
+	streamErr := changeStream.Err()
+	isTimeoutError := false
+	if streamErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			isTimeoutError = true
+			log.Printf("⏰ STREAM TIMEOUT: %s.%s reached 25s timeout (normal behavior)", database, collection)
+		} else {
+			log.Printf("⚠️  STREAM ERROR: %s.%s - %v", database, collection, streamErr)
+		}
+	}
+
+	// ALWAYS persist resume token (critical for recovery)
+	if checkpointMgr != nil && len(lastResumeToken) > 0 {
+		if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
+			log.Printf("⚠️  Failed to update resume token: %v", err)
+		} else {
+			log.Printf("✅ RESUME TOKEN UPDATED: %s.%s (%d bytes)", database, collection, len(lastResumeToken))
+		}
+	}
+
+	if len(documents) == 0 {
+		log.Printf("📋 STREAM SYNC: No changes found for %s.%s", database, collection)
+		if streamErr != nil && !isTimeoutError {
+			return 0, fmt.Errorf("change stream error: %w", streamErr)
+		}
+		return 0, nil
+	}
+
+	// Send changes via HTTP (reliable transport for incremental sync)
+	log.Printf("🚀 STREAM SYNC: Sending %d changed docs (%s) for %s.%s - inserts:%d, updates:%d, deletes:%d", 
+		len(documents), formatBytes(totalBytes), database, collection, 
+		operationCounts["insert"], operationCounts["update"], operationCounts["delete"])
+
+	if err := sendIncrementalChangesViaHTTP(database, collection, documents); err != nil {
+		return 0, fmt.Errorf("HTTP incremental sync failed: %w", err)
+	}
+
+	log.Printf("✅ STREAM SYNC: Successfully sent %d docs for %s.%s", len(documents), database, collection)
+	
+	if streamErr != nil && !isTimeoutError {
+		return 0, fmt.Errorf("change stream error: %w", streamErr)
+	}
+	
+	return changeCount, nil
+}
+
+// detectSimpleChanges uses simple document count comparison
+func detectSimpleChanges(database, collection string) (int, error) {
+	// Get current count from source database
+	sourceColl := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Apply same filters as initial sync to get accurate count
+	filter := buildDocumentFilter(database, collection)
+	currentCount, err := sourceColl.CountDocuments(ctx, filter)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count source documents: %w", err)
+	}
+
+	// Get last known count from checkpoint
+	lastCount := int64(0)
+	if checkpointMgr != nil {
+		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil {
+			if checkpoint.ProcessedCount > 0 {
+				lastCount = checkpoint.ProcessedCount
+				// SAFETY CHECK: If checkpoint count is higher than current count, reset it
+				if lastCount > currentCount {
+					log.Printf("⚠️  CHECKPOINT RESET: %s.%s checkpoint (%d) > current (%d), resetting to current count", 
+						database, collection, lastCount, currentCount)
+					lastCount = currentCount
+					// Update checkpoint to current count
+					checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now())
+				}
+			}
+		}
+	}
+
+	newDocuments := int(currentCount - lastCount)
+	if newDocuments > 0 {
+		log.Printf("📊 SIMPLE DETECTION: %s.%s has %d new documents (current: %d, last: %d)", 
+			database, collection, newDocuments, currentCount, lastCount)
+	} else {
+		log.Printf("📋 SIMPLE DETECTION: %s.%s has no new documents (current: %d, last: %d)", 
+			database, collection, currentCount, lastCount)
+	}
+
+	return newDocuments, nil
+}
+
+// syncNewDocuments transfers new documents using simple pagination
+func syncNewDocuments(database, collection string) error {
+	// Get last known count
+	lastCount := int64(0)
+	if checkpointMgr != nil {
+		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil {
+			if checkpoint.ProcessedCount > 0 {
+				lastCount = checkpoint.ProcessedCount
+			}
+		}
+	}
+
+	// Simple approach: Skip the first lastCount documents and get new ones
+	sourceColl := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Build filters and projection like initial sync
+	filter := buildDocumentFilter(database, collection)
+	pipeline := buildAggregationPipeline(database, collection, filter)
+
+	// Add skip stage to get only new documents
+	pipeline = append(pipeline, bson.D{{"$skip", lastCount}})
+	pipeline = append(pipeline, bson.D{{"$limit", 100}}) // Small batches for real-time feel
+
+	cursor, err := sourceColl.Aggregate(ctx, pipeline)
+	if err != nil {
+		return fmt.Errorf("failed to aggregate new documents: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	// Collect new documents
+	var documents [][]byte
+	for cursor.Next(ctx) {
+		documents = append(documents, cursor.Current)
+	}
+
+	if len(documents) == 0 {
+		log.Printf("📋 SIMPLE SYNC: No new documents to sync for %s.%s", database, collection)
+		return nil
+	}
+
+	log.Printf("🚀 SIMPLE SYNC: Sending %d new documents for %s.%s via HTTP", len(documents), database, collection)
+
+	// Send via HTTP to vm-sync
+	if err := sendIncrementalChangesViaHTTP(database, collection, documents); err != nil {
+		return fmt.Errorf("failed to send new documents: %w", err)
+	}
+
+	// Update checkpoint with new count
+	if checkpointMgr != nil {
+		newCount := lastCount + int64(len(documents))
+		// Clear old checkpoint and create new one with updated count
+		if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+			log.Printf("⚠️  Failed to update checkpoint: %v", err)
+		} else {
+			log.Printf("✅ CHECKPOINT UPDATED: %s.%s processed count: %d -> %d", database, collection, lastCount, newCount)
+		}
+	}
+
+	log.Printf("✅ SIMPLE SYNC: Successfully sent %d new documents for %s.%s", len(documents), database, collection)
+	return nil
+}
+
+// Simple helper functions
+func buildDocumentFilter(database, collection string) bson.M {
+	// Find the collection config to get document filters
+	for _, db := range config.MongoDB.Databases {
+		if db.Name == database {
+			for _, coll := range db.Collections {
+				if coll.Name == collection {
+					filter := bson.M{}
+					for _, criterion := range coll.DocumentFilter.Criteria {
+						switch criterion.Operator {
+						case "eq":
+							filter[criterion.Field] = criterion.Value
+						case "gt":
+							filter[criterion.Field] = bson.M{"$gt": criterion.Value}
+						case "gte":
+							filter[criterion.Field] = bson.M{"$gte": criterion.Value}
+						case "lt":
+							filter[criterion.Field] = bson.M{"$lt": criterion.Value}
+						case "lte":
+							filter[criterion.Field] = bson.M{"$lte": criterion.Value}
+						case "ne":
+							filter[criterion.Field] = bson.M{"$ne": criterion.Value}
+						}
+					}
+					return filter
+				}
+			}
+		}
+	}
+	return bson.M{} // No filter if collection not found
+}
+
+func buildAggregationPipeline(database, collection string, filter bson.M) mongo.Pipeline {
+	pipeline := mongo.Pipeline{}
+
+	// Add match stage for document filtering
+	if len(filter) > 0 {
+		pipeline = append(pipeline, bson.D{{"$match", filter}})
+	}
+
+	// Add field projection
+	for _, db := range config.MongoDB.Databases {
+		if db.Name == database {
+			for _, coll := range db.Collections {
+				if coll.Name == collection {
+					if len(coll.FieldFilter.IncludeFields) > 0 {
+						projection := bson.M{}
+						for _, field := range coll.FieldFilter.IncludeFields {
+							projection[field] = 1
+						}
+						pipeline = append(pipeline, bson.D{{"$project", projection}})
+					}
+					break
+				}
+			}
+			break
+		}
+	}
+
+	return pipeline
+}
+
+// detectChangesWithChangeStream uses pure MongoDB change streams for operation detection
+func detectChangesWithChangeStream(database, collection string) (int, error) {
+	coll := mongoClient.Database(database).Collection(collection)
+	// Use shorter timeout than scheduler interval to prevent blocking
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// Get resume token from checkpoint if available
+	var watchOptions *options.ChangeStreamOptions
+	var startFromToken bson.Raw
+	
+	if checkpointMgr != nil {
+		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil && len(checkpoint.ResumeToken) > 0 {
+			startFromToken = checkpoint.ResumeToken
+			watchOptions = options.ChangeStream().SetResumeAfter(startFromToken).SetFullDocument(options.UpdateLookup)
+			log.Printf("🎯 RESUME TOKEN DETECTION: Resuming change stream for %s.%s from checkpoint", database, collection)
+		} else {
+			// No resume token yet - start from current cluster time (will capture all new changes)
+			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+			log.Printf("🎆 NEW CHANGE STREAM: Starting fresh change stream for %s.%s from current cluster time", database, collection)
+		}
+	} else {
+		// No checkpoint manager - temporary mode
+		watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+		log.Printf("⚠️  NO CHECKPOINT MGR: Starting temporary change stream for %s.%s from current cluster time", database, collection)
+	}
+
+	// Create change stream
+	changeStream, err := coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
+	if err != nil {
+		// Handle resume token invalidation gracefully
+		if isInvalidateResumeTokenError(err) && len(startFromToken) > 0 {
+			log.Printf("🔄 RESUME TOKEN INVALID: Clearing checkpoint and starting fresh for %s.%s", database, collection)
+			if checkpointMgr != nil {
+				// Clear invalid resume token
+				if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+					log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+				}
+			}
+			// Retry with fresh stream
+			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
+		}
+		
+		if err != nil {
+			return 0, fmt.Errorf("failed to create change stream: %w", err)
+		}
+	}
+	defer changeStream.Close(ctx)
+
+	// Count ALL change operations since last checkpoint
+	changeCount := 0
+	lastResumeToken := startFromToken
+	operationCounts := map[string]int{
+		"insert": 0, "update": 0, "delete": 0, "replace": 0,
+		"drop": 0, "rename": 0, "dropDatabase": 0,
+		"createIndexes": 0, "dropIndexes": 0, "modify": 0,
+		"invalidate": 0,
+	}
+
+	// Process change events to count operations and update resume token
+	for changeStream.Next(ctx) {
+		var changeEvent bson.M
+		if err := changeStream.Decode(&changeEvent); err != nil {
+			log.Printf("⚠️  Failed to decode change event: %v", err)
+			continue
+		}
+
+		// Track operation type
+		if opType, ok := changeEvent["operationType"].(string); ok {
+			operationCounts[opType]++
+			changeCount++
+		}
+
+		// Update resume token for next iteration
+		lastResumeToken = changeStream.ResumeToken()
+	}
+
+	// Check for change stream errors but handle timeout gracefully
+	streamErr := changeStream.Err()
+	isTimeoutError := false
+	if streamErr != nil {
+		// Check if this is a context timeout (normal behavior)
+		if ctx.Err() == context.DeadlineExceeded {
+			isTimeoutError = true
+			log.Printf("⏰ CHANGE STREAM TIMEOUT: %s.%s reached 25s timeout (normal behavior)", database, collection)
+		} else {
+			// This is a real error, not a timeout
+			log.Printf("⚠️  CHANGE STREAM ERROR: %s.%s - %v", database, collection, streamErr)
+		}
+	}
+
+	// ALWAYS update checkpoint with resume token (even on timeout or no changes)
+	log.Printf("🔍 DEBUG CHECKPOINT: checkpointMgr != nil? %v, database=%s, collection=%s", checkpointMgr != nil, database, collection)
+	if checkpointMgr != nil {
+		// Use the latest resume token we have, or establish a new checkpoint
+		if len(lastResumeToken) > 0 {
+			log.Printf("🔍 DEBUG: About to call UpdateCheckpoint with resume token (%d bytes)", len(lastResumeToken))
+			if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
+				log.Printf("⚠️  Failed to update checkpoint: %v", err)
+			} else {
+				log.Printf("✅ CHECKPOINT UPDATED: %s.%s with resume token (%d bytes)", database, collection, len(lastResumeToken))
+			}
+		} else {
+			log.Printf("🔍 DEBUG: About to call UpdateCheckpoint without resume token (initial checkpoint)")
+			// Create initial checkpoint without resume token to establish tracking
+			if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+				log.Printf("⚠️  Failed to create initial checkpoint: %v", err)
+			} else {
+				log.Printf("📋 CHECKPOINT CREATED: %s.%s (initial checkpoint without resume token)", database, collection)
+			}
+		}
+	} else {
+		log.Printf("⚠️  DEBUG: checkpointMgr is nil - cannot update checkpoint for %s.%s", database, collection)
+	}
+
+	if changeCount > 0 {
+		log.Printf("🎯 CHANGE STREAM DETECTION: Found %d changes for %s.%s - inserts:%d, updates:%d, deletes:%d, replaces:%d", 
+			changeCount, database, collection, operationCounts["insert"], operationCounts["update"], operationCounts["delete"], operationCounts["replace"])
+	} else {
+		log.Printf("📋 CHANGE STREAM DETECTION: No changes for %s.%s since last checkpoint", database, collection)
+	}
+
+	// Return error only for real errors, not timeouts
+	if streamErr != nil && !isTimeoutError {
+		return 0, fmt.Errorf("change stream error: %w", streamErr)
+	}
+
+	return changeCount, nil
+}
+
+// syncCollectionChanges syncs detected changes using pure MongoDB change streams
+// NO document modification required - works with any existing documents
+func syncCollectionChanges(database, collection string) error {
+	// Check if we have connected vm-sync clients
+	clientsMutex.RLock()
+	hasVMClients := false
+	for _, clientInfo := range clients {
+		if clientInfo.ClientType == "vm-sync" {
+			hasVMClients = true
+			break
+		}
+	}
+	clientsMutex.RUnlock()
+
+	if !hasVMClients {
+		log.Printf("💤 INCREMENTAL SYNC: No vm-sync clients connected, skipping sync for %s.%s", database, collection)
+		return nil
+	}
+
+	// Use pure change streams for all synchronization
+	return syncCollectionChangesWithChangeStream(database, collection)
+}
+
+// syncCollectionChangesWithChangeStream syncs changes using pure MongoDB change streams
+func syncCollectionChangesWithChangeStream(database, collection string) error {
+	coll := mongoClient.Database(database).Collection(collection)
+	// Use shorter timeout than scheduler interval to prevent blocking
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// Get resume token from checkpoint if available
+	var watchOptions *options.ChangeStreamOptions
+	var startFromToken bson.Raw
+	
+	if checkpointMgr != nil {
+		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil && len(checkpoint.ResumeToken) > 0 {
+			startFromToken = checkpoint.ResumeToken
+			watchOptions = options.ChangeStream().SetResumeAfter(startFromToken).SetFullDocument(options.UpdateLookup)
+			log.Printf("🎯 CHANGE STREAM SYNC: Resuming from checkpoint for %s.%s", database, collection)
+		} else {
+			// No resume token - start from "now" but only sync new changes
+			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+			log.Printf("🎆 CHANGE STREAM SYNC: Starting fresh for %s.%s (will only sync new changes)", database, collection)
+		}
+	} else {
+		// No checkpoint manager
+		watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+		log.Printf("⚠️  CHANGE STREAM SYNC: No checkpoint manager for %s.%s", database, collection)
+	}
+
+	// Create change stream
+	changeStream, err := coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
+	if err != nil {
+		// Handle resume token invalidation
+		if isInvalidateResumeTokenError(err) && len(startFromToken) > 0 {
+			log.Printf("🔄 RESUME TOKEN INVALID: Clearing and restarting for %s.%s", database, collection)
+			if checkpointMgr != nil {
+				if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+					log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+				}
+			}
+			// Retry with fresh stream
+			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
+			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
+		}
+		
+		if err != nil {
+			return fmt.Errorf("failed to create change stream: %w", err)
+		}
+	}
+	defer changeStream.Close(ctx)
+
+	var documents [][]byte
+	totalBytes := 0
+	changeCount := 0
+	lastResumeToken := startFromToken
+	operationCounts := map[string]int{
+		"insert": 0, "update": 0, "delete": 0, "replace": 0,
+		"drop": 0, "rename": 0, "dropDatabase": 0,
+		"createIndexes": 0, "dropIndexes": 0, "modify": 0,
+		"invalidate": 0,
+	}
+
+	// Process ALL change events: insert, update, delete, replace
+	for changeStream.Next(ctx) {
+		var changeEvent bson.M
+		if err := changeStream.Decode(&changeEvent); err != nil {
+			log.Printf("⚠️  Failed to decode change event: %v", err)
+			continue
+		}
+
+		// Update resume token
+		lastResumeToken = changeStream.ResumeToken()
+		changeCount++
+
+		// Track operation type
+		if opType, ok := changeEvent["operationType"].(string); ok {
+			operationCounts[opType]++
+			log.Printf("📄 CHANGE DETECTED: %s operation on %s.%s", opType, database, collection)
+		}
+
+		// Extract document for insert/update/replace operations
+		if fullDoc, ok := changeEvent["fullDocument"]; ok {
+			docBytes, err := bson.Marshal(fullDoc)
+			if err != nil {
+				log.Printf("⚠️  Failed to marshal document: %v", err)
+				continue
+			}
+			documents = append(documents, docBytes)
+			totalBytes += len(docBytes)
+		} else if opType, ok := changeEvent["operationType"].(string); ok {
+			switch opType {
+			case "delete":
+				// For delete operations, create a special marker document
+				deleteMarker := bson.M{
+					"_operation":  "delete",
+					"_documentKey": changeEvent["documentKey"],
+					"_timestamp":   time.Now(),
+				}
+				docBytes, err := bson.Marshal(deleteMarker)
+				if err != nil {
+					log.Printf("⚠️  Failed to marshal delete marker: %v", err)
+					continue
+				}
+				documents = append(documents, docBytes)
+				totalBytes += len(docBytes)
+			case "drop", "rename", "dropDatabase":
+				// DDL operations - create special marker
+				ddlMarker := bson.M{
+					"_operation": opType,
+					"_database":  database,
+					"_collection": collection,
+					"_timestamp":  time.Now(),
+				}
+				if ns, ok := changeEvent["ns"]; ok {
+					ddlMarker["_namespace"] = ns
+				}
+				docBytes, err := bson.Marshal(ddlMarker)
+				if err != nil {
+					log.Printf("⚠️  Failed to marshal DDL marker: %v", err)
+					continue
+				}
+				documents = append(documents, docBytes)
+				totalBytes += len(docBytes)
+			case "createIndexes", "dropIndexes", "modify":
+				// Index operations - create special marker
+				indexMarker := bson.M{
+					"_operation": opType,
+					"_database":  database,
+					"_collection": collection,
+					"_timestamp":  time.Now(),
+				}
+				if operationDescription, ok := changeEvent["operationDescription"]; ok {
+					indexMarker["_operationDescription"] = operationDescription
+				}
+				docBytes, err := bson.Marshal(indexMarker)
+				if err != nil {
+					log.Printf("⚠️  Failed to marshal index marker: %v", err)
+					continue
+				}
+				documents = append(documents, docBytes)
+				totalBytes += len(docBytes)
+			case "invalidate":
+				// Invalidate operations - create special marker
+				invalidateMarker := bson.M{
+					"_operation": "invalidate",
+					"_database":  database,
+					"_collection": collection,
+					"_timestamp":  time.Now(),
+					"_reason":     "collection_invalidated",
+				}
+				docBytes, err := bson.Marshal(invalidateMarker)
+				if err != nil {
+					log.Printf("⚠️  Failed to marshal invalidate marker: %v", err)
+					continue
+				}
+				documents = append(documents, docBytes)
+				totalBytes += len(docBytes)
+				log.Printf("⚠️  INVALIDATE OPERATION: %s for %s.%s", opType, database, collection)
+			default:
+				log.Printf("⚠️  UNHANDLED OPERATION: %s for %s.%s", opType, database, collection)
+			}
+		}
+	}
+
+	// Check for change stream errors but handle timeout gracefully
+	streamErr := changeStream.Err()
+	isTimeoutError := false
+	if streamErr != nil {
+		// Check if this is a context timeout (normal behavior for 25-second sync window)
+		if ctx.Err() == context.DeadlineExceeded {
+			isTimeoutError = true
+			log.Printf("⏰ SYNC STREAM TIMEOUT: %s.%s reached 25s timeout (normal sync window)", database, collection)
+		} else {
+			// This is a real error, not a timeout
+			log.Printf("⚠️  SYNC STREAM ERROR: %s.%s - %v", database, collection, streamErr)
+		}
+	}
+
+	// ALWAYS update checkpoint with resume token (even on timeout or no changes)
+	if checkpointMgr != nil {
+		// Use the latest resume token we have, or establish a new checkpoint
+		if len(lastResumeToken) > 0 {
+			if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
+				log.Printf("⚠️  Failed to sync update checkpoint: %v", err)
+			} else {
+				log.Printf("✅ SYNC CHECKPOINT UPDATED: %s.%s with resume token (%d bytes)", database, collection, len(lastResumeToken))
+			}
+		} else {
+			// Create initial checkpoint without resume token to establish tracking
+			if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+				log.Printf("⚠️  Failed to create initial sync checkpoint: %v", err)
+			} else {
+				log.Printf("📋 SYNC CHECKPOINT CREATED: %s.%s (initial checkpoint without resume token)", database, collection)
+			}
+		}
+	}
+
+	if len(documents) == 0 {
+		log.Printf("📋 CHANGE STREAM SYNC: No document changes found for %s.%s", database, collection)
+		// Return error only for real errors, not timeouts
+		if streamErr != nil && !isTimeoutError {
+			return fmt.Errorf("change stream error: %w", streamErr)
+		}
+		return nil
+	}
+
+	// Send changes via HTTP fallback (most reliable for incremental sync)
+	log.Printf("🚀 CHANGE STREAM SYNC: Sending %d changed docs (%s) for %s.%s - inserts:%d, updates:%d, deletes:%d, replaces:%d", 
+		len(documents), formatBytes(totalBytes), database, collection, 
+		operationCounts["insert"], operationCounts["update"], operationCounts["delete"], operationCounts["replace"])
+
+	// FORCE HTTP FALLBACK for incremental sync reliability
+	log.Printf("🌐 INCREMENTAL SYNC: Using HTTP transport for guaranteed delivery")
+	if err := sendIncrementalChangesViaHTTP(database, collection, documents); err != nil {
+		return fmt.Errorf("HTTP incremental sync failed: %w", err)
+	}
+
+	log.Printf("✅ CHANGE STREAM SYNC: Successfully sent %d docs for %s.%s (resume token updated)", len(documents), database, collection)
+	
+	// Return error only for real errors, not timeouts
+	if streamErr != nil && !isTimeoutError {
+		return fmt.Errorf("change stream error: %w", streamErr)
+	}
+	
+	return nil
+}
+
+// sendIncrementalChangesViaHTTP sends incremental changes using HTTP protocol
+func sendIncrementalChangesViaHTTP(database, collection string, documents [][]byte) error {
+	if len(documents) == 0 {
+		return nil
+	}
+
+	// Get vm-sync endpoint
+	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
+	if vmSyncEndpoint == "" {
+		vmSyncEndpoint = "http://localhost:8081"
+	}
+
+	// Convert documents to DataResponse format
+	// Convert [][]byte to []bson.Raw
+	bsonDocs := make([]bson.Raw, len(documents))
+	for i, doc := range documents {
+		bsonDocs[i] = bson.Raw(doc)
+	}
+
+	response := models.DataResponse{
+		Database:   database,
+		Collection: collection,
+		Documents:  bsonDocs,
+		Count:      int64(len(documents)),
+	}
+
+	// Marshal to JSON
+	payload, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal documents: %v", err)
+	}
+
+	// Send HTTP request to vm-sync
+	url := fmt.Sprintf("%s/api/v1/push/%s/%s", vmSyncEndpoint, database, collection)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Sync-Type", "incremental")
+	req.Header.Set("X-Client-ID", "cloud-sync-incremental")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("✅ HTTP INCREMENTAL SYNC: Successfully sent %d documents for %s.%s", len(documents), database, collection)
+	return nil
+}
+
+// pushIncrementalChangesTCP removed - replaced with pure change stream implementation
+// All incremental sync now uses syncCollectionChangesWithChangeStream which relies on
+// MongoDB change streams with resume tokens - NO document modification required
 
 // startCatchUpSync handles catch-up synchronization for reconnected vm-sync clients
 // It skips the WebSocket connection wait since the client is already connected
@@ -2018,16 +2894,61 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 	tcpStartTime := time.Now()
 	log.Printf("🚀 TCP TRANSFER START: %s.%s page %d/%d (batch size: %d)", database, collection, pageNumber, totalPages, pageSize)
 
+	// Get collection configuration for filtering
+	var collConfig *models.CollectionConfig
+	for _, dbConfig := range config.MongoDB.Databases {
+		if dbConfig.Name == database {
+			for i, coll := range dbConfig.Collections {
+				if coll.Name == collection {
+					collConfig = &dbConfig.Collections[i]  // FIXED: Use slice index, not loop variable address
+					break
+				}
+			}
+			break
+		}
+	}
+
 	coll := mongoClient.Database(database).Collection(collection)
 
-	// Calculate skip value
-	skip := (pageNumber - 1) * pageSize
+	// CRITICAL: Apply consistent filtering for initial dump (same as real-time sync)
+	// Build comprehensive filtering pipeline
+	var filterPipeline []bson.M
 
-	// Find documents for this page
-	findOptions := options.Find().SetSkip(int64(skip)).SetLimit(int64(pageSize))
-	cursor, err := coll.Find(ctx, bson.M{}, findOptions)
+	// Apply document filtering first (filter out unwanted documents)
+	if collConfig != nil && len(collConfig.DocumentFilter.Criteria) > 0 {
+		docFilterPipeline := filterEngine.BuildDocumentFilterPipeline(&collConfig.DocumentFilter)
+		filterPipeline = append(filterPipeline, docFilterPipeline...)
+		log.Printf("🔍 INITIAL DUMP FILTER: Applied document filter for %s.%s with %d criteria", database, collection, len(collConfig.DocumentFilter.Criteria))
+	}
+
+	// Apply field filtering (include/exclude specific fields)
+	if collConfig != nil && (len(collConfig.FieldFilter.IncludeFields) > 0 || len(collConfig.FieldFilter.ExcludeFields) > 0) {
+		fieldFilterPipeline := filterEngine.BuildFieldFilterPipeline(&collConfig.FieldFilter)
+		filterPipeline = append(filterPipeline, fieldFilterPipeline...)
+		log.Printf("🔍 INITIAL DUMP FILTER: Applied field filter for %s.%s (include: %v, exclude: %v)", 
+			database, collection, collConfig.FieldFilter.IncludeFields, collConfig.FieldFilter.ExcludeFields)
+	}
+
+	// Add pagination (skip and limit)
+	skip := (pageNumber - 1) * pageSize
+	filterPipeline = append(filterPipeline, bson.M{"$skip": skip})
+	filterPipeline = append(filterPipeline, bson.M{"$limit": pageSize})
+
+	// Execute filtered aggregation pipeline instead of simple find
+	var cursor *mongo.Cursor
+	var err error
+
+	if len(filterPipeline) > 2 { // More than just skip and limit
+		log.Printf("🔍 FILTERED AGGREGATION: %s.%s using %d pipeline stages", database, collection, len(filterPipeline))
+		cursor, err = coll.Aggregate(ctx, filterPipeline)
+	} else {
+		// No filters, use simple find for better performance
+		findOptions := options.Find().SetSkip(int64(skip)).SetLimit(int64(pageSize))
+		cursor, err = coll.Find(ctx, bson.M{}, findOptions)
+	}
+
 	if err != nil {
-		return fmt.Errorf("failed to find documents: %v", err)
+		return fmt.Errorf("failed to query documents with filters: %v", err)
 	}
 	defer cursor.Close(ctx)
 
@@ -2296,21 +3217,66 @@ func markTransferCompleted(clientID, database, collection string, totalDocs int6
 	return transferTracker.UpdateClientSyncState(clientID, database, collection, nil, 0, true)
 }
 
-// pushSinglePageHTTP pushes a single page using HTTP transport (original implementation)
+// pushSinglePageHTTP pushes a single page using HTTP transport with consistent filtering
 func pushSinglePageHTTP(ctx context.Context, vmSyncEndpoint, database, collection string, pageNumber, pageSize, totalPages int) error {
 	// Apply back-pressure throttling if enabled
 	applyBackPressureThrottle()
 
+	// Get collection configuration for filtering
+	var collConfig *models.CollectionConfig
+	for _, dbConfig := range config.MongoDB.Databases {
+		if dbConfig.Name == database {
+			for i, coll := range dbConfig.Collections {
+				if coll.Name == collection {
+					collConfig = &dbConfig.Collections[i]  // FIXED: Use slice index, not loop variable address
+					break
+				}
+			}
+			break
+		}
+	}
+
 	coll := mongoClient.Database(database).Collection(collection)
 
-	// Calculate skip value
-	skip := (pageNumber - 1) * pageSize
+	// CRITICAL: Apply consistent filtering for initial dump (same as real-time sync)
+	// Build comprehensive filtering pipeline
+	var filterPipeline []bson.M
 
-	// Find documents for this page
-	findOptions := options.Find().SetSkip(int64(skip)).SetLimit(int64(pageSize))
-	cursor, err := coll.Find(ctx, bson.M{}, findOptions)
+	// Apply document filtering first (filter out unwanted documents)
+	if collConfig != nil && len(collConfig.DocumentFilter.Criteria) > 0 {
+		docFilterPipeline := filterEngine.BuildDocumentFilterPipeline(&collConfig.DocumentFilter)
+		filterPipeline = append(filterPipeline, docFilterPipeline...)
+		log.Printf("🔍 INITIAL DUMP FILTER: Applied document filter for %s.%s with %d criteria", database, collection, len(collConfig.DocumentFilter.Criteria))
+	}
+
+	// Apply field filtering (include/exclude specific fields)
+	if collConfig != nil && (len(collConfig.FieldFilter.IncludeFields) > 0 || len(collConfig.FieldFilter.ExcludeFields) > 0) {
+		fieldFilterPipeline := filterEngine.BuildFieldFilterPipeline(&collConfig.FieldFilter)
+		filterPipeline = append(filterPipeline, fieldFilterPipeline...)
+		log.Printf("🔍 INITIAL DUMP FILTER: Applied field filter for %s.%s (include: %v, exclude: %v)", 
+			database, collection, collConfig.FieldFilter.IncludeFields, collConfig.FieldFilter.ExcludeFields)
+	}
+
+	// Add pagination (skip and limit)
+	skip := (pageNumber - 1) * pageSize
+	filterPipeline = append(filterPipeline, bson.M{"$skip": skip})
+	filterPipeline = append(filterPipeline, bson.M{"$limit": pageSize})
+
+	// Execute filtered aggregation pipeline instead of simple find
+	var cursor *mongo.Cursor
+	var err error
+
+	if len(filterPipeline) > 2 { // More than just skip and limit
+		log.Printf("🔍 FILTERED AGGREGATION: %s.%s using %d pipeline stages", database, collection, len(filterPipeline))
+		cursor, err = coll.Aggregate(ctx, filterPipeline)
+	} else {
+		// No filters, use simple find for better performance
+		findOptions := options.Find().SetSkip(int64(skip)).SetLimit(int64(pageSize))
+		cursor, err = coll.Find(ctx, bson.M{}, findOptions)
+	}
+
 	if err != nil {
-		return fmt.Errorf("failed to find documents: %v", err)
+		return fmt.Errorf("failed to query documents with filters: %v", err)
 	}
 	defer cursor.Close(ctx)
 
@@ -2522,15 +3488,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Determine client type based on User-Agent or other headers
 	clientType := "unknown"
 	userAgent := r.Header.Get("User-Agent")
-	log.Printf("DEBUG: WebSocket connection - User-Agent: %s", userAgent)
+	log.Printf("🔍 WEBSOCKET DEBUG: New connection - User-Agent: '%s'", userAgent)
 	if strings.Contains(userAgent, "vm-sync") {
 		clientType = "vm-sync"
-		log.Printf("DEBUG: Detected vm-sync client type")
+		log.Printf("🎯 WEBSOCKET DEBUG: Detected vm-sync client type based on User-Agent")
 	} else if strings.Contains(r.Header.Get("Referer"), "/dashboard") || strings.Contains(userAgent, "Mozilla") {
 		clientType = "dashboard"
-		log.Printf("DEBUG: Detected dashboard client type")
+		log.Printf("🎯 WEBSOCKET DEBUG: Detected dashboard client type")
 	} else {
-		log.Printf("DEBUG: Unknown client type, User-Agent: %s", userAgent)
+		log.Printf("⚠️ WEBSOCKET DEBUG: Unknown client type, User-Agent: '%s'", userAgent)
 	}
 
 	clientInfo := ClientInfo{
@@ -4107,8 +5073,28 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 			}
 
 			if fullDocument, ok := changeDoc["fullDocument"]; ok {
-				if docData, err := bson.Marshal(fullDocument); err == nil {
-					event.FullDocument = bson.Raw(docData)
+				// CRITICAL: Apply consistent field filtering for real-time sync
+				// This ensures real-time changes have the same field filtering as initial dump
+				if fullDocMap, ok := fullDocument.(bson.M); ok {
+					// Apply field filtering using the same engine as initial dump
+					if len(collConfig.FieldFilter.IncludeFields) > 0 || len(collConfig.FieldFilter.ExcludeFields) > 0 {
+						filteredDoc := filterEngine.ApplyFieldFilter(fullDocMap, &collConfig.FieldFilter)
+						log.Printf("🔍 REAL-TIME FILTER: Applied field filter to %s.%s change event (include: %v, exclude: %v)", 
+							dbName, collName, collConfig.FieldFilter.IncludeFields, collConfig.FieldFilter.ExcludeFields)
+						if docData, err := bson.Marshal(filteredDoc); err == nil {
+							event.FullDocument = bson.Raw(docData)
+						}
+					} else {
+						// No field filtering configured, preserve original document
+						if docData, err := bson.Marshal(fullDocument); err == nil {
+							event.FullDocument = bson.Raw(docData)
+						}
+					}
+				} else {
+					// Unable to convert to bson.M, preserve as-is
+					if docData, err := bson.Marshal(fullDocument); err == nil {
+						event.FullDocument = bson.Raw(docData)
+					}
 				}
 			}
 
@@ -5127,7 +6113,7 @@ var (
 	currentSyncError       string
 	collectionSyncStatuses = make(map[string]*CollectionSyncInfo)
 	syncStatusMutex        sync.RWMutex
-	forceInitialSync       = true  // Flag to force initial sync regardless of existing state
+	forceInitialSync       = true // Flag to force initial sync regardless of existing state
 )
 
 // handleTriggerInitialSync handles manual triggering of initial data sync
@@ -6102,4 +7088,134 @@ func generateRecommendations(stats map[string]interface{}) []string {
 	}
 
 	return recommendations
+}
+
+// handleInitialSync triggers a full database replacement sync
+func handleInitialSync(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse request body for optional parameters
+	type InitialSyncRequest struct {
+		ClientID string `json:"client_id"` // Optional: specific client to sync to
+		Force    bool   `json:"force"`     // Force sync even if already in progress
+	}
+
+	var req InitialSyncRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			// Ignore decode errors - request body is optional
+			log.Printf("Initial sync request body decode error (ignoring): %v", err)
+		}
+	}
+
+	log.Printf("🚀 INITIAL SYNC API: Triggered via API endpoint")
+	if req.ClientID != "" {
+		log.Printf("🎯 INITIAL SYNC: Target client specified: %s", req.ClientID)
+	}
+
+	// Check if we have any connected VM clients
+	clientsMutex.RLock()
+	log.Printf("🔍 DEBUG INITIAL SYNC: Checking for vm-sync clients. Total clients: %d", len(clients))
+	targetClients := make([]*websocket.Conn, 0)
+	for client, clientInfo := range clients {
+		log.Printf("🔍 DEBUG INITIAL SYNC: Client - Type: '%s', ID: '%s', ConnectedAt: %v", clientInfo.ClientType, clientInfo.ClientID, clientInfo.ConnectedAt)
+		if clientInfo.ClientType == "vm-sync" {
+			// If specific client requested, filter by ClientID
+			if req.ClientID == "" || clientInfo.ClientID == req.ClientID {
+				targetClients = append(targetClients, client)
+				log.Printf("🎯 DEBUG INITIAL SYNC: Added vm-sync client %s to target list", clientInfo.ClientID)
+			}
+		} else {
+			log.Printf("🔍 DEBUG INITIAL SYNC: Skipping non-vm-sync client: Type='%s', ID='%s'", clientInfo.ClientType, clientInfo.ClientID)
+		}
+	}
+	clientsMutex.RUnlock()
+	log.Printf("🔍 DEBUG INITIAL SYNC: Found %d target vm-sync clients out of %d total", len(targetClients), len(clients))
+
+	if len(targetClients) == 0 {
+		if req.ClientID != "" {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "vm_client_not_found",
+				"message": fmt.Sprintf("VM client '%s' not connected", req.ClientID),
+			})
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "no_vm_clients",
+				"message": "No VM clients connected for initial sync",
+			})
+		}
+		return
+	}
+
+	// Trigger initial sync by doing a complete database replacement
+	syncsTriggered := 0
+	failedSyncs := make([]string, 0)
+
+	for _, client := range targetClients {
+		// Get client info
+		clientsMutex.RLock()
+		clientInfo, exists := clients[client]
+		clientsMutex.RUnlock()
+
+		if !exists {
+			continue
+		}
+
+		log.Printf("🔄 INITIAL SYNC: Starting full database replacement for client %s", clientInfo.ClientID)
+
+		// Create initial sync message that triggers full database replacement
+		syncMessage := map[string]interface{}{
+			"type":       "initial_sync_trigger",
+			"action":     "replace_database",
+			"client_id":  clientInfo.ClientID,
+			"timestamp": time.Now().Format(time.RFC3339),
+			"message":    "API triggered full database replacement",
+			"force":      req.Force,
+		}
+
+		// Send sync trigger message to VM client
+		client.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := client.WriteJSON(syncMessage); err != nil {
+			log.Printf("❌ INITIAL SYNC: Failed to send trigger to client %s: %v", clientInfo.ClientID, err)
+			failedSyncs = append(failedSyncs, clientInfo.ClientID)
+			continue
+		}
+
+		syncsTriggered++
+		log.Printf("✅ INITIAL SYNC: Trigger sent to client %s", clientInfo.ClientID)
+	}
+
+	// Return response
+	if syncsTriggered > 0 {
+		response := map[string]interface{}{
+			"success":          true,
+			"message":          "Initial sync triggered successfully",
+			"syncs_triggered":  syncsTriggered,
+			"total_targets":    len(targetClients),
+			"timestamp":        time.Now().Format(time.RFC3339),
+			"sync_type":        "full_database_replacement",
+		}
+
+		if len(failedSyncs) > 0 {
+			response["failed_clients"] = failedSyncs
+			response["partial_success"] = true
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+
+		log.Printf("🎉 INITIAL SYNC API: Successfully triggered %d syncs (failed: %d)", syncsTriggered, len(failedSyncs))
+	} else {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":       false,
+			"error":         "all_syncs_failed",
+			"message":       "Failed to trigger sync on all target clients",
+			"failed_clients": failedSyncs,
+		})
+	}
 }

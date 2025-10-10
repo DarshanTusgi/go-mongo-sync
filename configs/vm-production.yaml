@@ -1,0 +1,98 @@
+# Test VM-sync configuration for initial dump testing
+cloud_sync:
+  http_url: "http://localhost:8080"
+  ws_url: "ws://localhost:8080/ws"
+  http_timeout: "600s"
+  
+  # OAuth2 authentication - using generated credentials
+  oauth2:
+    enabled: true
+    client_id: "vm_sync_c9bf87e373213c1e"
+    client_secret: "54c1493d9595b1f5d20bb7afc0c61e0019b929a2b62d86a236c564b1d7f6ef19"
+    token_url: "http://localhost:8080/api/auth/token"
+
+mongodb:
+  uri: "mongodb://localhost:27017/?retryWrites=true&w=majority"
+  timeout: 30s
+
+# Collections to sync - using same database name on target for testing
+collections:
+  - "real_transfer_test.products:real_transfer_test.products"
+  - "real_transfer_test.customers:real_transfer_test.customers"
+  - "real_transfer_test.orders:real_transfer_test.orders"
+  - "real_transfer_test.inventory:real_transfer_test.inventory"
+
+sync:
+  initial_sync: true
+  realtime_sync: false  # Disabled in favor of scheduler-based sync
+  scheduler_sync: true  # Enable scheduler-based sync to receive incremental updates
+  scheduler_interval: "5m"  # Should match cloud-sync interval
+  resumable_initial_sync: true
+  batch_size: 100
+  parallel_collections: true
+  max_workers: 4
+  retry_attempts: 3
+  retry_delay: "5s"
+  
+  # TCP Transport Configuration - THIS IS THE KEY
+  transport:
+    mode: "tcp"  # Use TCP for initial dumps
+    http_fallback: true  # Accept fallback if needed
+    compression_type: "zstd"
+    tcp_receiver:
+      listen_addr: "0.0.0.0:9000"  # Listen on port 9000
+      max_connections: 20           # Increased from 10 for better concurrency
+      read_timeout: 200s            # Increased to 200s for ultra-stability
+      write_timeout: 120s           # Increased to 120s for large transfers
+      buffer_size: 1048576          # Increased to 1MB for large data
+      disk_checkpoint: true
+      checkpoint_dir: "/tmp/vm-sync-tcp-checkpoints"
+      heartbeat_interval: 90s       # Increased to 90s for stability
+      max_batch_size: 67108864      # Increased to 64MB for efficiency
+      tls_enabled: false
+
+# Encryption configuration
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  key_id: "cloud-sync-key-001"
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"
+
+# Checkpoint configuration
+checkpoint:
+  enabled: true
+  database: "vm_sync_checkpoints"
+  collection: "client_resume_tokens"
+  save_interval_seconds: 3
+  cleanup_enabled: true
+  retention_days: 7
+
+# Watermarks configuration
+watermarks:
+  enabled: false  # Disabled for testing
+
+# Sequence configuration
+sequence:
+  enabled: true
+  database: "vm_sync_sequences"
+  collection: "sequence_counters"
+  batch_size: 500
+  node_id: "vm-sync-test-001"
+
+# Cluster time fence
+fence:
+  enabled: true
+
+# Logging
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  include_timestamps: true
+
+# Performance tuning
+performance:
+  buffer_size: 10000
+  flush_interval: "500ms"
+  max_batch_wait: "5s"
+  compression_enabled: true

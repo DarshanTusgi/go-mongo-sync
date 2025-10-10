@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -223,61 +224,150 @@ func (sc *senderConnection) flushFrameBatch(frames []*Frame) {
 	}
 }
 
-// readLoopOptimized handles reading ACKs with billion-document optimizations
+// readLoopOptimized handles reading ACKs with ultra-stable production architecture
 func (sc *senderConnection) readLoopOptimized() {
 	defer sc.sender.wg.Done()
 
-	// OPTIMIZED: Larger buffer for high-throughput reads
-	buf := make([]byte, sc.sender.config.BufferSize*2) // Double the configured buffer size
+	// ULTRA-STABLE: Enhanced buffer and comprehensive error tracking
+	buf := make([]byte, sc.sender.config.BufferSize*3) // Triple buffer size for stability
 	headerBuf := make([]byte, FrameHeaderSize)
+	var consecutiveErrors, timeoutCount, ioErrors int
+	var lastActivity = time.Now()
+	maxConsecutiveErrors, maxTimeoutErrors, maxIOErrors := 20, 15, 8 // Increased thresholds
+	baseTimeout := sc.sender.config.ConnTimeout
+	maxIdleTime := 10 * time.Minute // Extended idle timeout
+
+	log.Printf("🚀 TCP SENDER READ LOOP: connection %d started (ultra-stable)", sc.id)
 
 	for {
 		select {
 		case <-sc.ctx.Done():
+			log.Printf("📋 TCP SENDER SHUTDOWN: connection %d", sc.id)
 			return
 		default:
-			// Set read timeout
-			sc.conn.SetReadDeadline(time.Now().Add(sc.sender.config.ConnTimeout))
+			// ULTRA-STABLE: Check idle timeout with extended grace period
+			if time.Since(lastActivity) > maxIdleTime {
+				log.Printf("⏰ TCP SENDER IDLE: connection %d (idle %v)", sc.id, time.Since(lastActivity))
+				sc.sender.handleConnectionError(sc, fmt.Errorf("connection idle timeout"))
+				return
+			}
 
-			// Read header
-			_, err := sc.conn.Read(headerBuf)
+			// ULTRA-STABLE: Intelligent timeout adaptation
+			readTimeout := baseTimeout
+			if consecutiveErrors > 0 {
+				// Adaptive timeout: base * (1 + errors * 0.25)
+				backoffMultiplier := 1.0 + float64(consecutiveErrors)*0.25
+				readTimeout = time.Duration(float64(baseTimeout) * backoffMultiplier)
+				if readTimeout > 200*time.Second {
+					readTimeout = 200 * time.Second // Cap at 200 seconds
+				}
+			}
+
+			// Set read timeout with safety margin
+			sc.conn.SetReadDeadline(time.Now().Add(readTimeout))
+
+			// ULTRA-STABLE: Header read with comprehensive error classification
+			n, err := sc.conn.Read(headerBuf)
 			if err != nil {
-				sc.sender.stats.errorCount.Add(1)
+				// Handle timeout errors with progressive backoff
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					timeoutCount++
+					consecutiveErrors++
+					if timeoutCount >= maxTimeoutErrors || consecutiveErrors >= maxConsecutiveErrors {
+						log.Printf("🔴 TCP SENDER ERROR LIMIT: connection %d (timeouts: %d, errors: %d)", sc.id, timeoutCount, consecutiveErrors)
+						sc.sender.handleConnectionError(sc, fmt.Errorf("too many errors: timeouts=%d, total=%d", timeoutCount, consecutiveErrors))
+						return
+					}
+					// Progressive exponential backoff with randomization
+					backoffBase := time.Duration(200*consecutiveErrors*consecutiveErrors) * time.Millisecond
+					if backoffBase > 8*time.Second {
+						backoffBase = 8 * time.Second
+					}
+					log.Printf("⏱️ TCP SENDER TIMEOUT: connection %d (attempt %d/%d, backoff %v)", sc.id, timeoutCount, maxTimeoutErrors, backoffBase)
+					time.Sleep(backoffBase)
+					continue
+				}
+
+				// Handle EOF and I/O errors
+				if err == io.EOF {
+					log.Printf("📋 TCP SENDER EOF: connection %d", sc.id)
+				} else {
+					ioErrors++
+					consecutiveErrors++
+					if ioErrors >= maxIOErrors {
+						log.Printf("🔴 TCP SENDER IO LIMIT: connection %d (%d io errors)", sc.id, ioErrors)
+					}
+					log.Printf("🔴 TCP SENDER READ ERROR: connection %d: %v", sc.id, err)
+				}
+				sc.sender.handleConnectionError(sc, err)
+				return
+			}
+
+			// ULTRA-STABLE: Reset all error counters on successful read
+			consecutiveErrors = 0
+			timeoutCount = 0
+			ioErrors = 0
+			lastActivity = time.Now()
+
+			// ULTRA-STABLE: Validate header size
+			if n != FrameHeaderSize {
+				log.Printf("⚠️ TCP SENDER INVALID HEADER: connection %d (got %d bytes)", sc.id, n)
 				continue
 			}
 
+			// ULTRA-STABLE: Decode and validate header
 			header, err := DecodeHeader(headerBuf)
 			if err != nil {
+				log.Printf("🔴 TCP SENDER DECODE ERROR: connection %d: %v", sc.id, err)
 				sc.sender.stats.errorCount.Add(1)
 				continue
 			}
-
 			if err := header.Validate(); err != nil {
+				log.Printf("🔴 TCP SENDER VALIDATION ERROR: connection %d: %v", sc.id, err)
 				sc.sender.stats.errorCount.Add(1)
 				continue
 			}
 
-			// Read payload if present
+			// ULTRA-STABLE: Handle payload with comprehensive validation
 			payloadSize := header.PayloadSize()
 			var payload []byte
 			if payloadSize > 0 {
-				if payloadSize > uint32(len(buf)) {
-					buf = make([]byte, payloadSize)
-				}
-				payload = buf[:payloadSize]
-				_, err = sc.conn.Read(payload)
-				if err != nil {
+				if payloadSize > uint32(sc.sender.config.MaxBatchSize) {
+					log.Printf("🔴 TCP SENDER PAYLOAD TOO LARGE: connection %d (%d bytes)", sc.id, payloadSize)
 					sc.sender.stats.errorCount.Add(1)
 					continue
 				}
+				if payloadSize > uint32(len(buf)) {
+					log.Printf("📦 TCP SENDER BUFFER RESIZE: connection %d (to %d bytes)", sc.id, payloadSize)
+					buf = make([]byte, payloadSize*2)
+				}
+				payload = buf[:payloadSize]
+
+				// ULTRA-STABLE: Complete payload read with timeout handling
+				sc.conn.SetReadDeadline(time.Now().Add(readTimeout))
+				bytesRead := 0
+				for bytesRead < int(payloadSize) {
+					n, err := sc.conn.Read(payload[bytesRead:])
+					if err != nil {
+						log.Printf("🔴 TCP SENDER PAYLOAD READ ERROR: connection %d: %v", sc.id, err)
+						sc.sender.handleConnectionError(sc, err)
+						return
+					}
+					bytesRead += n
+				}
+				lastActivity = time.Now()
 			}
 
-			// Handle different message types
+			// ULTRA-STABLE: Handle message types with enhanced error resilience
 			switch header.MsgType {
 			case MsgTypeAck:
 				sc.handleAckOptimized(payload)
 			case MsgTypeResumeResponse:
 				sc.handleResumeResponse(payload)
+			case MsgTypeHeartbeat:
+				lastActivity = time.Now()
+			default:
+				log.Printf("⚠️ TCP SENDER UNKNOWN MESSAGE: connection %d (type %d)", sc.id, header.MsgType)
 			}
 		}
 	}
@@ -404,16 +494,16 @@ func (s *tcpSender) sendStandardBatch(stream string, batch [][]byte, async bool,
 	// Format: [stream_name_length:4][stream_name][bson_documents]
 	streamNameBytes := []byte(stream)
 	streamNameLength := uint32(len(streamNameBytes))
-	
+
 	// Create payload with stream name prefix
 	lengthBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lengthBytes, streamNameLength)
-	
+
 	finalPayload := make([]byte, 0, 4+len(streamNameBytes)+len(payload))
 	finalPayload = append(finalPayload, lengthBytes...)
 	finalPayload = append(finalPayload, streamNameBytes...)
 	finalPayload = append(finalPayload, payload...)
-	
+
 	payload = finalPayload
 
 	// Check batch size limit
@@ -628,6 +718,18 @@ func (s *tcpSender) Resume(stream string, fromSeq uint64) error {
 
 	// All connections failed
 	return fmt.Errorf("all connections failed during resume: %v", errors)
+}
+
+// handleConnectionError handles connection-specific errors with proper logging
+func (s *tcpSender) handleConnectionError(conn *senderConnection, err error) {
+	log.Printf("🔴 TCP CONNECTION ERROR: connection %d: %v", conn.id, err)
+	s.stats.errorCount.Add(1)
+
+	// Cancel the connection context to trigger cleanup
+	conn.cancel()
+
+	// Log for monitoring and debugging
+	log.Printf("🔧 TCP CONNECTION CLEANUP: connection %d initiated", conn.id)
 }
 
 // ResumeWithRetry implements automatic retry logic for resume operations

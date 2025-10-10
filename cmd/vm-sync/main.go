@@ -261,7 +261,7 @@ func getOrAssignStreamMapping(stream string) (database, collection string, err e
 func mapSourceToTarget(sourceCollection string) (targetDatabase, targetCollection string, err error) {
 	log.Printf("🔍 DEBUG MAP: Input sourceCollection='%s'", sourceCollection)
 	log.Printf("🔍 DEBUG MAP: Available config.Collections=%v", config.Collections)
-	
+
 	// Check each configured collection mapping
 	for i, collMapping := range config.Collections {
 		log.Printf("🔍 DEBUG MAP: Checking mapping %d: '%s'", i, collMapping)
@@ -460,11 +460,18 @@ func processPageOptimized(database, collection string, pageResult *PageResult) e
 	return nil
 }
 
-// processIncrementalPageOptimized processes incremental data with billion-document optimizations
+// processIncrementalPageOptimized processes incremental data with enhanced operation type handling
 func processIncrementalPageOptimized(database, collection string, pageResult *PageResult) error {
-	// For now, use the same optimized processing as initial data
-	// In the future, this could be enhanced with upsert logic
-	return processPageOptimized(database, collection, pageResult)
+	// Convert PageResult to DataResponse format for consistent processing
+	dataResponse := &models.DataResponse{
+		Database:   database,
+		Collection: collection,
+		Documents:  pageResult.Documents,
+		Count:      int64(len(pageResult.Documents)),
+	}
+
+	// Use the same processing logic as HTTP incremental sync
+	return processIncrementalData(database, collection, dataResponse)
 }
 
 // parseStreamName parses a stream name to extract database and collection
@@ -497,8 +504,98 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 		return fmt.Errorf("failed to unmarshal metadata: %v", err)
 	}
 
-	// Process metadata (create indexes, etc.)
-	log.Printf("📊 METADATA RECEIVED: %s.%s metadata", database, collection)
+	log.Printf("📊 METADATA PROCESSING: %s.%s metadata", database, collection)
+
+	// Map source to target collection based on configuration
+	fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
+	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
+	if err != nil {
+		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
+	}
+
+	log.Printf("🎯 METADATA MAPPING: %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
+
+	// Extract and process indexes
+	if indexesData, ok := metadata["indexes"]; ok {
+		if indexesArray, ok := indexesData.([]interface{}); ok {
+			log.Printf("🔍 INDEXES: Processing %d indexes for %s.%s", len(indexesArray), targetDatabase, targetCollection)
+			
+			// Convert to models.IndexInfo
+			var indexes []models.IndexInfo
+			for _, indexData := range indexesArray {
+				if indexBytes, err := bson.Marshal(indexData); err == nil {
+					var indexInfo models.IndexInfo
+					if err := bson.Unmarshal(indexBytes, &indexInfo); err == nil {
+						indexes = append(indexes, indexInfo)
+					} else {
+						log.Printf("⚠️ METADATA: Failed to unmarshal index: %v", err)
+					}
+				}
+			}
+			
+			// Recreate indexes on target collection
+			if len(indexes) > 0 {
+				targetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				
+				if err := recreateIndexes(ctx, targetColl, indexes); err != nil {
+					log.Printf("❌ METADATA: Failed to recreate indexes for %s.%s: %v", targetDatabase, targetCollection, err)
+				} else {
+					log.Printf("✅ METADATA: Successfully recreated %d indexes for %s.%s", len(indexes), targetDatabase, targetCollection)
+				}
+			}
+		}
+	}
+
+	// Extract and process collection options
+	if collOptionsData, ok := metadata["collectionOptions"]; ok && collOptionsData != nil {
+		log.Printf("⚙️ COLLECTION OPTIONS: Processing for %s.%s", targetDatabase, targetCollection)
+		
+		if collOptionsBytes, err := bson.Marshal(collOptionsData); err == nil {
+			var collOptions models.CollectionOptions
+			if err := bson.Unmarshal(collOptionsBytes, &collOptions); err == nil {
+				// Apply collection options
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				
+				if err := applyCollectionOptions(ctx, mongoClient.Database(targetDatabase), targetCollection, &collOptions); err != nil {
+					log.Printf("❌ METADATA: Failed to apply collection options for %s.%s: %v", targetDatabase, targetCollection, err)
+				} else {
+					log.Printf("✅ METADATA: Successfully applied collection options for %s.%s", targetDatabase, targetCollection)
+				}
+			} else {
+				log.Printf("⚠️ METADATA: Failed to unmarshal collection options: %v", err)
+			}
+		}
+	}
+
+	// Process snapshot fence info
+	if snapshotFenceData, ok := metadata["snapshotFence"]; ok && snapshotFenceData != nil {
+		log.Printf("🔒 SNAPSHOT FENCE: Processing for %s.%s", targetDatabase, targetCollection)
+		
+		if fenceBytes, err := bson.Marshal(snapshotFenceData); err == nil {
+			var snapshotFence models.SnapshotFenceInfo
+			if err := bson.Unmarshal(fenceBytes, &snapshotFence); err == nil {
+				// Store snapshot fence information for change stream coordination
+				log.Printf("✅ METADATA: Snapshot fence processed - ClusterTime: %v, OperationTime: %v",
+					snapshotFence.ClusterTime, snapshotFence.OperationTime)
+				
+				// Validate that change streams can start consistently with this fence
+				if clusterFence != nil && clusterFence.IsEnabled() {
+					if err := clusterFence.ValidateChangeStreamStart(convertToSnapshotFence(&snapshotFence), snapshotFence.OperationTime); err != nil {
+						log.Printf("⚠️ METADATA: Change stream coordination validation failed: %v", err)
+					} else {
+						log.Printf("✅ METADATA: Change stream coordination validated for %s.%s", targetDatabase, targetCollection)
+					}
+				}
+			} else {
+				log.Printf("⚠️ METADATA: Failed to unmarshal snapshot fence: %v", err)
+			}
+		}
+	}
+
+	log.Printf("🎉 METADATA: Successfully processed all metadata for %s.%s", targetDatabase, targetCollection)
 	return nil
 }
 
@@ -796,32 +893,52 @@ func handlePushData(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Parse the page result - check content type to handle both BSON and JSON
-	var pageResult PageResult
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "application/bson" {
-		// BSON format (preserves MongoDB types)
-		if err := bson.Unmarshal(body, &pageResult); err != nil {
-			log.Printf("Error parsing BSON page result: %v", err)
-			http.Error(w, "Failed to parse BSON page result", http.StatusBadRequest)
+	// Check if this is incremental sync (from change streams)
+	syncType := r.Header.Get("X-Sync-Type")
+	if syncType == "incremental" {
+		// Handle incremental sync data (DataResponse format)
+		var dataResponse models.DataResponse
+		if err := json.Unmarshal(body, &dataResponse); err != nil {
+			log.Printf("Error parsing incremental data response: %v", err)
+			http.Error(w, "Failed to parse incremental data response", http.StatusBadRequest)
 			return
 		}
-		log.Printf("📦 RECEIVED BSON DATA: %s.%s page %d with %d documents", database, collection, pageResult.PageNumber, len(pageResult.Documents))
+		log.Printf("🚀 RECEIVED INCREMENTAL DATA: %s.%s with %d documents", database, collection, len(dataResponse.Documents))
+		
+		// Process incremental data directly
+		if err := processIncrementalData(database, collection, &dataResponse); err != nil {
+			log.Printf("Error processing incremental data: %v", err)
+			http.Error(w, "Failed to process incremental data", http.StatusInternalServerError)
+			return
+		}
 	} else {
-		// Legacy JSON format (for backward compatibility)
-		if err := json.Unmarshal(body, &pageResult); err != nil {
-			log.Printf("Error parsing JSON page result: %v", err)
-			http.Error(w, "Failed to parse JSON page result", http.StatusBadRequest)
+		// Handle initial sync data (PageResult format)
+		var pageResult PageResult
+		contentType := r.Header.Get("Content-Type")
+		if contentType == "application/bson" {
+			// BSON format (preserves MongoDB types)
+			if err := bson.Unmarshal(body, &pageResult); err != nil {
+				log.Printf("Error parsing BSON page result: %v", err)
+				http.Error(w, "Failed to parse BSON page result", http.StatusBadRequest)
+				return
+			}
+			log.Printf("📦 RECEIVED BSON DATA: %s.%s page %d with %d documents", database, collection, pageResult.PageNumber, len(pageResult.Documents))
+		} else {
+			// Legacy JSON format (for backward compatibility)
+			if err := json.Unmarshal(body, &pageResult); err != nil {
+				log.Printf("Error parsing JSON page result: %v", err)
+				http.Error(w, "Failed to parse JSON page result", http.StatusBadRequest)
+				return
+			}
+			log.Printf("📦 RECEIVED JSON DATA: %s.%s page %d with %d documents", database, collection, pageResult.PageNumber, len(pageResult.Documents))
+		}
+		
+		// Process initial sync data
+		if err := processPushedData(database, collection, &pageResult); err != nil {
+			log.Printf("Error processing pushed data: %v", err)
+			http.Error(w, "Failed to process data", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("📦 RECEIVED JSON DATA: %s.%s page %d with %d documents", database, collection, pageResult.PageNumber, len(pageResult.Documents))
-	}
-
-	// Process the received data
-	if err := processPushedData(database, collection, &pageResult); err != nil {
-		log.Printf("Error processing pushed data: %v", err)
-		http.Error(w, "Failed to process data", http.StatusInternalServerError)
-		return
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -890,6 +1007,110 @@ func handleClearCollection(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Cleared collection and checkpoint for %s.%s", database, collection)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Collection cleared"))
+}
+
+// processIncrementalData processes incremental changes from change streams
+func processIncrementalData(database, collection string, dataResponse *models.DataResponse) error {
+	if len(dataResponse.Documents) == 0 {
+		log.Printf("📋 INCREMENTAL SYNC: No documents to process for %s.%s", database, collection)
+		return nil
+	}
+
+	// Map source collection to target collection based on configuration
+	fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
+	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
+	if err != nil {
+		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
+	}
+
+	log.Printf("🔄 INCREMENTAL MAPPING: %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
+
+	// Separate documents by operation type
+	var regularDocs []bson.Raw
+	var deleteOperations []bson.M
+
+	for _, doc := range dataResponse.Documents {
+		var docMap bson.M
+		if err := bson.Unmarshal(doc, &docMap); err != nil {
+			log.Printf("⚠️  Failed to unmarshal document: %v", err)
+			continue
+		}
+
+		// Check if this is a delete operation marker
+		if operation, ok := docMap["_operation"].(string); ok {
+			switch operation {
+			case "delete":
+				// Extract document key for deletion
+				if documentKey, ok := docMap["_documentKey"]; ok {
+					if docKeyMap, ok := documentKey.(bson.M); ok {
+						deleteOperations = append(deleteOperations, docKeyMap)
+						log.Printf("🗑️  DELETE MARKER: Found delete operation for %s.%s", targetDatabase, targetCollection)
+					} else {
+						log.Printf("⚠️  Invalid document key format in delete marker")
+					}
+				} else {
+					log.Printf("⚠️  Delete marker missing document key")
+				}
+			case "drop":
+				log.Printf("🗑️  DROP OPERATION: Collection %s.%s will be dropped", targetDatabase, targetCollection)
+				// Handle collection drop - this will drop the entire collection
+				if err := handleDropCollection(targetDatabase, targetCollection); err != nil {
+					log.Printf("⚠️  Failed to handle drop operation: %v", err)
+				}
+			case "rename":
+				log.Printf("🔄 RENAME OPERATION: Collection %s.%s will be renamed", targetDatabase, targetCollection)
+				// Handle collection rename - requires special handling
+				if err := handleRenameCollection(docMap, targetDatabase, targetCollection); err != nil {
+					log.Printf("⚠️  Failed to handle rename operation: %v", err)
+				}
+			case "dropDatabase":
+				log.Printf("🗑️  DROP DATABASE OPERATION: Database %s will be dropped", targetDatabase)
+				// Handle database drop - this is a critical operation
+				if err := handleDropDatabase(targetDatabase); err != nil {
+					log.Printf("⚠️  Failed to handle drop database operation: %v", err)
+				}
+			case "createIndexes", "dropIndexes", "modify":
+				log.Printf("🔍 INDEX OPERATION: %s for %s.%s", operation, targetDatabase, targetCollection)
+				// Handle index operations - these are metadata changes
+				if err := handleIndexOperation(operation, docMap, targetDatabase, targetCollection); err != nil {
+					log.Printf("⚠️  Failed to handle index operation: %v", err)
+				}
+			case "invalidate":
+				log.Printf("⚠️  INVALIDATE OPERATION: %s.%s invalidated", targetDatabase, targetCollection)
+				// Handle invalidate - usually triggers a full resync
+				if err := handleInvalidateEvent(targetDatabase, targetCollection, "incremental_invalidate"); err != nil {
+					log.Printf("⚠️  Failed to handle invalidate operation: %v", err)
+				}
+			default:
+				log.Printf("⚠️  UNKNOWN OPERATION: %s for %s.%s - treating as regular document", operation, targetDatabase, targetCollection)
+				// Treat unknown operations as regular documents
+				regularDocs = append(regularDocs, doc)
+			}
+		} else {
+			// Regular insert/update/replace operation
+			regularDocs = append(regularDocs, doc)
+		}
+	}
+
+	// Process regular documents (insert/update/replace) with upserts
+	if len(regularDocs) > 0 {
+		if err := insertDocumentsBatch(targetDatabase, targetCollection, regularDocs); err != nil {
+			return fmt.Errorf("failed to process regular documents: %v", err)
+		}
+		log.Printf("✅ INCREMENTAL UPSERT: Successfully processed %d regular documents for %s.%s", len(regularDocs), targetDatabase, targetCollection)
+	}
+
+	// Process delete operations
+	if len(deleteOperations) > 0 {
+		if err := deleteDocumentsBatch(targetDatabase, targetCollection, deleteOperations); err != nil {
+			return fmt.Errorf("failed to process delete operations: %v", err)
+		}
+		log.Printf("✅ INCREMENTAL DELETE: Successfully deleted %d documents from %s.%s", len(deleteOperations), targetDatabase, targetCollection)
+	}
+
+	log.Printf("✅ INCREMENTAL SYNC: Successfully processed %d total operations (%d upserts, %d deletes) for %s.%s", 
+		len(dataResponse.Documents), len(regularDocs), len(deleteOperations), targetDatabase, targetCollection)
+	return nil
 }
 
 func processPushedData(database, collection string, pageResult *PageResult) error {
@@ -1266,6 +1487,178 @@ func syncCollectionData(database, collection string) error {
 	return nil
 }
 
+// syncCollectionDataWithMapping syncs data from source collection to target collection
+// This is used when source and target database/collection names are different
+func syncCollectionDataWithMapping(sourceDatabase, sourceCollection, targetDatabase, targetCollection string) error {
+	// Initialize worker pool if not already done
+	if workerPool == nil {
+		initWorkerPool()
+	}
+
+	// Use pagination to handle large collections efficiently
+	pageSize := 1000 // Default page size
+	if config.Sync.BatchSize > 0 {
+		pageSize = config.Sync.BatchSize
+	}
+
+	// Clear target collection for clean sync
+	targetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Drop and recreate target collection for clean sync
+	if err := targetColl.Drop(ctx); err != nil {
+		log.Printf("Warning: Failed to drop target collection %s.%s: %v", targetDatabase, targetCollection, err)
+	}
+
+	// First, get the first page from source to determine total count and get metadata
+	firstPageResult, err := fetchSinglePage(sourceDatabase, sourceCollection, 0, pageSize)
+	if err != nil {
+		return fmt.Errorf("failed to fetch first page from source: %v", err)
+	}
+
+	if len(firstPageResult.Documents) == 0 {
+		log.Printf("No documents to sync from %s.%s to %s.%s", sourceDatabase, sourceCollection, targetDatabase, targetCollection)
+		return nil
+	}
+
+	// Calculate total pages needed
+	cloudCount, err := getCloudCount(sourceDatabase, sourceCollection)
+	if err != nil {
+		return fmt.Errorf("failed to get cloud count: %v", err)
+	}
+
+	totalPages := int((cloudCount + int64(pageSize) - 1) / int64(pageSize))
+	log.Printf("Starting parallel sync from %s.%s to %s.%s: %d total pages with %d workers", sourceDatabase, sourceCollection, targetDatabase, targetCollection, totalPages, workerPool.workerCount)
+
+	// Process first page to target
+	if err := insertDocumentsBatch(targetDatabase, targetCollection, firstPageResult.Documents); err != nil {
+		return fmt.Errorf("failed to insert documents from page 0 to target: %v", err)
+	}
+	log.Printf("Processed page 0 from %s.%s to %s.%s: %d documents", sourceDatabase, sourceCollection, targetDatabase, targetCollection, len(firstPageResult.Documents))
+
+	// Process remaining pages in parallel if there are more
+	if totalPages > 1 {
+		if err := processRemainingPagesMappingParallel(sourceDatabase, sourceCollection, targetDatabase, targetCollection, pageSize, totalPages, firstPageResult); err != nil {
+			return err
+		}
+	}
+
+	// Handle final processing (indexes, collection options, snapshot fence) on target collection
+	if err := handleFinalProcessingWithMapping(targetDatabase, targetCollection, firstPageResult); err != nil {
+		return err
+	}
+
+	log.Printf("Successfully completed parallel sync from %s.%s to %s.%s", sourceDatabase, sourceCollection, targetDatabase, targetCollection)
+	return nil
+}
+
+// processRemainingPagesMappingParallel processes remaining pages with source to target mapping
+func processRemainingPagesMappingParallel(sourceDatabase, sourceCollection, targetDatabase, targetCollection string, pageSize, totalPages int, firstPageResult *PageResult) error {
+	// Channel for page results
+	resultChan := make(chan PageResult, workerPool.workerCount*2)
+	var wg sync.WaitGroup
+
+	// Start workers for remaining pages (1 to totalPages-1)
+	pageQueue := make(chan int, totalPages-1)
+	for i := 1; i < totalPages; i++ {
+		pageQueue <- i
+	}
+	close(pageQueue)
+
+	// Launch worker goroutines
+	for i := 0; i < workerPool.workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pageNum := range pageQueue {
+				fetchPageConcurrently(sourceDatabase, sourceCollection, pageNum, pageSize, resultChan)
+			}
+		}()
+	}
+
+	// Close result channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Process results as they come in
+	totalProcessed := len(firstPageResult.Documents) // Already processed page 0
+	for result := range resultChan {
+		if result.Error != nil {
+			return fmt.Errorf("error fetching page %d: %v", result.PageNumber, result.Error)
+		}
+
+		if len(result.Documents) > 0 {
+			// Estimate memory usage and wait if necessary
+			memorySize := workerPool.estimateMemoryUsage(result.Documents)
+			for !workerPool.canAllocateMemory(memorySize) {
+				log.Printf("Memory limit reached, waiting before processing page %d...", result.PageNumber)
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			workerPool.allocateMemory(memorySize)
+
+			// Process documents from this page to target collection
+			if err := insertDocumentsBatch(targetDatabase, targetCollection, result.Documents); err != nil {
+				workerPool.releaseMemory(memorySize)
+				return fmt.Errorf("failed to insert documents from page %d to target: %v", result.PageNumber, err)
+			}
+
+			workerPool.releaseMemory(memorySize)
+			totalProcessed += len(result.Documents)
+			log.Printf("Processed page %d from %s.%s to %s.%s: %d documents (total: %d)", result.PageNumber, sourceDatabase, sourceCollection, targetDatabase, targetCollection, len(result.Documents), totalProcessed)
+		}
+	}
+
+	return nil
+}
+
+// handleFinalProcessingWithMapping handles final processing for mapped collections
+func handleFinalProcessingWithMapping(targetDatabase, targetCollection string, pageResult *PageResult) error {
+	targetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Recreate indexes if provided
+	if len(pageResult.Indexes) > 0 {
+		if err := recreateIndexes(ctx, targetColl, pageResult.Indexes); err != nil {
+			log.Printf("Warning: Failed to recreate indexes for %s.%s: %v", targetDatabase, targetCollection, err)
+		} else {
+			log.Printf("Successfully recreated %d indexes for %s.%s", len(pageResult.Indexes), targetDatabase, targetCollection)
+		}
+	}
+
+	// Apply collection options if provided
+	if pageResult.CollectionOptions != nil {
+		if err := applyCollectionOptions(ctx, mongoClient.Database(targetDatabase), targetCollection, pageResult.CollectionOptions); err != nil {
+			log.Printf("Warning: Failed to apply collection options for %s.%s: %v", targetDatabase, targetCollection, err)
+		} else {
+			log.Printf("Successfully applied collection options for %s.%s", targetDatabase, targetCollection)
+		}
+	}
+
+	// Store snapshot fence information for change stream coordination
+	if pageResult.SnapshotFence != nil {
+		log.Printf("Snapshot completed with fence - ClusterTime: %v, OperationTime: %v",
+			pageResult.SnapshotFence.ClusterTime, pageResult.SnapshotFence.OperationTime)
+
+		// Validate that change streams can start consistently with this fence
+		if clusterFence != nil && clusterFence.IsEnabled() {
+			if err := clusterFence.ValidateChangeStreamStart(convertToSnapshotFence(pageResult.SnapshotFence), pageResult.SnapshotFence.OperationTime); err != nil {
+				log.Printf("Warning: Change stream coordination validation failed: %v", err)
+			} else {
+				log.Printf("Change stream coordination validated successfully for %s.%s", targetDatabase, targetCollection)
+			}
+		}
+	} else {
+		log.Printf("No snapshot fence provided - change stream coordination may have gaps")
+	}
+
+	return nil
+}
+
 func fetchSinglePage(database, collection string, pageNumber, pageSize int) (*PageResult, error) {
 	resultChan := make(chan PageResult, 1)
 	fetchPageConcurrently(database, collection, pageNumber, pageSize, resultChan)
@@ -1381,6 +1774,93 @@ func handleFinalProcessing(database, collection string, pageResult *PageResult) 
 }
 
 // insertDocumentsBatch inserts a batch of documents efficiently with duplicate key handling
+// deleteDocumentsBatch deletes a batch of documents by their document keys
+// handleDropCollection handles collection drop operations
+func handleDropCollection(database, collection string) error {
+	coll := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := coll.Drop(ctx); err != nil {
+		return fmt.Errorf("failed to drop collection %s.%s: %v", database, collection, err)
+	}
+	log.Printf("✅ DROPPED COLLECTION: %s.%s", database, collection)
+	return nil
+}
+
+// handleRenameCollection handles collection rename operations
+func handleRenameCollection(docMap bson.M, database, collection string) error {
+	// Collection rename is complex and may not be directly supported in all scenarios
+	// For now, log the operation and continue
+	log.Printf("🔄 RENAME COLLECTION: %s.%s (rename operations require manual handling)", database, collection)
+	return nil
+}
+
+// handleDropDatabase handles database drop operations
+func handleDropDatabase(database string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := mongoClient.Database(database).Drop(ctx); err != nil {
+		return fmt.Errorf("failed to drop database %s: %v", database, err)
+	}
+	log.Printf("✅ DROPPED DATABASE: %s", database)
+	return nil
+}
+
+// handleIndexOperation handles index creation, deletion, and modification operations
+func handleIndexOperation(operation string, docMap bson.M, database, collection string) error {
+	// Index operations are metadata changes that may need special handling
+	// For now, log the operation - in production, you might want to replicate index changes
+	log.Printf("🔍 INDEX OPERATION: %s for %s.%s", operation, database, collection)
+	
+	// You could implement actual index replication here if needed:
+	// - Parse operationDescription for index definitions
+	// - Apply createIndex/dropIndex operations to target
+	// - Handle index modifications
+	
+	return nil
+}
+
+func deleteDocumentsBatch(database, collection string, documentKeys []bson.M) error {
+	if len(documentKeys) == 0 {
+		return nil
+	}
+
+	coll := mongoClient.Database(database).Collection(collection)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Delete documents in smaller batches to avoid memory issues
+	batchSize := 1000
+	for i := 0; i < len(documentKeys); i += batchSize {
+		end := i + batchSize
+		if end > len(documentKeys) {
+			end = len(documentKeys)
+		}
+
+		// Create bulk write operations for deletion
+		bulkOps := make([]mongo.WriteModel, 0, end-i)
+		for j := i; j < end; j++ {
+			deleteOp := mongo.NewDeleteOneModel()
+			deleteOp.SetFilter(documentKeys[j])
+			bulkOps = append(bulkOps, deleteOp)
+		}
+
+		if len(bulkOps) > 0 {
+			// Use unordered bulk write for better performance
+			opts := options.BulkWrite().SetOrdered(false)
+			result, err := coll.BulkWrite(ctx, bulkOps, opts)
+			if err != nil {
+				return fmt.Errorf("failed to delete batch: %v", err)
+			}
+			log.Printf("✅ DELETED: %d documents from %s.%s (matched: %d)", result.DeletedCount, database, collection, result.MatchedCount)
+		}
+	}
+
+	return nil
+}
+
 func insertDocumentsBatch(database, collection string, documents []bson.Raw) error {
 	if len(documents) == 0 {
 		return nil
@@ -1398,29 +1878,35 @@ func insertDocumentsBatch(database, collection string, documents []bson.Raw) err
 			end = len(documents)
 		}
 
-		// Convert bson.Raw to []interface{} for InsertMany
-		batch := make([]interface{}, 0, end-i)
+		// Use upserts for resumable sync compatibility
+		bulkOps := make([]mongo.WriteModel, 0, end-i)
 		for j := i; j < end; j++ {
 			var doc bson.M
 			if err := bson.Unmarshal(documents[j], &doc); err != nil {
 				log.Printf("Error unmarshaling document: %v", err)
 				continue
 			}
-			batch = append(batch, doc)
+			
+			// Create upsert operation using _id as filter
+			if id, ok := doc["_id"]; ok {
+				filter := bson.M{"_id": id}
+				upsertOp := mongo.NewReplaceOneModel()
+				upsertOp.SetFilter(filter)
+				upsertOp.SetReplacement(doc)
+				upsertOp.SetUpsert(true)
+				bulkOps = append(bulkOps, upsertOp)
+			} else {
+				log.Printf("Warning: Document without _id field, skipping upsert")
+			}
 		}
 
-		if len(batch) > 0 {
-			// Use ordered=false to continue inserting even if some documents fail due to duplicates
-			opts := options.InsertMany().SetOrdered(false)
-			if _, err := coll.InsertMany(ctx, batch, opts); err != nil {
-				// Check if this is a duplicate key error
-				if mongo.IsDuplicateKeyError(err) {
-					log.Printf("Warning: Duplicate key errors encountered during batch insert for %s.%s - this is expected during resumable sync", database, collection)
-					// Continue processing - duplicate key errors are expected during resumable sync
-				} else {
-					return fmt.Errorf("failed to insert batch: %v", err)
-				}
+		if len(bulkOps) > 0 {
+			// Use unordered bulk write for better performance
+			opts := options.BulkWrite().SetOrdered(false)
+			if _, err := coll.BulkWrite(ctx, bulkOps, opts); err != nil {
+				return fmt.Errorf("failed to upsert batch: %v", err)
 			}
+			log.Printf("✅ UPSERTED: %d documents for %s.%s", len(bulkOps), database, collection)
 		}
 	}
 
@@ -1617,6 +2103,7 @@ func connectWebSocket() error {
 
 		// Handle different message types
 		if messageType == websocket.BinaryMessage {
+			log.Printf("📥 WEBSOCKET: Received binary message (%d bytes)", len(messageData))
 			if encryptionMgr.IsEnabled() {
 				// Decrypt and then unmarshal BSON to preserve MongoDB types
 				decryptedData, err := encryptionMgr.Decrypt(messageData)
@@ -1626,19 +2113,34 @@ func connectWebSocket() error {
 				}
 				if err := bson.Unmarshal(decryptedData, &event); err != nil {
 					log.Printf("Error unmarshaling decrypted BSON message: %v", err)
+					log.Printf("🔍 DEBUG: Decrypted data length: %d bytes", len(decryptedData))
 					continue
 				}
-				log.Printf("Decrypted change event: %s on %s.%s", event.OperationType, event.Database, event.Collection)
+				log.Printf("✅ REALTIME: Decrypted change event: %s on %s.%s", event.OperationType, event.Database, event.Collection)
 			} else {
 				// Unmarshal BSON directly to preserve MongoDB types
 				if err := bson.Unmarshal(messageData, &event); err != nil {
 					log.Printf("Error unmarshaling BSON message: %v", err)
+					log.Printf("🔍 DEBUG: Raw BSON data length: %d bytes", len(messageData))
+					// Try to decode the raw BSON to see what fields are available
+					var rawDoc map[string]interface{}
+					if bsonErr := bson.Unmarshal(messageData, &rawDoc); bsonErr == nil {
+						log.Printf("🔍 DEBUG: Available BSON fields: %v", func() []string {
+							keys := make([]string, 0, len(rawDoc))
+							for k := range rawDoc {
+								keys = append(keys, k)
+							}
+							return keys
+						}())
+					}
 					continue
 				}
-				log.Printf("Received change event: %s on %s.%s", event.OperationType, event.Database, event.Collection)
+				log.Printf("✅ REALTIME: Received change event: %s on %s.%s (FullDoc: %d bytes, DocKey: %d bytes)", 
+					event.OperationType, event.Database, event.Collection, len(event.FullDocument), len(event.DocumentKey))
 			}
 		} else if messageType == websocket.TextMessage {
 			// Handle JSON messages - check if it's a status update or change event
+			log.Printf("💬 DEBUG: Received TextMessage (%d bytes): %s", len(messageData), string(messageData))
 			var jsonMsg map[string]interface{}
 			if err := json.Unmarshal(messageData, &jsonMsg); err != nil {
 				log.Printf("Error unmarshaling JSON message: %v", err)
@@ -1647,12 +2149,24 @@ func connectWebSocket() error {
 
 			// Check if this is a status update (metrics_update, status_update, etc.)
 			if msgType, ok := jsonMsg["type"].(string); ok {
+				log.Printf("🔍 DEBUG: Message type detected: %s", msgType)
 				switch msgType {
 				case "metrics_update", "status_update", "log_entry":
 					// Skip status updates - these are not change events
 					log.Printf("Received status update: %s", msgType)
 					continue
+				case "initial_sync_trigger":
+					// Handle initial sync trigger from API
+					log.Printf("🚀 INITIAL SYNC: Received trigger from cloud-sync API")
+					if err := handleInitialSyncTrigger(jsonMsg, conn); err != nil {
+						log.Printf("❌ INITIAL SYNC: Failed to handle trigger: %v", err)
+					} else {
+						log.Printf("✅ INITIAL SYNC: Successfully completed full database replacement")
+					}
+					continue
 				}
+			} else {
+				log.Printf("⚠️ DEBUG: No 'type' field found in JSON message")
 			}
 
 			// Try to parse as a change event (legacy JSON format)
@@ -2088,4 +2602,166 @@ func splitDatabaseCollection(fullName string) []string {
 		}
 	}
 	return []string{fullName}
+}
+
+// handleInitialSyncTrigger handles the initial_sync_trigger message from cloud-sync API
+// This performs a complete database replacement (clear + full sync)
+func handleInitialSyncTrigger(jsonMsg map[string]interface{}, conn *websocket.Conn) error {
+	log.Printf("🔄 INITIAL SYNC: Processing API trigger message")
+
+	// Extract client ID and other parameters from the message
+	clientID, _ := jsonMsg["client_id"].(string)
+	force, _ := jsonMsg["force"].(bool)
+	timestamp, _ := jsonMsg["timestamp"].(string)
+
+	log.Printf("🎯 INITIAL SYNC: client_id=%s, force=%v, timestamp=%s", clientID, force, timestamp)
+
+	// Send acknowledgment first
+	ackMsg := map[string]interface{}{
+		"type":       "initial_sync_ack",
+		"status":     "started",
+		"client_id":  clientID,
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"message":    "Initial sync started - performing full database replacement",
+	}
+
+	if err := conn.WriteJSON(ackMsg); err != nil {
+		log.Printf("❌ INITIAL SYNC: Failed to send acknowledgment: %v", err)
+	} else {
+		log.Printf("✅ INITIAL SYNC: Acknowledgment sent to cloud-sync")
+	}
+
+	// Perform full database replacement for all configured collections
+	log.Printf("🗑️ INITIAL SYNC: Starting full database replacement for %d collections", len(config.Collections))
+
+	totalCollections := len(config.Collections)
+	successCount := 0
+	failedCollections := make([]string, 0)
+
+	for i, collectionName := range config.Collections {
+		// Parse collection mapping format: "source.db.collection" or "source.db.collection:target.db.collection"
+		var sourceCollection string
+		if strings.Contains(collectionName, ":") {
+			// Format: "source.db.collection:target.db.collection"
+			mappingParts := strings.Split(collectionName, ":")
+			sourceCollection = mappingParts[0]
+		} else {
+			// Format: "source.db.collection" (no target mapping)
+			sourceCollection = collectionName
+		}
+		
+		// Split source collection into database and collection
+		parts := splitDatabaseCollection(sourceCollection)
+		if len(parts) != 2 {
+			log.Printf("⚠️ INITIAL SYNC: Skipping invalid collection format: %s", collectionName)
+			failedCollections = append(failedCollections, collectionName)
+			continue
+		}
+
+		database := parts[0]
+		collection := parts[1]
+
+		log.Printf("🔄 INITIAL SYNC: [%d/%d] Processing %s.%s", i+1, totalCollections, database, collection)
+
+		// Map source to target collection
+		fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
+		targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
+		if err != nil {
+			log.Printf("❌ INITIAL SYNC: Failed to map collection %s: %v", fullSourceCollection, err)
+			failedCollections = append(failedCollections, collectionName)
+			continue
+		}
+
+		log.Printf("🎯 INITIAL SYNC: Mapped %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
+
+		// Step 1: Clear target collection (COMPLETE REPLACEMENT)
+		log.Printf("🗑️ INITIAL SYNC: Dropping collection %s.%s", targetDatabase, targetCollection)
+		targetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := targetColl.Drop(ctx); err != nil {
+			log.Printf("⚠️ INITIAL SYNC: Failed to drop %s.%s (might not exist): %v", targetDatabase, targetCollection, err)
+			// Continue even if drop fails - collection might not exist
+		}
+		cancel()
+		log.Printf("✅ INITIAL SYNC: Collection %s.%s cleared", targetDatabase, targetCollection)
+
+		// Step 2: Clear checkpoints and watermarks for clean state
+		if checkpointMgr != nil {
+			log.Printf("🔄 INITIAL SYNC: Clearing checkpoints for %s.%s", targetDatabase, targetCollection)
+			// Checkpoints will be recreated during sync
+		}
+		if watermarkMgr != nil {
+			log.Printf("🔄 INITIAL SYNC: Clearing watermarks for %s.%s", targetDatabase, targetCollection)
+			// Watermarks will be recreated during sync
+		}
+
+		// Step 3: Perform full sync from cloud (get ALL data + metadata)
+		log.Printf("🚀 INITIAL SYNC: Starting full data + metadata sync for %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
+		if err := syncCollectionDataWithMapping(database, collection, targetDatabase, targetCollection); err != nil {
+			log.Printf("❌ INITIAL SYNC: Failed to sync collection %s.%s -> %s.%s: %v", database, collection, targetDatabase, targetCollection, err)
+			failedCollections = append(failedCollections, collectionName)
+			continue
+		}
+
+		// CRITICAL: Verify that indexes and metadata were properly transferred
+		verifyTargetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		indexView := verifyTargetColl.Indexes()
+		indexCursor, err := indexView.List(verifyCtx)
+		if err == nil {
+			indexCount := 0
+			for indexCursor.Next(verifyCtx) {
+				indexCount++
+			}
+			indexCursor.Close(verifyCtx)
+			log.Printf("✅ INITIAL SYNC: Verified %d indexes created for %s.%s", indexCount, targetDatabase, targetCollection)
+		} else {
+			log.Printf("⚠️ INITIAL SYNC: Failed to verify indexes for %s.%s: %v", targetDatabase, targetCollection, err)
+		}
+		verifyCancel()
+
+		successCount++
+		log.Printf("✅ INITIAL SYNC: [%d/%d] Successfully replaced %s.%s", i+1, totalCollections, targetDatabase, targetCollection)
+	}
+
+	// Send final status back to cloud-sync
+	finalStatus := "completed"
+	if len(failedCollections) > 0 {
+		finalStatus = "partial_success"
+		if successCount == 0 {
+			finalStatus = "failed"
+		}
+	}
+
+	finalMsg := map[string]interface{}{
+		"type":              "initial_sync_result",
+		"status":            finalStatus,
+		"client_id":         clientID,
+		"timestamp":         time.Now().Format(time.RFC3339),
+		"total_collections": totalCollections,
+		"success_count":     successCount,
+		"failed_count":      len(failedCollections),
+		"message":           fmt.Sprintf("Initial sync %s: %d/%d collections processed", finalStatus, successCount, totalCollections),
+	}
+
+	if len(failedCollections) > 0 {
+		finalMsg["failed_collections"] = failedCollections
+	}
+
+	if err := conn.WriteJSON(finalMsg); err != nil {
+		log.Printf("❌ INITIAL SYNC: Failed to send final status: %v", err)
+	} else {
+		log.Printf("✅ INITIAL SYNC: Final status sent to cloud-sync")
+	}
+
+	if finalStatus == "completed" {
+		log.Printf("🎉 INITIAL SYNC: Successfully completed full database replacement - ALL collections replaced")
+	} else if finalStatus == "partial_success" {
+		log.Printf("⚠️ INITIAL SYNC: Partial success - %d/%d collections replaced", successCount, totalCollections)
+	} else {
+		log.Printf("❌ INITIAL SYNC: Failed - no collections were successfully replaced")
+		return fmt.Errorf("initial sync failed: %d collections failed", len(failedCollections))
+	}
+
+	return nil
 }

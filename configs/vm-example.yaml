@@ -45,28 +45,30 @@ collections:
 # Sync configuration
 sync:
   initial_sync: true
-  realtime_sync: true
+  realtime_sync: false  # Disabled in favor of scheduler-based sync
+  scheduler_sync: true  # Enable scheduler-based sync to receive incremental updates
+  scheduler_interval: "30m"  # Should match cloud-sync interval
   resumable_initial_sync: true  # Enable to resume from last sync state instead of full re-sync
   batch_size: 100      # Very small batches for reliable transfers
   parallel_collections: true
-  max_workers: 8       # Optimized for high-volume sync
+  max_workers: 4       # Optimized for stability
   retry_attempts: 3    # Number of retry attempts for failed operations
   retry_delay: "5s"    # Delay between retry attempts
-  # TCP Transport Configuration for high-performance data transfer
+  # Ultra-Stable TCP Transport Configuration for production reliability
   transport:
     mode: "tcp"  # Use TCP transport for initial dumps ("http" for legacy mode)
     http_fallback: true  # Accept HTTP fallback from cloud-sync
     compression_type: "zstd"  # Use Zstd compression for best ratio
     tcp_receiver:
       listen_addr: "0.0.0.0:9000"  # TCP receiver listen address
-      max_connections: 10
-      read_timeout: 60s
-      write_timeout: 30s
-      buffer_size: 262144  # 256KB
+      max_connections: 20           # Ultra-stable: Increased connections
+      read_timeout: 200s            # Ultra-stable: 200s read timeout
+      write_timeout: 120s           # Ultra-stable: 120s write timeout
+      buffer_size: 1048576          # Ultra-stable: 1MB buffer
       disk_checkpoint: true
       checkpoint_dir: "/tmp/vm-sync-tcp-checkpoints"
-      heartbeat_interval: 30s
-      max_batch_size: 16777216  # 16MB
+      heartbeat_interval: 90s       # Ultra-stable: 90s heartbeat
+      max_batch_size: 67108864      # Ultra-stable: 64MB batches
       tls_enabled: false
 
 # Internal cluster configuration
@@ -122,6 +124,15 @@ metrics:
   port: 8082
   path: "/metrics"
   collection_interval: "10s"
+
+# Checkpoint configuration for client-side resume token tracking
+checkpoint:
+  enabled: true
+  database: "vm_sync_checkpoints"
+  collection: "client_resume_tokens"
+  save_interval_seconds: 3
+  cleanup_enabled: true
+  retention_days: 7
 
 # Checkpoint configuration for client-side resume token tracking
 checkpoint:

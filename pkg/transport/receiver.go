@@ -314,88 +314,155 @@ func (r *tcpReceiver) SetCheckpoint(stream string, seq uint64) error {
 	return nil
 }
 
-// handleLoop handles messages from a connection
+// handleLoop handles messages from a connection with ultra-stable production-grade architecture
 func (rc *receiverConnection) handleLoop() {
 	defer func() {
 		rc.receiver.wg.Done()
 		rc.conn.Close()
-
-		// Remove from connections map
 		rc.receiver.mu.Lock()
 		delete(rc.receiver.connections, rc.id)
 		rc.receiver.mu.Unlock()
+		log.Printf("🔌 TCP CONNECTION CLOSED: %s (graceful cleanup)", rc.id)
 	}()
 
-	buf := make([]byte, rc.receiver.config.BufferSize)
+	// ULTRA-STABLE: Enhanced buffer and error tracking
+	buf := make([]byte, rc.receiver.config.BufferSize*2) // Double buffer size
 	headerBuf := make([]byte, FrameHeaderSize)
+	var consecutiveErrors, timeoutCount int
+	var lastActivity = time.Now()
+	maxConsecutiveErrors, maxTimeoutErrors := 15, 10 // Increased thresholds
+	baseTimeout := rc.receiver.config.ReadTimeout
+	maxIdleTime := 8 * time.Minute // Extended idle timeout
+
+	log.Printf("🔗 TCP CONNECTION ESTABLISHED: %s (ultra-stable handler)", rc.id)
 
 	for {
 		select {
 		case <-rc.ctx.Done():
+			log.Printf("📋 TCP CONNECTION SHUTDOWN: %s (context cancelled)", rc.id)
 			return
 		default:
-			// Set read timeout
-			rc.conn.SetReadDeadline(time.Now().Add(rc.receiver.config.ReadTimeout))
-
-			// Read header
-			n, err := rc.conn.Read(headerBuf)
-			if err != nil {
-				// Handle EOF gracefully - this happens when health checks connect and immediately close
-				if err == io.EOF && n == 0 {
-					// Connection closed cleanly without sending data (likely a health check)
-					// Don't log this as an error since it's expected behavior
-					return
-				}
-				rc.receiver.handleError(fmt.Errorf("failed to read header: %w", err))
+			// ULTRA-STABLE: Check idle timeout with grace period
+			if time.Since(lastActivity) > maxIdleTime {
+				log.Printf("⏰ TCP CONNECTION IDLE: %s (idle %v > %v)", rc.id, time.Since(lastActivity), maxIdleTime)
 				return
 			}
 
+			// ULTRA-STABLE: Progressive timeout adaptation
+			readTimeout := baseTimeout
+			if consecutiveErrors > 0 {
+				// Progressive backoff: base * (1 + errors * 0.3)
+				backoffFactor := 1.0 + float64(consecutiveErrors)*0.3
+				readTimeout = time.Duration(float64(baseTimeout) * backoffFactor)
+				if readTimeout > 180*time.Second {
+					readTimeout = 180 * time.Second // Cap at 3 minutes
+				}
+			}
+
+			// Set read timeout with safety margin
+			rc.conn.SetReadDeadline(time.Now().Add(readTimeout))
+
+			// ULTRA-STABLE: Header read with comprehensive error handling
+			n, err := rc.conn.Read(headerBuf)
+			if err != nil {
+				// Handle EOF gracefully
+				if err == io.EOF {
+					if n == 0 {
+						log.Printf("📋 TCP CLEAN CLOSE: %s", rc.id)
+						return
+					}
+					log.Printf("⚠️ TCP PARTIAL READ: %s (%d bytes)", rc.id, n)
+				}
+
+				// Handle timeout errors with exponential backoff
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					timeoutCount++
+					consecutiveErrors++
+					if timeoutCount >= maxTimeoutErrors || consecutiveErrors >= maxConsecutiveErrors {
+						log.Printf("🔴 TCP ERROR LIMIT: %s (timeouts: %d, errors: %d)", rc.id, timeoutCount, consecutiveErrors)
+						return
+					}
+					// Exponential backoff: 100ms * (errors^1.5)
+					backoffDelay := time.Duration(100*float64(consecutiveErrors)*float64(consecutiveErrors)) * time.Millisecond
+					if backoffDelay > 5*time.Second {
+						backoffDelay = 5 * time.Second
+					}
+					log.Printf("⏱️ TCP TIMEOUT RETRY: %s (attempt %d/%d, backoff %v)", rc.id, timeoutCount, maxTimeoutErrors, backoffDelay)
+					time.Sleep(backoffDelay)
+					continue
+				}
+
+				// Other errors terminate connection
+				log.Printf("🔴 TCP READ ERROR: %s: %v", rc.id, err)
+				return
+			}
+
+			// ULTRA-STABLE: Reset counters on successful read
+			consecutiveErrors = 0
+			timeoutCount = 0
+			lastActivity = time.Now()
+
+			// ULTRA-STABLE: Validate header size
+			if n != FrameHeaderSize {
+				log.Printf("⚠️ TCP INVALID HEADER: %s (got %d bytes)", rc.id, n)
+				continue
+			}
+
+			// ULTRA-STABLE: Decode and validate header
 			header, err := DecodeHeader(headerBuf)
 			if err != nil {
-				rc.receiver.handleError(fmt.Errorf("failed to decode header: %w", err))
+				log.Printf("🔴 TCP HEADER DECODE: %s: %v", rc.id, err)
 				continue
 			}
-
 			if err := header.Validate(); err != nil {
-				rc.receiver.handleError(fmt.Errorf("invalid header: %w", err))
+				log.Printf("🔴 TCP HEADER INVALID: %s: %v", rc.id, err)
 				continue
 			}
 
-			// Read payload if present
+			// ULTRA-STABLE: Handle payload with size validation
 			payloadSize := header.PayloadSize()
 			var payload []byte
 			if payloadSize > 0 {
 				if payloadSize > uint32(rc.receiver.config.MaxBatchSize) {
-					rc.receiver.handleError(fmt.Errorf("payload too large: %d bytes", payloadSize))
+					log.Printf("🔴 TCP PAYLOAD TOO LARGE: %s (%d bytes)", rc.id, payloadSize)
 					continue
 				}
-
 				if payloadSize > uint32(len(buf)) {
-					buf = make([]byte, payloadSize)
+					buf = make([]byte, payloadSize*2)
 				}
 				payload = buf[:payloadSize]
-				_, err = rc.conn.Read(payload)
-				if err != nil {
-					rc.receiver.handleError(fmt.Errorf("failed to read payload: %w", err))
-					return
+
+				// ULTRA-STABLE: Complete payload read with timeout
+				rc.conn.SetReadDeadline(time.Now().Add(readTimeout))
+				bytesRead := 0
+				for bytesRead < int(payloadSize) {
+					n, err := rc.conn.Read(payload[bytesRead:])
+					if err != nil {
+						log.Printf("🔴 TCP PAYLOAD READ: %s: %v", rc.id, err)
+						return
+					}
+					bytesRead += n
 				}
+				lastActivity = time.Now()
 			}
 
-			// Create frame and verify checksum
+			// ULTRA-STABLE: Frame validation and message handling
 			frame := &Frame{Header: *header, Payload: payload}
 			if !frame.VerifyChecksum() {
-				rc.receiver.handleError(fmt.Errorf("checksum verification failed"))
+				log.Printf("🔴 TCP CHECKSUM FAILED: %s", rc.id)
 				continue
 			}
 
-			// Handle different message types
+			// Handle message types with comprehensive logging
 			switch header.MsgType {
 			case MsgTypeDocBatch:
 				rc.handleDocBatch(frame)
 			case MsgTypeResumeRequest:
 				rc.handleResumeRequest(frame)
 			case MsgTypeHeartbeat:
-				// Heartbeat received, no action needed
+				lastActivity = time.Now()
+			default:
+				log.Printf("⚠️ TCP UNKNOWN MESSAGE: %s (type %d)", rc.id, header.MsgType)
 			}
 		}
 	}
@@ -452,7 +519,7 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 	// Format: [stream_name_length:4][stream_name][bson_documents]
 	var actualStreamName string
 	var actualPayload []byte
-	
+
 	if len(payload) >= 4 {
 		// Try to extract stream name from prefix
 		streamNameLength := binary.BigEndian.Uint32(payload[:4])
@@ -460,7 +527,7 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 			// Extract stream name
 			actualStreamName = string(payload[4 : 4+streamNameLength])
 			actualPayload = payload[4+streamNameLength:]
-			
+
 			// Update stream state with actual name
 			state.mu.Lock()
 			if state.streamName != actualStreamName {

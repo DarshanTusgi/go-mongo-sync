@@ -98,7 +98,9 @@ websocket:
 # Sync configuration
 sync:
   initial_sync: true
-  realtime_sync: false
+  realtime_sync: false  # Disabled in favor of scheduler-based sync
+  scheduler_sync: true  # Enable configurable scheduler-based synchronization
+  scheduler_interval: "5m"  # 5 minutes for testing (configurable: 30m, 1h, etc.)
   resumable_initial_sync: true  # Enable resumable initial sync to avoid full re-sync on restart
   batch_size: 1000
   parallel_collections: true
@@ -106,19 +108,20 @@ sync:
   # TCP Transport Configuration for high-performance data transfer
   transport:
     mode: "tcp"  # Use TCP transport for initial dumps ("http" for legacy mode)
-    http_fallback: true  # Fall back to HTTP if TCP fails
+    http_fallback: false  # DO NOT fall back to HTTP if TCP fails - TCP is PRIMARY
     compression_type: "zstd"  # Use Zstd compression for best ratio
+    health_monitor: "30s"  # TCP health monitor interval (checks for VM-sync availability)
     tcp_sender:
-      address: "localhost:9000"  # vm-sync TCP receiver address
+      address: "127.0.0.1:9000"  # vm-sync TCP receiver address (use 127.0.0.1 not localhost)
       parallel_conns: 4
       window_size: 64
-      batch_timeout: 5s
-      conn_timeout: 30s
-      keep_alive: 30s
-      max_retries: 3
-      retry_backoff: 1s
-      buffer_size: 262144  # 256KB
-      max_batch_size: 16777216  # 16MB
+      batch_timeout: 60s      # Increased to 60s for ultra-stability
+      conn_timeout: 180s      # Increased to 180s for ultra-stable connections
+      keep_alive: 120s        # Increased to 120s for persistent connections
+      max_retries: 8          # Increased to 8 for maximum reliability
+      retry_backoff: 3s       # Increased to 3s for proper recovery
+      buffer_size: 1048576    # Increased to 1MB for large transfers
+      max_batch_size: 67108864  # Increased to 64MB for efficiency
       tls_enabled: false
 
 # Encryption configuration
