@@ -2019,26 +2019,30 @@ func connectWebSocket() error {
 		return fmt.Errorf("OAuth2 authentication failed: %v", authResponse["message"])
 	}
 
-	// If VM sync integration already exists, update its connection
+	// If VM sync integration already exists, check if it's using HTTP or WebSocket
 	if vmSyncIntegration != nil {
-		log.Println("Updating existing VM sync integration with new WebSocket connection")
-		if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
-			transmitter.UpdateConnection(conn)
+		if vmSyncIntegration.IsUsingHTTP() {
+			log.Println("Existing HTTP VM sync integration is already running (no WebSocket connection needed)")
+		} else {
+			log.Println("Updating existing WebSocket VM sync integration with new connection")
+			if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
+				transmitter.UpdateConnection(conn)
+			}
 		}
 	} else {
-		// Initialize VM sync integration with WebSocket connection
-		vmSyncIntegration, err = adaptive.NewVMSyncIntegration(clientID, conn)
+		// Initialize VM sync integration with HTTP-based telemetry (no WebSocket dependency)
+		vmSyncIntegration, err = adaptive.NewHTTPVMSyncIntegration(clientID, config.CloudSync.HTTPURL, vmTokenManager)
 		if err != nil {
-			log.Printf("Failed to initialize VM sync integration: %v", err)
+			log.Printf("Failed to initialize HTTP VM sync integration: %v", err)
 			return err
 		}
-		log.Println("VM sync integration initialized with WebSocket connection")
+		log.Println("VM sync integration initialized with HTTP telemetry (WebSocket-free)")
 
 		// Start telemetry collection and transmission
 		if err := vmSyncIntegration.Start(); err != nil {
 			log.Printf("Failed to start VM sync integration: %v", err)
 		} else {
-			log.Println("VM sync integration started successfully")
+			log.Println("HTTP telemetry VM sync integration started successfully")
 		}
 	}
 
@@ -2050,15 +2054,25 @@ func connectWebSocket() error {
 			select {
 			case <-ticker.C:
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					log.Printf("Failed to send ping: %v", err)
+					log.Printf("❌ PING FAILED: %v", err)
 
 					// Mark telemetry as disconnected when ping fails
-					if vmSyncIntegration != nil && vmSyncIntegration.GetTransmitter() != nil {
-						vmSyncIntegration.GetTransmitter().MarkDisconnected()
+					if vmSyncIntegration != nil {
+						if vmSyncIntegration.IsUsingHTTP() {
+							if httpTransmitter := vmSyncIntegration.GetHTTPTransmitter(); httpTransmitter != nil {
+								httpTransmitter.MarkDisconnected()
+								log.Printf("HTTP telemetry connection marked as disconnected")
+							}
+						} else if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
+							transmitter.MarkDisconnected()
+							log.Printf("WebSocket telemetry connection marked as disconnected")
+						}
 					}
 
-					// Trigger reconnection by returning from this function
-					// This will cause the main WebSocket loop to exit and reconnect
+					// STABILITY FIX: Close the connection to trigger reconnection
+					// This ensures the main read loop exits and reconnects with a fresh connection
+					log.Printf("🔄 RECONNECTING: Closing broken WebSocket connection to trigger reconnection")
+					conn.Close()
 					return
 				}
 			}
@@ -2075,8 +2089,14 @@ func connectWebSocket() error {
 			log.Printf("Error reading WebSocket message: %v", err)
 
 			// Mark telemetry as disconnected when WebSocket read fails
-			if vmSyncIntegration != nil && vmSyncIntegration.GetTransmitter() != nil {
-				vmSyncIntegration.GetTransmitter().MarkDisconnected()
+			if vmSyncIntegration != nil {
+				if vmSyncIntegration.IsUsingHTTP() {
+					if httpTransmitter := vmSyncIntegration.GetHTTPTransmitter(); httpTransmitter != nil {
+						httpTransmitter.MarkDisconnected()
+					}
+				} else if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
+					transmitter.MarkDisconnected()
+				}
 			}
 
 			// Check if this is a resume token invalidation error

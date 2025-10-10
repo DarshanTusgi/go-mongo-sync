@@ -1,0 +1,81 @@
+# VM-Sync Domain-Based Configuration for Kubernetes
+# Domain: xyz.com
+
+cloud_sync:
+  # HTTP telemetry endpoint (WebSocket-free as requested)
+  http_url: "https://darshan.com"
+  ws_url: "wss://darshan.com/ws"  # Still needed for real-time change events
+  http_timeout: "600s"
+  
+  # OAuth2 authentication for HTTP telemetry
+  oauth2:
+    enabled: true
+    client_id: "${VM_SYNC_CLIENT_ID}"        # Set via environment variable
+    client_secret: "${VM_SYNC_CLIENT_SECRET}" # Set via environment variable  
+    token_url: "https://darshan.com/api/auth/token"
+
+mongodb:
+  uri: "${MONGODB_URI}"  # Local MongoDB in VM-Sync pod
+  timeout: 30s
+
+# Collections - Auto-distributed by cloud-sync (no manual config needed)
+collections: []  # Empty - cloud-sync will auto-assign collections
+
+sync:
+  initial_sync: true
+  realtime_sync: true
+  resumable_initial_sync: true
+  batch_size: 1000
+  parallel_collections: true
+  max_workers: 4
+  retry_attempts: 3
+  retry_delay: "5s"
+  
+  # TCP Transport Configuration for receiving data from darshan.com
+  transport:
+    mode: "tcp"  # Primary mode for high performance
+    http_fallback: true
+    compression_type: "zstd"
+    tcp_receiver:
+      listen_addr: "0.0.0.0:9000"  # Listen on all interfaces
+      max_connections: 20
+      read_timeout: 200s
+      write_timeout: 120s
+      buffer_size: 1048576  # 1MB
+      disk_checkpoint: true
+      checkpoint_dir: "/tmp/vm-sync-tcp-checkpoints"
+      heartbeat_interval: 90s
+      max_batch_size: 67108864  # 64MB
+      tls_enabled: false  # Set to true for production with certificates
+
+# Encryption (must match cloud-sync)
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  key_id: "${ENCRYPTION_KEY_ID}"
+  key: "${ENCRYPTION_KEY}"
+
+# Checkpoints for resume capability
+checkpoint:
+  enabled: true
+  database: "vm_checkpoints"
+  collection: "resume_tokens"
+  save_interval: 5
+
+# Watermarks for duplicate detection
+watermarks:
+  enabled: true
+  database: "vm_watermarks"
+  collection: "high_water_marks"
+
+# Sequence for ordered processing
+sequence:
+  enabled: true
+  database: "vm_sequence"
+  collection: "counters"
+  batch_size: 1000
+  node_id: "vm-xyz-com"
+
+# Fence for consistency
+fence:
+  enabled: true

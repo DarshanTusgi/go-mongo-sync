@@ -332,7 +332,10 @@ func (rc *receiverConnection) handleLoop() {
 	var lastActivity = time.Now()
 	maxConsecutiveErrors, maxTimeoutErrors := 15, 10 // Increased thresholds
 	baseTimeout := rc.receiver.config.ReadTimeout
-	maxIdleTime := 8 * time.Minute // Extended idle timeout
+	// STABILITY FIX: Disable idle timeout - rely on heartbeats instead
+	// TCP connections should stay open indefinitely if heartbeats are working
+	// maxIdleTime := 8 * time.Minute // Extended idle timeout
+	var maxIdleTime time.Duration = 0 // No idle timeout - connections stay open
 
 	log.Printf("🔗 TCP CONNECTION ESTABLISHED: %s (ultra-stable handler)", rc.id)
 
@@ -342,8 +345,8 @@ func (rc *receiverConnection) handleLoop() {
 			log.Printf("📋 TCP CONNECTION SHUTDOWN: %s (context cancelled)", rc.id)
 			return
 		default:
-			// ULTRA-STABLE: Check idle timeout with grace period
-			if time.Since(lastActivity) > maxIdleTime {
+			// STABILITY FIX: Only check idle timeout if it's actually configured
+			if maxIdleTime > 0 && time.Since(lastActivity) > maxIdleTime {
 				log.Printf("⏰ TCP CONNECTION IDLE: %s (idle %v > %v)", rc.id, time.Since(lastActivity), maxIdleTime)
 				return
 			}

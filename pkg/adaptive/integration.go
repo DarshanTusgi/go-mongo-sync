@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"go-data-sync-http/pkg/auth"
 	"go-data-sync-http/pkg/models"
 	"go-data-sync-http/pkg/telemetry"
 )
@@ -18,6 +19,7 @@ import (
 type VMSyncIntegration struct {
 	collector         *telemetry.Collector
 	transmitter       *telemetry.Transmitter
+	httpTransmitter   *telemetry.HTTPTransmitter
 	conn              *websocket.Conn
 	ctx               context.Context
 	cancel            context.CancelFunc
@@ -26,6 +28,7 @@ type VMSyncIntegration struct {
 	isActive          bool
 	nodeID            string
 	telemetryInterval time.Duration
+	useHTTP           bool // Flag to determine which transmitter to use
 }
 
 // CloudSyncIntegration integrates adaptive features into Cloud Sync
@@ -46,7 +49,7 @@ type CloudSyncIntegration struct {
 // ConfigCallback is called when configuration changes
 type ConfigCallback func(*models.AdaptiveConfig) error
 
-// NewVMSyncIntegration creates a new VM Sync integration
+// NewVMSyncIntegration creates a new VM Sync integration (WebSocket-based, deprecated)
 func NewVMSyncIntegration(nodeID string, conn *websocket.Conn) (*VMSyncIntegration, error) {
 	collector, err := telemetry.NewCollector(nodeID)
 	if err != nil {
@@ -64,6 +67,28 @@ func NewVMSyncIntegration(nodeID string, conn *websocket.Conn) (*VMSyncIntegrati
 		cancel:            cancel,
 		nodeID:            nodeID,
 		telemetryInterval: time.Second * 10,
+		useHTTP:           false,
+	}, nil
+}
+
+// NewHTTPVMSyncIntegration creates a new VM Sync integration using HTTP REST telemetry
+func NewHTTPVMSyncIntegration(nodeID string, cloudSyncURL string, tokenManager *auth.VMTokenManager) (*VMSyncIntegration, error) {
+	collector, err := telemetry.NewCollector(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create telemetry collector: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	httpTransmitter := telemetry.NewHTTPTransmitter(collector, cloudSyncURL, tokenManager, time.Second*10) // 10s interval
+
+	return &VMSyncIntegration{
+		collector:         collector,
+		httpTransmitter:   httpTransmitter,
+		ctx:               ctx,
+		cancel:            cancel,
+		nodeID:            nodeID,
+		telemetryInterval: time.Second * 10,
+		useHTTP:           true,
 	}, nil
 }
 
@@ -98,13 +123,22 @@ func (vsi *VMSyncIntegration) Start() error {
 	}
 
 	vsi.isActive = true
-	vsi.transmitter.Start()
 
-	// Start configuration listener
-	vsi.wg.Add(1)
-	go vsi.configListener()
+	// Start the appropriate transmitter based on the integration type
+	if vsi.useHTTP && vsi.httpTransmitter != nil {
+		vsi.httpTransmitter.Start()
+		log.Printf("VM Sync HTTP telemetry integration started for node %s", vsi.nodeID)
+	} else if vsi.transmitter != nil {
+		vsi.transmitter.Start()
+		log.Printf("VM Sync WebSocket telemetry integration started for node %s", vsi.nodeID)
 
-	log.Printf("VM Sync adaptive integration started for node %s", vsi.nodeID)
+		// Start configuration listener for WebSocket-based integration
+		vsi.wg.Add(1)
+		go vsi.configListener()
+	} else {
+		return fmt.Errorf("no transmitter available for VM Sync integration")
+	}
+
 	return nil
 }
 
@@ -119,10 +153,17 @@ func (vsi *VMSyncIntegration) Stop() {
 
 	vsi.isActive = false
 	vsi.cancel()
-	vsi.transmitter.Stop()
-	vsi.wg.Wait()
 
-	log.Printf("VM Sync adaptive integration stopped for node %s", vsi.nodeID)
+	// Stop the appropriate transmitter
+	if vsi.useHTTP && vsi.httpTransmitter != nil {
+		vsi.httpTransmitter.Stop()
+		log.Printf("VM Sync HTTP telemetry integration stopped for node %s", vsi.nodeID)
+	} else if vsi.transmitter != nil {
+		vsi.transmitter.Stop()
+		log.Printf("VM Sync WebSocket telemetry integration stopped for node %s", vsi.nodeID)
+	}
+
+	vsi.wg.Wait()
 }
 
 // Start begins the Cloud Sync adaptive integration
@@ -375,11 +416,25 @@ func (csi *CloudSyncIntegration) SendConfigToVM(conn *websocket.Conn, config *mo
 	return conn.WriteMessage(websocket.TextMessage, msgBytes)
 }
 
-// GetTransmitter returns the telemetry transmitter
+// GetTransmitter returns the WebSocket telemetry transmitter (deprecated)
 func (vsi *VMSyncIntegration) GetTransmitter() *telemetry.Transmitter {
 	vsi.mutex.RLock()
 	defer vsi.mutex.RUnlock()
 	return vsi.transmitter
+}
+
+// GetHTTPTransmitter returns the HTTP telemetry transmitter
+func (vsi *VMSyncIntegration) GetHTTPTransmitter() *telemetry.HTTPTransmitter {
+	vsi.mutex.RLock()
+	defer vsi.mutex.RUnlock()
+	return vsi.httpTransmitter
+}
+
+// IsUsingHTTP returns true if this integration uses HTTP telemetry
+func (vsi *VMSyncIntegration) IsUsingHTTP() bool {
+	vsi.mutex.RLock()
+	defer vsi.mutex.RUnlock()
+	return vsi.useHTTP
 }
 
 // GetStats returns integration statistics
@@ -391,12 +446,19 @@ func (vsi *VMSyncIntegration) GetStats() map[string]interface{} {
 		"nodeID":            vsi.nodeID,
 		"isActive":          vsi.isActive,
 		"telemetryInterval": vsi.telemetryInterval,
+		"useHTTP":           vsi.useHTTP,
 	}
 
-	if vsi.transmitter != nil {
+	// Add transmitter-specific stats
+	if vsi.useHTTP && vsi.httpTransmitter != nil {
+		transmitterStats := vsi.httpTransmitter.GetStats()
+		for k, v := range transmitterStats {
+			stats["http_transmitter_"+k] = v
+		}
+	} else if vsi.transmitter != nil {
 		transmitterStats := vsi.transmitter.GetStats()
 		for k, v := range transmitterStats {
-			stats["transmitter_"+k] = v
+			stats["websocket_transmitter_"+k] = v
 		}
 	}
 

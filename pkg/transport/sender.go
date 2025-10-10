@@ -235,7 +235,10 @@ func (sc *senderConnection) readLoopOptimized() {
 	var lastActivity = time.Now()
 	maxConsecutiveErrors, maxTimeoutErrors, maxIOErrors := 20, 15, 8 // Increased thresholds
 	baseTimeout := sc.sender.config.ConnTimeout
-	maxIdleTime := 10 * time.Minute // Extended idle timeout
+	// STABILITY FIX: Disable idle timeout - rely on heartbeats instead
+	// TCP connections should stay open indefinitely if heartbeats are working
+	// maxIdleTime := 10 * time.Minute // Extended idle timeout
+	var maxIdleTime time.Duration = 0 // No idle timeout - connections stay open
 
 	log.Printf("🚀 TCP SENDER READ LOOP: connection %d started (ultra-stable)", sc.id)
 
@@ -245,8 +248,8 @@ func (sc *senderConnection) readLoopOptimized() {
 			log.Printf("📋 TCP SENDER SHUTDOWN: connection %d", sc.id)
 			return
 		default:
-			// ULTRA-STABLE: Check idle timeout with extended grace period
-			if time.Since(lastActivity) > maxIdleTime {
+			// STABILITY FIX: Only check idle timeout if it's actually configured
+			if maxIdleTime > 0 && time.Since(lastActivity) > maxIdleTime {
 				log.Printf("⏰ TCP SENDER IDLE: connection %d (idle %v)", sc.id, time.Since(lastActivity))
 				sc.sender.handleConnectionError(sc, fmt.Errorf("connection idle timeout"))
 				return

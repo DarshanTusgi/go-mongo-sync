@@ -724,6 +724,7 @@ func main() {
 	apiRouter.HandleFunc("/api/partitions", handlePartitionsRequest).Methods("POST")
 	apiRouter.HandleFunc("/api/sync/trigger", handleTriggerInitialSync).Methods("POST") // Manual initial sync trigger
 	apiRouter.HandleFunc("/api/sync/status", handleSyncStatus).Methods("GET")           // Sync status endpoint
+	apiRouter.HandleFunc("/api/telemetry", handleTelemetry).Methods("POST")              // HTTP telemetry endpoint
 	apiRouter.HandleFunc("/health", handleHealth).Methods("GET")
 
 	// Register metrics API routes first (to avoid conflicts)
@@ -3484,7 +3485,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("WebSocket upgrade failed: %v", err)
 		return
 	}
-	defer conn.Close()
+	
+	// STABILITY FIX: Ensure connection is always closed and removed from clients map
+	defer func() {
+		conn.Close()
+		// Remove from clients map on disconnect
+		clientsMutex.Lock()
+		if clientInfo, exists := clients[conn]; exists {
+			delete(clients, conn)
+			log.Printf("🗑️  CLEANUP: Removed %s client %s from clients map (defer cleanup)", clientInfo.ClientType, clientInfo.ClientID)
+		}
+		clientsMutex.Unlock()
+	}()
 	// Determine client type based on User-Agent or other headers
 	clientType := "unknown"
 	userAgent := r.Header.Get("User-Agent")
@@ -3647,8 +3659,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		conn.SetReadDeadline(time.Time{})
 	}
 
+	// STABILITY FIX: Thread-safe client registration with mutex protection
+	clientsMutex.Lock()
 	clients[conn] = clientInfo
 	clientCount := len(clients)
+	clientsMutex.Unlock()
+	
 	log.Printf("%s client connected. Total clients: %d", clientType, clientCount)
 	if clientType == "vm-sync" && clientInfo.OAuth2Claims != nil {
 		appLogger.Info("websocket", "vm_sync_connected", "VM-sync client connected with valid OAuth2 token", map[string]interface{}{
@@ -3691,9 +3707,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			delete(clients, conn)
-			clientCount := len(clients)
-			log.Printf("Client removed. Total clients: %d", clientCount)
+			// STABILITY FIX: Client removal handled by defer cleanup
+			// No need to manually delete here - defer ensures cleanup in all cases
 			break
 		}
 
@@ -3718,13 +3733,51 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						}
 					case "telemetry":
 						// Handle telemetry data from VM Sync
-						if clientInfo.ClientType == "vm-sync" && cloudSyncIntegration != nil {
+						if clientInfo.ClientType == "vm-sync" {
 							var telemetryMsg models.TelemetryMessage
 							if err := json.Unmarshal(messageData, &telemetryMsg); err != nil {
-								log.Printf("Error unmarshaling telemetry from client %s: %v", clientInfo.ClientID, err)
+								log.Printf("❌ TELEMETRY ERROR: Failed to unmarshal telemetry from client %s: %v", clientInfo.ClientID, err)
+								// Send error response back to VM so circuit breaker knows about the failure
+								errorResponse := map[string]interface{}{
+									"type":  "telemetry_error",
+									"error": "Failed to unmarshal telemetry message",
+								}
+								if errBytes, _ := json.Marshal(errorResponse); errBytes != nil {
+									conn.WriteMessage(websocket.TextMessage, errBytes)
+								}
 							} else {
-								cloudSyncIntegration.ProcessTelemetryMessage(&telemetryMsg)
-								log.Printf("Processed telemetry from VM Sync client %s", clientInfo.ClientID)
+								// STABILITY FIX: Check if cloudSyncIntegration is available
+								if cloudSyncIntegration != nil {
+									cloudSyncIntegration.ProcessTelemetryMessage(&telemetryMsg)
+									log.Printf("✅ TELEMETRY: Processed telemetry from VM Sync client %s (CPU=%.1f%%, Mem=%.1f%%, Latency=%.1fms)",
+										clientInfo.ClientID,
+										telemetryMsg.Data.CPUUsage,
+										telemetryMsg.Data.MemoryUsage,
+										telemetryMsg.Data.SyncLatency)
+									
+									// Send acknowledgment back to VM
+									ackResponse := map[string]interface{}{
+										"type":      "telemetry_ack",
+										"timestamp": time.Now(),
+									}
+									if ackBytes, _ := json.Marshal(ackResponse); ackBytes != nil {
+										conn.WriteMessage(websocket.TextMessage, ackBytes)
+									}
+								} else {
+									log.Printf("⚠️  TELEMETRY WARNING: cloudSyncIntegration is nil - cannot process telemetry from client %s", clientInfo.ClientID)
+									log.Printf("⚠️  DEGRADED MODE: Telemetry data received but adaptive system is not running")
+									
+									// Still send acknowledgment to prevent circuit breaker from opening
+									// This allows the system to work without adaptive features
+									ackResponse := map[string]interface{}{
+										"type":      "telemetry_ack",
+										"timestamp": time.Now(),
+										"warning":   "Adaptive system unavailable",
+									}
+									if ackBytes, _ := json.Marshal(ackResponse); ackBytes != nil {
+										conn.WriteMessage(websocket.TextMessage, ackBytes)
+									}
+								}
 							}
 						}
 					case "config_request":
@@ -6033,6 +6086,79 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleTelemetry handles HTTP telemetry data from vm-sync
+func handleTelemetry(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Validate HTTP method
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": "Method not allowed. Use POST.",
+		})
+		return
+	}
+
+	// Authenticate using JWT token (per your preference)
+	authorization := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authorization, "Bearer ") {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": "Missing or invalid Authorization header. Use Bearer token.",
+		})
+		return
+	}
+
+	token := strings.TrimPrefix(authorization, "Bearer ")
+	if authService != nil {
+		// Validate JWT token
+		claims, err := authService.ValidateToken(token)
+		if err != nil {
+			log.Printf("❌ HTTP TELEMETRY: JWT validation failed: %v", err)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "Invalid JWT token: " + err.Error(),
+			})
+			return
+		}
+		log.Printf("✅ HTTP TELEMETRY: Authenticated client_id=%s, app_id=%s", claims.ClientID, claims.AppID)
+	} else {
+		log.Printf("⚠️  HTTP TELEMETRY: No auth service configured, accepting all requests")
+	}
+
+	// Parse telemetry message
+	var telemetryMsg models.TelemetryMessage
+	if err := json.NewDecoder(r.Body).Decode(&telemetryMsg); err != nil {
+		log.Printf("❌ HTTP TELEMETRY ERROR: Failed to unmarshal telemetry: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": "Failed to parse telemetry message: " + err.Error(),
+		})
+		return
+	}
+
+	// Process telemetry data
+	if cloudSyncIntegration != nil {
+		cloudSyncIntegration.ProcessTelemetryMessage(&telemetryMsg)
+		log.Printf("✅ HTTP TELEMETRY: Processed telemetry (CPU=%.1f%%, Mem=%.1f%%, Latency=%.1fms)",
+			telemetryMsg.Data.CPUUsage,
+			telemetryMsg.Data.MemoryUsage,
+			telemetryMsg.Data.SyncLatency)
+	} else {
+		log.Printf("⚠️  HTTP TELEMETRY WARNING: cloudSyncIntegration is nil - cannot process telemetry")
+		log.Printf("⚠️  DEGRADED MODE: Telemetry data received but adaptive system is not running")
+	}
+
+	// Always send success response (graceful degradation)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"message":   "Telemetry received successfully",
+		"timestamp": time.Now(),
+		"processed": cloudSyncIntegration != nil,
+	})
 }
 
 // Helper functions for enhanced health check

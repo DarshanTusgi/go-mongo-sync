@@ -71,13 +71,17 @@ func (t *Transmitter) Stop() {
 }
 
 // UpdateConnection updates the WebSocket connection
+// STABILITY FIX: Reset circuit breaker and error counts when connection is restored
 func (t *Transmitter) UpdateConnection(conn *websocket.Conn) {
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.conn = conn
 	t.isConnected = true
 	t.errorCount = 0
-	log.Printf("Telemetry WebSocket connection updated and marked as connected")
+	// STABILITY FIX: Reset circuit breaker on successful reconnection
+	t.consecutiveFailures = 0
+	t.circuitBreakerOpen = false
+	log.Printf("✅ TELEMETRY RECONNECTED: WebSocket connection updated, circuit breaker reset")
 }
 
 // MarkDisconnected marks the connection as disconnected
@@ -116,13 +120,16 @@ func (t *Transmitter) transmissionLoop() {
 	ticker := time.NewTicker(t.interval)
 	defer ticker.Stop()
 
+	log.Printf("🟢 TELEMETRY TRANSMITTER: Started with interval %v", t.interval)
+
 	for {
 		select {
 		case <-t.ctx.Done():
+			log.Printf("🛑 TELEMETRY TRANSMITTER: Stopped (context cancelled)")
 			return
 		case <-ticker.C:
 			if err := t.transmitTelemetry(); err != nil {
-				log.Printf("Failed to transmit telemetry: %v", err)
+				log.Printf("❌ TELEMETRY TRANSMIT FAILED: %v", err)
 				t.handleTransmissionError(err)
 			} else {
 				t.handleTransmissionSuccess()
@@ -132,6 +139,7 @@ func (t *Transmitter) transmissionLoop() {
 }
 
 // transmitTelemetry collects and sends telemetry data
+// STABILITY FIX: Improved error handling and logging for telemetry transmission
 func (t *Transmitter) transmitTelemetry() error {
 	// Check circuit breaker status
 	t.mutex.RLock()
@@ -150,12 +158,16 @@ func (t *Transmitter) transmitTelemetry() error {
 		t.mutex.Lock()
 		t.circuitBreakerOpen = false
 		t.isConnected = true
-		log.Printf("Circuit breaker half-open - attempting telemetry transmission")
+		log.Printf("🟡 TELEMETRY: Circuit breaker half-open - attempting transmission")
 		t.mutex.Unlock()
 	}
 
-	if !isConnected || conn == nil {
-		return fmt.Errorf("no active WebSocket connection")
+	if !isConnected {
+		return fmt.Errorf("transmitter marked as disconnected")
+	}
+	
+	if conn == nil {
+		return fmt.Errorf("no active WebSocket connection (conn is nil)")
 	}
 
 	// Collect telemetry data
@@ -177,13 +189,20 @@ func (t *Transmitter) transmitTelemetry() error {
 		return fmt.Errorf("failed to marshal telemetry message: %w", err)
 	}
 
-	// Send message with timeout
+	log.Printf("📤 TELEMETRY: Sending data (CPU=%.1f%%, Mem=%.1f%%, Latency=%.1fms)",
+		telemetryData.CPUUsage, telemetryData.MemoryUsage, telemetryData.SyncLatency)
+
+	// STABILITY FIX: Send message with timeout and better error handling
 	ctx, cancel := context.WithTimeout(t.ctx, time.Second*10)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- conn.WriteMessage(websocket.TextMessage, msgBytes)
+		writeErr := conn.WriteMessage(websocket.TextMessage, msgBytes)
+		if writeErr != nil {
+			log.Printf("❌ TELEMETRY: WebSocket write failed: %v", writeErr)
+		}
+		done <- writeErr
 	}()
 
 	select {
@@ -191,8 +210,9 @@ func (t *Transmitter) transmitTelemetry() error {
 		if err != nil {
 			return fmt.Errorf("failed to send telemetry message: %w", err)
 		}
+		log.Printf("✅ TELEMETRY: Message sent successfully via WebSocket")
 	case <-ctx.Done():
-		return fmt.Errorf("telemetry transmission timeout")
+		return fmt.Errorf("telemetry transmission timeout (10s)")
 	}
 
 	return nil
@@ -207,7 +227,7 @@ func (t *Transmitter) handleTransmissionError(err error) {
 	t.consecutiveFailures++
 	t.lastFailureTime = time.Now()
 
-	log.Printf("Telemetry transmission error (count: %d, consecutive: %d): %v",
+	log.Printf("❌ TELEMETRY ERROR (total: %d, consecutive: %d): %v",
 		t.errorCount, t.consecutiveFailures, err)
 
 	// Calculate exponential backoff delay
@@ -221,9 +241,9 @@ func (t *Transmitter) handleTransmissionError(err error) {
 		t.isConnected = false
 		t.circuitBreakerOpen = true
 		t.circuitBreakerUntil = time.Now().Add(backoffDelay)
-		log.Printf("Circuit breaker opened for telemetry transmission. Will retry after %v", backoffDelay)
+		log.Printf("🔴 CIRCUIT BREAKER OPENED: Telemetry paused until %v (backoff: %v)", t.circuitBreakerUntil, backoffDelay)
 	} else {
-		log.Printf("Next telemetry retry will use backoff delay: %v", backoffDelay)
+		log.Printf("⏱️  BACKOFF: Next telemetry retry will wait %v", backoffDelay)
 	}
 }
 
@@ -233,10 +253,16 @@ func (t *Transmitter) handleTransmissionSuccess() {
 	defer t.mutex.Unlock()
 
 	t.lastTransmission = time.Now()
+	wasOpen := t.circuitBreakerOpen
 	t.errorCount = 0             // Reset error count on success
 	t.consecutiveFailures = 0    // Reset consecutive failures
 	t.circuitBreakerOpen = false // Close circuit breaker
-	log.Printf("Telemetry transmission successful - circuit breaker closed")
+	
+	if wasOpen {
+		log.Printf("🟢 CIRCUIT BREAKER CLOSED: Telemetry transmission recovered")
+	} else {
+		log.Printf("✅ TELEMETRY SUCCESS: Transmission healthy (no errors)")
+	}
 }
 
 // SendImmediateTelemetry sends telemetry data immediately (outside of the regular interval)

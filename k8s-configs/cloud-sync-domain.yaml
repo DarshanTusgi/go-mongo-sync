@@ -1,0 +1,89 @@
+# Cloud-Sync Domain-Based Configuration for Kubernetes
+# Domain: darshan.com
+
+server:
+  port: 8080
+  host: "0.0.0.0"  # Listen on all interfaces for Kubernetes
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+  data_timeout: "600s"
+
+websocket:
+  endpoint: "/ws"
+  allowed_origins: 
+    - "https://darshan.com"
+    - "https://*.darshan.com"
+    - "http://darshan.com"
+    - "http://*.darshan.com"
+  read_buffer_size: 4096
+  write_buffer_size: 4096
+
+mongodb:
+  uri: "${MONGODB_URI}"  # Set via environment variable
+  timeout: 30s
+  databases:
+    - name: "production-db"
+      collections:
+        - "users"
+        - "products"
+        - "orders"
+        - "analytics"
+
+sync:
+  initial_sync: true
+  realtime_sync: true
+  resumable_initial_sync: true
+  batch_size: 1000
+  parallel_collections: true
+  max_workers: 8
+  
+  # Transport configuration for high-performance
+  transport:
+    mode: "tcp"  # Primary mode
+    http_fallback: true
+    compression_type: "zstd"
+    tcp_sender:
+      address: "${VM_SYNC_TCP_ADDRESS}"  # xyz.com:9000
+      parallel_conns: 8
+      window_size: 128
+      batch_timeout: 10s
+      conn_timeout: 60s
+      keep_alive: 30s
+      max_retries: 5
+      retry_backoff: 2s
+      buffer_size: 1048576  # 1MB
+      max_batch_size: 67108864  # 64MB
+    health_monitor: 30s
+
+# Advanced features
+checkpoint:
+  enabled: true
+  database: "checkpoints"
+  collection: "resume_tokens"
+  save_interval: 5
+
+tracking:
+  enabled: true
+  database: "tracking"
+  collection: "transfers"
+
+sequence:
+  enabled: true
+  database: "sequence"
+  collection: "counters"
+  batch_size: 1000
+  node_id: "cloud-darshan-com"
+
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  key_id: "${ENCRYPTION_KEY_ID}"
+  key: "${ENCRYPTION_KEY}"
+
+internal_cluster:
+  enabled: true
+  worker_pool:
+    worker_count: 16
+    queue_size: 10000
+    batch_size: 500
