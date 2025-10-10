@@ -1,38 +1,59 @@
-# Test VM-sync configuration for initial dump testing
+# VM-sync HTTP client configuration - Production
+# 
+# License Configuration (Environment Variable):
+# VM_SYNC_LICENSE="vm-tag,vm-uuid-456"  # VM-sync license key
+# 
+# Production Environment Variables (required):
+# VM_SYNC_LICENSE: Your vm-sync license UUID (must match cloud-sync authorization)
+# MONGODB_URI: Your local MongoDB connection string
+# CLOUD_SYNC_URL: URL of your cloud-sync server (e.g., https://your-cloud-sync.com)
+# CLOUD_SYNC_WS_URL: WebSocket URL of your cloud-sync server (e.g., wss://your-cloud-sync.com/ws)
+# ENCRYPTION_KEY: Base64 encoded 32-byte encryption key (must match cloud-sync)
+# ENCRYPTION_KEY_ID: Unique identifier for your encryption key (must match cloud-sync)
+
+server:
+  port: 8081
+  host: "0.0.0.0"  # Listen on all interfaces for production
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+
 cloud_sync:
   http_url: "http://localhost:8080"
   ws_url: "ws://localhost:8080/ws"
   http_timeout: "600s"
   
-  # OAuth2 authentication - using generated credentials
+  # OAuth2 authentication - Production (use environment variables)
   oauth2:
     enabled: true
-    client_id: "vm_sync_c9bf87e373213c1e"
-    client_secret: "54c1493d9595b1f5d20bb7afc0c61e0019b929a2b62d86a236c564b1d7f6ef19"
-    token_url: "http://localhost:8080/api/auth/token"
+    client_id: "${VM_SYNC_CLIENT_ID}"
+    client_secret: "${VM_SYNC_CLIENT_SECRET}"
+    token_url: "${CLOUD_SYNC_URL}/api/auth/token"
 
 mongodb:
-  uri: "mongodb://localhost:27017/?retryWrites=true&w=majority"
+  # Production URI (use environment variable)
+  uri: "${MONGODB_URI}"
   timeout: 30s
 
-# Collections to sync - using same database name on target for testing
+# Collections to sync - Production collections
+# Format: "source-db.collection:target-db.collection" or "source-db.collection" (uses same name)
 collections:
-  - "real_transfer_test.products:real_transfer_test.products"
-  - "real_transfer_test.customers:real_transfer_test.customers"
-  - "real_transfer_test.orders:real_transfer_test.orders"
-  - "real_transfer_test.inventory:real_transfer_test.inventory"
+  - "${SOURCE_DATABASE}.products:${TARGET_DATABASE}.products"
+  - "${SOURCE_DATABASE}.customers:${TARGET_DATABASE}.customers"
+  - "${SOURCE_DATABASE}.orders:${TARGET_DATABASE}.orders"
+  - "${SOURCE_DATABASE}.inventory:${TARGET_DATABASE}.inventory"
 
 sync:
   initial_sync: true
   realtime_sync: false  # Disabled in favor of scheduler-based sync
   scheduler_sync: true  # Enable scheduler-based sync to receive incremental updates
-  scheduler_interval: "5m"  # Should match cloud-sync interval
+  scheduler_interval: "30m"  # Production: 30 minutes (configurable)
   resumable_initial_sync: true
-  batch_size: 100
+  batch_size: 500      # Production optimized batch size
   parallel_collections: true
-  max_workers: 4
-  retry_attempts: 3
-  retry_delay: "5s"
+  max_workers: 8       # Increased for production
+  retry_attempts: 5    # Increased for production reliability
+  retry_delay: "10s"   # Increased delay for production stability
   
   # TCP Transport Configuration - THIS IS THE KEY
   transport:
@@ -51,12 +72,13 @@ sync:
       max_batch_size: 67108864      # Increased to 64MB for efficiency
       tls_enabled: false
 
-# Encryption configuration
+# Encryption configuration (must match cloud-sync)
 encryption:
   enabled: true
   algorithm: "AES-256-GCM"
-  key_id: "cloud-sync-key-001"
-  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"
+  # Production keys (use environment variables)
+  key_id: "${ENCRYPTION_KEY_ID}"
+  key: "${ENCRYPTION_KEY}"  # Base64 encoded 32-byte key
 
 # Checkpoint configuration
 checkpoint:
@@ -67,32 +89,65 @@ checkpoint:
   cleanup_enabled: true
   retention_days: 7
 
-# Watermarks configuration
+# Watermarks configuration for exactly-once semantics
 watermarks:
-  enabled: false  # Disabled for testing
+  enabled: true  # Enabled for production
+  database: "vm_sync_watermarks"
+  collection: "event_watermarks"
 
-# Sequence configuration
+# Sequence configuration for ordered event processing
 sequence:
   enabled: true
   database: "vm_sync_sequences"
   collection: "sequence_counters"
-  batch_size: 500
-  node_id: "vm-sync-test-001"
+  batch_size: 1000  # Increased for production
+  node_id: "vm-sync-prod-001"  # Production node ID
 
-# Cluster time fence
+# Cluster time fence for snapshot consistency
 fence:
   enabled: true
 
-# Logging
+# Internal cluster configuration
+# Multiple vm-sync instances can form a cluster for high availability
+cluster:
+  enabled: true
+  node_id: "vm-sync-prod-node-1"  # Unique ID for production node
+  discovery_port: 9090
+  heartbeat_interval: "10s"
+  election_timeout: "5s"
+  log_level: "warn"  # Production log level
+
+# Connection and retry configuration
+connection:
+  reconnect_interval: "10s"  # Increased for production
+  max_reconnect_attempts: 20  # Increased for production
+  connection_timeout: "600s"  # Increased for large data transfers
+  keepalive_interval: "60s"   # Increased for production
+
+# Logging configuration
 logging:
-  level: "info"
+  level: "warn"       # Production log level
   format: "json"
   output: "stdout"
   include_timestamps: true
 
-# Performance tuning
+# Performance tuning - Production optimized
 performance:
-  buffer_size: 10000
-  flush_interval: "500ms"
-  max_batch_wait: "5s"
+  buffer_size: 50000   # Increased for production
+  flush_interval: "1s" # Increased for production
+  max_batch_wait: "10s" # Increased for production
   compression_enabled: true
+
+# Health check configuration
+health:
+  enabled: true
+  port: 8081
+  path: "/health"
+  interval: "60s"  # Increased for production
+
+# Metrics configuration
+metrics:
+  enabled: true
+  port: 8082
+  path: "/metrics"
+  collection_interval: "30s"  # Increased for production

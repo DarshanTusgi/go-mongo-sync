@@ -36,7 +36,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_DIR="$(dirname "$SCRIPT_DIR")"
 BINARY="$BINARY_DIR/cloud-sync"
-CONFIG="$BINARY_DIR/configs/cloud-config.yaml"
+CONFIG="$BINARY_DIR/configs/cloud-example.yaml"
 
 echo -e "${BLUE}🚀 Starting Cloud-Sync Service${NC}"
 echo -e "Binary: $BINARY"
@@ -80,7 +80,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_DIR="$(dirname "$SCRIPT_DIR")"
 BINARY="$BINARY_DIR/vm-sync"
-CONFIG="$BINARY_DIR/configs/vm-config.yaml"
+CONFIG="$BINARY_DIR/configs/vm-example.yaml"
 
 echo -e "${BLUE}🚀 Starting VM-Sync Service${NC}"
 echo -e "Binary: $BINARY"

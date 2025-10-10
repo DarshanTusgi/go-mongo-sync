@@ -14,6 +14,14 @@
 # ENCRYPTION_KEY: Base64 encoded 32-byte encryption key (must match cloud-sync)
 # ENCRYPTION_KEY_ID: Unique identifier for your encryption key (must match cloud-sync)
 
+# VM-sync HTTP server configuration
+server:
+  port: 8081                  # HTTP server port (can override with VM_SYNC_PORT env var)
+  host: "0.0.0.0"             # Listen on all interfaces (use "localhost" for local-only)
+  read_timeout: "30s"         # Timeout for reading the entire request
+  write_timeout: "30s"        # Timeout for writing the response  
+  idle_timeout: "120s"        # Keep-alive timeout for idle connections
+
 cloud_sync:
   # Production URLs - Using path-based routing with BASE_PATH-TENANT_ID-COMMUNITY_ID
   # Cloud-sync is configured with BASE_PATH="cloudsync", TENANT_ID="737373", COMMUNITY_ID="828282"

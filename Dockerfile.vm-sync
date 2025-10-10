@@ -39,6 +39,9 @@ WORKDIR /app
 COPY --from=builder /app/vm-sync .
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
+# Copy configuration files
+COPY --chown=vmsync:vmsync configs/ ./configs/
+
 # Create directories with proper permissions
 RUN mkdir -p /app/logs /app/state /app/checkpoints && \
     chown -R vmsync:vmsync /app
@@ -46,13 +49,13 @@ RUN mkdir -p /app/logs /app/state /app/checkpoints && \
 # Switch to non-root user
 USER vmsync
 
-# Expose ports (health check and metrics)
+# Expose ports (HTTP: 8081, Metrics: 8082, TCP receiver: 9000 - cloud-sync connects here)
 EXPOSE 8081 8082 9000
 
-# Health check
+# Health check using HTTP endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep vm-sync || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8081/health || exit 1
 
 # Default command
 ENTRYPOINT ["./vm-sync"]
-CMD ["-config", "/app/config.yaml"]
+CMD ["-config", "/app/configs/vm-example.yaml"]

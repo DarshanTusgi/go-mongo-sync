@@ -150,5 +150,91 @@ metadata:
   namespace: data-sync
 data:
   config.yaml: |
-    # Content from cloud-sync-domain.yaml will be inserted here
-    # This is managed separately for easier updates
+    # Cloud-Sync Kubernetes Production Configuration
+    # Deployed on darshan.com domain
+    # ⚠️ KUBERNETES REQUIREMENT: Host MUST be "0.0.0.0"
+    
+    server:
+      port: 8080
+      host: "0.0.0.0"        # ⚠️ CRITICAL: Must be 0.0.0.0 in Kubernetes!
+      read_timeout: "30s"
+      write_timeout: "30s"
+      idle_timeout: "120s"
+    
+    websocket:
+      endpoint: "/ws"
+      max_message_size: 10485760
+      ping_interval: "30s"
+      pong_wait: "60s"
+    
+    mongodb:
+      # Inject via secret - see MONGODB_URI env var
+      uri: "${MONGODB_URI}"
+      timeout: 30s
+      databases:
+        - name: "real_transfer_test"
+          enabled: true
+          collections:
+            - name: "products"
+              enabled: true
+            - name: "customers"
+              enabled: true
+            - name: "orders"
+              enabled: true
+            - name: "inventory"
+              enabled: true
+    
+    sync:
+      resumable_initial_sync: true
+      force_initial_sync: false
+      
+      transport:
+        mode: "tcp"
+        http_fallback: true
+        compression_type: "zstd"
+        health_monitor: "30s"
+        tcp_sender:
+          # Target VM-Sync at xyz.com (cross-domain)
+          address: "${VM_SYNC_TCP_ADDRESS}"  # xyz.com:9000
+          parallel_conns: 8
+          window_size: 128
+          batch_timeout: 10s
+          conn_timeout: 60s
+          keep_alive: 30s
+          max_retries: 5
+          retry_backoff: 2s
+          buffer_size: 1048576
+          max_batch_size: 67108864
+    
+    encryption:
+      enabled: true
+      algorithm: "AES-256-GCM"
+      # Inject via secret - see ENCRYPTION_KEY env vars
+      key_id: "${ENCRYPTION_KEY_ID}"
+      key: "${ENCRYPTION_KEY}"
+    
+    checkpoint:
+      enabled: true
+      database: "cloud_sync_checkpoints"
+      collection: "resume_tokens"
+      save_interval: 30
+    
+    tracking:
+      enabled: true
+      database: "cloud_sync_tracking"
+      collection: "transfers"
+      cleanup_interval: 3600
+      retention_days: 7
+    
+    sequence:
+      enabled: true
+      database: "cloud_sync_sequences"
+      collection: "counters"
+      batch_size: 1000
+      node_id: "cloud-sync-k8s-pod"
+    
+    fence:
+      enabled: true
+    
+    internal_cluster:
+      enabled: false

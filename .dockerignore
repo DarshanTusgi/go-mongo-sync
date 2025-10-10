@@ -51,3 +51,5 @@ monitoring/
 examples/*.yaml
 !examples/cloud-config.yaml
 !examples/vm-config.yaml
+
+# Note: configs/ directory is included for container configuration

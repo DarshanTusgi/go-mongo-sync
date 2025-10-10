@@ -14,6 +14,14 @@
 # ENCRYPTION_KEY: Base64 encoded 32-byte encryption key (must match cloud-sync)
 # ENCRYPTION_KEY_ID: Unique identifier for your encryption key (must match cloud-sync)
 
+# VM-sync HTTP server configuration
+server:
+  port: 8081
+  host: "0.0.0.0"  # Listen on all interfaces
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+
 cloud_sync:
   # Production URLs - Using path-based routing with BASE_PATH-TENANT_ID-COMMUNITY_ID
   # Cloud-sync is configured with BASE_PATH="cloudsync", TENANT_ID="737373", COMMUNITY_ID="828282"
@@ -124,15 +132,6 @@ metrics:
   port: 8082
   path: "/metrics"
   collection_interval: "10s"
-
-# Checkpoint configuration for client-side resume token tracking
-checkpoint:
-  enabled: true
-  database: "vm_sync_checkpoints"
-  collection: "client_resume_tokens"
-  save_interval_seconds: 3
-  cleanup_enabled: true
-  retention_days: 7
 
 # Checkpoint configuration for client-side resume token tracking
 checkpoint:

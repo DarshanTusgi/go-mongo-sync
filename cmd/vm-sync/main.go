@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,6 +41,13 @@ import (
 
 // Config represents the client configuration
 type Config struct {
+	Server struct {
+		Port         int           `yaml:"port"`
+		Host         string        `yaml:"host"`
+		ReadTimeout  time.Duration `yaml:"read_timeout"`
+		WriteTimeout time.Duration `yaml:"write_timeout"`
+		IdleTimeout  time.Duration `yaml:"idle_timeout"`
+	} `yaml:"server"`
 	CloudSync struct {
 		HTTPURL     string        `yaml:"http_url"`
 		WSURL       string        `yaml:"ws_url"`
@@ -110,6 +118,10 @@ var (
 	vmSyncIntegration  *adaptive.VMSyncIntegration
 	// HTTP server for graceful shutdown
 	httpServer *http.Server
+
+	// WebSocket connection for graceful shutdown
+	websocketConn      *websocket.Conn
+	websocketConnMutex sync.RWMutex
 
 	// TCP transport for high-performance data transfer
 	tcpReceiver         transport.Receiver
@@ -828,6 +840,17 @@ func main() {
 	}
 
 	// Close WebSocket connection if exists
+	websocketConnMutex.RLock()
+	if websocketConn != nil {
+		log.Println("🔌 Closing WebSocket connection...")
+		// Send close message to cloud-sync
+		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "VM-sync shutting down")
+		websocketConn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(5*time.Second))
+		websocketConn.Close()
+		log.Println("✅ WebSocket connection closed gracefully")
+	}
+	websocketConnMutex.RUnlock()
+	
 	if vmSyncIntegration != nil {
 		if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
 			transmitter.MarkDisconnected()
@@ -860,18 +883,53 @@ func startHTTPServer() {
 		w.Write([]byte("OK"))
 	}).Methods("GET")
 
-	port := "8081" // Default port for vm-sync
-	if envPort := os.Getenv("VM_SYNC_PORT"); envPort != "" {
-		port = envPort
+	// Get port from config, environment variable, or use default
+	port := config.Server.Port
+	if port == 0 {
+		// Fallback to environment variable if config not set
+		if envPort := os.Getenv("VM_SYNC_PORT"); envPort != "" {
+			if parsedPort, err := strconv.Atoi(envPort); err == nil {
+				port = parsedPort
+			} else {
+				log.Printf("WARNING: Invalid VM_SYNC_PORT '%s', using default 8081", envPort)
+				port = 8081
+			}
+		} else {
+			port = 8081 // Default port
+		}
 	}
 
-	// Create HTTP server instance for graceful shutdown
+	// Get host from config or use default
+	host := config.Server.Host
+	if host == "" {
+		host = "0.0.0.0" // Default to listen on all interfaces
+	}
+
+	// Create HTTP server instance for graceful shutdown with configured timeouts
 	httpServer = &http.Server{
-		Addr:    ":" + port,
-		Handler: router,
+		Addr:         fmt.Sprintf("%s:%d", host, port),
+		Handler:      router,
+		ReadTimeout:  config.Server.ReadTimeout,
+		WriteTimeout: config.Server.WriteTimeout,
+		IdleTimeout:  config.Server.IdleTimeout,
 	}
 
-	log.Printf("HTTP server starting on port %s", port)
+	// Apply default timeouts if not configured
+	if httpServer.ReadTimeout == 0 {
+		httpServer.ReadTimeout = 15 * time.Second
+	}
+	if httpServer.WriteTimeout == 0 {
+		httpServer.WriteTimeout = 15 * time.Second
+	}
+	if httpServer.IdleTimeout == 0 {
+		httpServer.IdleTimeout = 60 * time.Second
+	}
+
+	log.Printf("🚀 VM-SYNC HTTP SERVER: Starting on %s:%d", host, port)
+	log.Printf("📋 HTTP CONFIG: ReadTimeout=%v, WriteTimeout=%v, IdleTimeout=%v", 
+		httpServer.ReadTimeout, httpServer.WriteTimeout, httpServer.IdleTimeout)
+	log.Printf("🔗 ENDPOINTS: Push=/api/v1/push/{db}/{coll}, Health=/health")
+	
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server failed: %v", err)
 	}
@@ -1972,6 +2030,12 @@ func connectWebSocket() error {
 	if err != nil {
 		return err
 	}
+	
+	// Store connection globally for graceful shutdown
+	websocketConnMutex.Lock()
+	websocketConn = conn
+	websocketConnMutex.Unlock()
+	
 	// Note: Connection will be managed by the adaptive integration, not closed here
 
 	log.Println("Connected to WebSocket for real-time sync")

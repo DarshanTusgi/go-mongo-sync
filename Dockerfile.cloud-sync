@@ -39,6 +39,9 @@ WORKDIR /app
 COPY --from=builder /app/cloud-sync .
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
+# Copy configuration files
+COPY --chown=cloudsync:cloudsync configs/ ./configs/
+
 # Copy web assets for dashboard
 COPY --chown=cloudsync:cloudsync web/ ./web/
 
@@ -49,8 +52,8 @@ RUN mkdir -p /app/logs /app/state && \
 # Switch to non-root user
 USER cloudsync
 
-# Expose ports
-EXPOSE 8080 9090
+# Expose ports (HTTP/WebSocket: 8080 - vm-sync connects to cloud-sync for control plane)
+EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
@@ -58,4 +61,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 # Default command
 ENTRYPOINT ["./cloud-sync"]
-CMD ["-config", "/app/config.yaml"]
+CMD ["-config", "/app/configs/cloud-example.yaml"]
