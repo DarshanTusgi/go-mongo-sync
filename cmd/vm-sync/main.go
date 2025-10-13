@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -2715,98 +2716,123 @@ func handleInitialSyncTrigger(jsonMsg map[string]interface{}, conn *websocket.Co
 		log.Printf("✅ INITIAL SYNC: Acknowledgment sent to cloud-sync")
 	}
 
-	// Perform full database replacement for all configured collections
-	log.Printf("🗑️ INITIAL SYNC: Starting full database replacement for %d collections", len(config.Collections))
+	// PERFORMANCE FIX: Perform full database replacement for all configured collections IN PARALLEL
+	log.Printf("🗑️ INITIAL SYNC: Starting PARALLEL full database replacement for %d collections", len(config.Collections))
 
 	totalCollections := len(config.Collections)
-	successCount := 0
-	failedCollections := make([]string, 0)
+	var successCount int32 = 0
+	var failedCollections []string
+	var failedMutex sync.Mutex
 
+	// Use WaitGroup for parallel processing
+	var wg sync.WaitGroup
+
+	// PARALLEL PROCESSING: Process each collection concurrently
 	for i, collectionName := range config.Collections {
-		// Parse collection mapping format: "source.db.collection" or "source.db.collection:target.db.collection"
-		var sourceCollection string
-		if strings.Contains(collectionName, ":") {
-			// Format: "source.db.collection:target.db.collection"
-			mappingParts := strings.Split(collectionName, ":")
-			sourceCollection = mappingParts[0]
-		} else {
-			// Format: "source.db.collection" (no target mapping)
-			sourceCollection = collectionName
-		}
-		
-		// Split source collection into database and collection
-		parts := splitDatabaseCollection(sourceCollection)
-		if len(parts) != 2 {
-			log.Printf("⚠️ INITIAL SYNC: Skipping invalid collection format: %s", collectionName)
-			failedCollections = append(failedCollections, collectionName)
-			continue
-		}
+		wg.Add(1)
+		go func(index int, collName string) {
+			defer wg.Done()
 
-		database := parts[0]
-		collection := parts[1]
-
-		log.Printf("🔄 INITIAL SYNC: [%d/%d] Processing %s.%s", i+1, totalCollections, database, collection)
-
-		// Map source to target collection
-		fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
-		targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
-		if err != nil {
-			log.Printf("❌ INITIAL SYNC: Failed to map collection %s: %v", fullSourceCollection, err)
-			failedCollections = append(failedCollections, collectionName)
-			continue
-		}
-
-		log.Printf("🎯 INITIAL SYNC: Mapped %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
-
-		// Step 1: Clear target collection (COMPLETE REPLACEMENT)
-		log.Printf("🗑️ INITIAL SYNC: Dropping collection %s.%s", targetDatabase, targetCollection)
-		targetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		if err := targetColl.Drop(ctx); err != nil {
-			log.Printf("⚠️ INITIAL SYNC: Failed to drop %s.%s (might not exist): %v", targetDatabase, targetCollection, err)
-			// Continue even if drop fails - collection might not exist
-		}
-		cancel()
-		log.Printf("✅ INITIAL SYNC: Collection %s.%s cleared", targetDatabase, targetCollection)
-
-		// Step 2: Clear checkpoints and watermarks for clean state
-		if checkpointMgr != nil {
-			log.Printf("🔄 INITIAL SYNC: Clearing checkpoints for %s.%s", targetDatabase, targetCollection)
-			// Checkpoints will be recreated during sync
-		}
-		if watermarkMgr != nil {
-			log.Printf("🔄 INITIAL SYNC: Clearing watermarks for %s.%s", targetDatabase, targetCollection)
-			// Watermarks will be recreated during sync
-		}
-
-		// Step 3: Perform full sync from cloud (get ALL data + metadata)
-		log.Printf("🚀 INITIAL SYNC: Starting full data + metadata sync for %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
-		if err := syncCollectionDataWithMapping(database, collection, targetDatabase, targetCollection); err != nil {
-			log.Printf("❌ INITIAL SYNC: Failed to sync collection %s.%s -> %s.%s: %v", database, collection, targetDatabase, targetCollection, err)
-			failedCollections = append(failedCollections, collectionName)
-			continue
-		}
-
-		// CRITICAL: Verify that indexes and metadata were properly transferred
-		verifyTargetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
-		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		indexView := verifyTargetColl.Indexes()
-		indexCursor, err := indexView.List(verifyCtx)
-		if err == nil {
-			indexCount := 0
-			for indexCursor.Next(verifyCtx) {
-				indexCount++
+			// Parse collection mapping format: "source.db.collection" or "source.db.collection:target.db.collection"
+			var sourceCollection string
+			if strings.Contains(collName, ":") {
+				// Format: "source.db.collection:target.db.collection"
+				mappingParts := strings.Split(collName, ":")
+				sourceCollection = mappingParts[0]
+			} else {
+				// Format: "source.db.collection" (no target mapping)
+				sourceCollection = collName
 			}
-			indexCursor.Close(verifyCtx)
-			log.Printf("✅ INITIAL SYNC: Verified %d indexes created for %s.%s", indexCount, targetDatabase, targetCollection)
-		} else {
-			log.Printf("⚠️ INITIAL SYNC: Failed to verify indexes for %s.%s: %v", targetDatabase, targetCollection, err)
-		}
-		verifyCancel()
 
-		successCount++
-		log.Printf("✅ INITIAL SYNC: [%d/%d] Successfully replaced %s.%s", i+1, totalCollections, targetDatabase, targetCollection)
+			// Split source collection into database and collection
+			parts := splitDatabaseCollection(sourceCollection)
+			if len(parts) != 2 {
+				log.Printf("⚠️ INITIAL SYNC: Skipping invalid collection format: %s", collName)
+				failedMutex.Lock()
+				failedCollections = append(failedCollections, collName)
+				failedMutex.Unlock()
+				return
+			}
+
+			database := parts[0]
+			collection := parts[1]
+
+			log.Printf("🔄 INITIAL SYNC PARALLEL: [%d/%d] Processing %s.%s", index+1, totalCollections, database, collection)
+
+			// Map source to target collection
+			fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
+			targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
+			if err != nil {
+				log.Printf("❌ INITIAL SYNC: Failed to map collection %s: %v", fullSourceCollection, err)
+				failedMutex.Lock()
+				failedCollections = append(failedCollections, collName)
+				failedMutex.Unlock()
+				return
+			}
+
+			log.Printf("🎯 INITIAL SYNC PARALLEL: Mapped %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
+
+			// Step 1: Clear target collection (COMPLETE REPLACEMENT)
+			log.Printf("🗑️ INITIAL SYNC PARALLEL: Dropping collection %s.%s", targetDatabase, targetCollection)
+			targetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			if err := targetColl.Drop(ctx); err != nil {
+				log.Printf("⚠️ INITIAL SYNC: Failed to drop %s.%s (might not exist): %v", targetDatabase, targetCollection, err)
+				// Continue even if drop fails - collection might not exist
+			}
+			cancel()
+			log.Printf("✅ INITIAL SYNC PARALLEL: Collection %s.%s cleared", targetDatabase, targetCollection)
+
+			// Step 2: Clear checkpoints and watermarks for clean state
+			if checkpointMgr != nil {
+				log.Printf("🔄 INITIAL SYNC PARALLEL: Clearing checkpoints for %s.%s", targetDatabase, targetCollection)
+				// Checkpoints will be recreated during sync
+			}
+			if watermarkMgr != nil {
+				log.Printf("🔄 INITIAL SYNC PARALLEL: Clearing watermarks for %s.%s", targetDatabase, targetCollection)
+				// Watermarks will be recreated during sync
+			}
+
+			// Step 3: Perform full sync from cloud (get ALL data + metadata)
+			syncStartTime := time.Now()
+			log.Printf("🚀 INITIAL SYNC PARALLEL: Starting full data + metadata sync for %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
+			if err := syncCollectionDataWithMapping(database, collection, targetDatabase, targetCollection); err != nil {
+				log.Printf("❌ INITIAL SYNC: Failed to sync collection %s.%s -> %s.%s: %v", database, collection, targetDatabase, targetCollection, err)
+				failedMutex.Lock()
+				failedCollections = append(failedCollections, collName)
+				failedMutex.Unlock()
+				return
+			}
+			syncDuration := time.Since(syncStartTime)
+			log.Printf("⏱️ INITIAL SYNC PARALLEL: Sync completed for %s.%s in %v", targetDatabase, targetCollection, syncDuration)
+
+			// CRITICAL: Verify that indexes and metadata were properly transferred
+			verifyTargetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
+			verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			indexView := verifyTargetColl.Indexes()
+			indexCursor, err := indexView.List(verifyCtx)
+			if err == nil {
+				indexCount := 0
+				for indexCursor.Next(verifyCtx) {
+					indexCount++
+				}
+				indexCursor.Close(verifyCtx)
+				log.Printf("✅ INITIAL SYNC PARALLEL: Verified %d indexes created for %s.%s", indexCount, targetDatabase, targetCollection)
+			} else {
+				log.Printf("⚠️ INITIAL SYNC: Failed to verify indexes for %s.%s: %v", targetDatabase, targetCollection, err)
+			}
+			verifyCancel()
+
+			// Increment success count atomically
+			atomic.AddInt32(&successCount, 1)
+			log.Printf("✅ INITIAL SYNC PARALLEL: [%d/%d] Successfully replaced %s.%s", index+1, totalCollections, targetDatabase, targetCollection)
+		}(i, collectionName)
 	}
+
+	// Wait for all collections to finish processing
+	log.Printf("⏳ INITIAL SYNC: Waiting for all %d collections to complete...", totalCollections)
+	wg.Wait()
+	log.Printf("✅ INITIAL SYNC: All collections processed")
 
 	// Send final status back to cloud-sync
 	finalStatus := "completed"
