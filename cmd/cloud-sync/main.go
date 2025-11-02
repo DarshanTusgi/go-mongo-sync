@@ -157,6 +157,100 @@ var (
 	maxConnectionsPerIP int = 10
 )
 
+// initializeTCPTransportWithAddress initializes the TCP transport with a specific address
+func initializeTCPTransportWithAddress(address string) error {
+	// Check if TCP transport is enabled in config
+	if config.Sync.Transport.Mode != "tcp" {
+		log.Printf("TCP transport disabled, using mode: %s", config.Sync.Transport.Mode)
+		return nil
+	}
+
+	// Validate address
+	if address == "" {
+		return fmt.Errorf("TCP sender address is empty")
+	}
+
+	// Create high-performance TCP sender configuration for billion-document transfers
+	senderConfig := transport.SenderConfig{
+		Address:       address,
+		ParallelConns: config.Sync.Transport.TCPSender.ParallelConns,
+		WindowSize:    config.Sync.Transport.TCPSender.WindowSize,
+		BatchTimeout:  config.Sync.Transport.TCPSender.BatchTimeout,
+		ConnTimeout:   config.Sync.Transport.TCPSender.ConnTimeout,
+		KeepAlive:     config.Sync.Transport.TCPSender.KeepAlive,
+		MaxRetries:    config.Sync.Transport.TCPSender.MaxRetries,
+		RetryBackoff:  config.Sync.Transport.TCPSender.RetryBackoff,
+		BufferSize:    config.Sync.Transport.TCPSender.BufferSize,
+		MaxBatchSize:  config.Sync.Transport.TCPSender.MaxBatchSize,
+	}
+
+	// OPTIMIZED: Set compression type with high-performance options for billion-document transfers
+	switch config.Sync.Transport.CompressionType {
+	case "zstd":
+		senderConfig.Compression = transport.CompressionTypeZstd
+	case "lz4":
+		senderConfig.Compression = transport.CompressionTypeLZ4
+	case "none":
+		senderConfig.Compression = transport.CompressionTypeNone
+	default:
+		// Default to Zstd for best compression ratio on massive datasets
+		senderConfig.Compression = transport.CompressionTypeZstd
+		log.Printf("Unknown compression type '%s', defaulting to zstd", config.Sync.Transport.CompressionType)
+	}
+
+	// OPTIMIZED: Apply high-performance defaults for massive datasets
+	if senderConfig.ParallelConns <= 0 {
+		senderConfig.ParallelConns = 8 // Increased for billion-document performance
+	}
+	if senderConfig.WindowSize <= 0 {
+		senderConfig.WindowSize = 128 // Larger window for better throughput
+	}
+	if senderConfig.BatchTimeout == 0 {
+		senderConfig.BatchTimeout = 10 * time.Second // Longer timeout for large batches
+	}
+	if senderConfig.ConnTimeout == 0 {
+		senderConfig.ConnTimeout = 60 * time.Second // Longer connection timeout
+	}
+	if senderConfig.KeepAlive == 0 {
+		senderConfig.KeepAlive = 30 * time.Second
+	}
+	if senderConfig.MaxRetries <= 0 {
+		senderConfig.MaxRetries = 5 // More retries for reliability
+	}
+	if senderConfig.RetryBackoff == 0 {
+		senderConfig.RetryBackoff = 2 * time.Second // Longer backoff
+	}
+	if senderConfig.BufferSize <= 0 {
+		senderConfig.BufferSize = 1024 * 1024 // 1MB buffer for billion-document transfers
+	}
+	if senderConfig.MaxBatchSize <= 0 {
+		senderConfig.MaxBatchSize = 64 * 1024 * 1024 // 64MB max batch for large datasets
+	}
+
+	// Create TCP sender
+	sender, err := transport.NewSender(senderConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create TCP sender: %w", err)
+	}
+
+	// Test connection to ensure vm-sync is reachable
+	if err := testTCPConnection(senderConfig.Address); err != nil {
+		log.Printf("WARNING: TCP connection test failed: %v", err)
+		if !config.Sync.Transport.HTTPFallback {
+			return fmt.Errorf("TCP connection failed and HTTP fallback disabled: %w", err)
+		}
+		log.Printf("TCP transport will use HTTP fallback when needed")
+	}
+
+	tcpSender = sender
+	tcpTransportEnabled = true
+
+	log.Printf("🚀 TCP TRANSPORT OPTIMIZED: address=%s, parallel_conns=%d, window_size=%d, buffer=%s, max_batch=%s, compression=%s",
+		senderConfig.Address, senderConfig.ParallelConns, senderConfig.WindowSize,
+		formatBytes(senderConfig.BufferSize), formatBytes(senderConfig.MaxBatchSize), config.Sync.Transport.CompressionType)
+	return nil
+}
+
 // initializeTCPTransportWithRetry initializes TCP transport with retry mechanism
 func initializeTCPTransportWithRetry() error {
 	// Check if TCP transport is enabled in config
@@ -442,7 +536,7 @@ func main() {
 			config.Checkpoint.Enabled = false
 		} else {
 			log.Println("✅ Checkpoint manager initialized successfully")
-			log.Printf("📋 CHECKPOINT CONFIG: Database: %s, Collection: %s, SaveInterval: %vs", 
+			log.Printf("📋 CHECKPOINT CONFIG: Database: %s, Collection: %s, SaveInterval: %vs",
 				config.Checkpoint.Database, config.Checkpoint.Collection, config.Checkpoint.SaveInterval)
 		}
 	} else {
@@ -725,7 +819,7 @@ func main() {
 	apiRouter.HandleFunc("/api/partitions", handlePartitionsRequest).Methods("POST")
 	apiRouter.HandleFunc("/api/sync/trigger", handleTriggerInitialSync).Methods("POST") // Manual initial sync trigger
 	apiRouter.HandleFunc("/api/sync/status", handleSyncStatus).Methods("GET")           // Sync status endpoint
-	apiRouter.HandleFunc("/api/telemetry", handleTelemetry).Methods("POST")              // HTTP telemetry endpoint
+	apiRouter.HandleFunc("/api/telemetry", handleTelemetry).Methods("POST")             // HTTP telemetry endpoint
 	apiRouter.HandleFunc("/health", handleHealth).Methods("GET")
 
 	// Register metrics API routes first (to avoid conflicts)
@@ -1289,7 +1383,7 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 	// Get resume token from checkpoint (industry standard persistence pattern)
 	var watchOptions *options.ChangeStreamOptions
 	var startFromToken bson.Raw
-	
+
 	if checkpointMgr != nil {
 		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil && len(checkpoint.ResumeToken) > 0 {
 			startFromToken = checkpoint.ResumeToken
@@ -1322,7 +1416,7 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
 			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
 		}
-		
+
 		if err != nil {
 			return 0, fmt.Errorf("failed to create change stream: %w", err)
 		}
@@ -1368,7 +1462,7 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 		} else if opType, ok := changeEvent["operationType"].(string); ok && opType == "delete" {
 			// Handle delete operations
 			deleteMarker := bson.M{
-				"_operation":  "delete",
+				"_operation":   "delete",
 				"_documentKey": changeEvent["documentKey"],
 				"_timestamp":   time.Now(),
 			}
@@ -1412,8 +1506,8 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 	}
 
 	// Send changes via HTTP (reliable transport for incremental sync)
-	log.Printf("🚀 STREAM SYNC: Sending %d changed docs (%s) for %s.%s - inserts:%d, updates:%d, deletes:%d", 
-		len(documents), formatBytes(totalBytes), database, collection, 
+	log.Printf("🚀 STREAM SYNC: Sending %d changed docs (%s) for %s.%s - inserts:%d, updates:%d, deletes:%d",
+		len(documents), formatBytes(totalBytes), database, collection,
 		operationCounts["insert"], operationCounts["update"], operationCounts["delete"])
 
 	if err := sendIncrementalChangesViaHTTP(database, collection, documents); err != nil {
@@ -1421,11 +1515,11 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 	}
 
 	log.Printf("✅ STREAM SYNC: Successfully sent %d docs for %s.%s", len(documents), database, collection)
-	
+
 	if streamErr != nil && !isTimeoutError {
 		return 0, fmt.Errorf("change stream error: %w", streamErr)
 	}
-	
+
 	return changeCount, nil
 }
 
@@ -1451,7 +1545,7 @@ func detectSimpleChanges(database, collection string) (int, error) {
 				lastCount = checkpoint.ProcessedCount
 				// SAFETY CHECK: If checkpoint count is higher than current count, reset it
 				if lastCount > currentCount {
-					log.Printf("⚠️  CHECKPOINT RESET: %s.%s checkpoint (%d) > current (%d), resetting to current count", 
+					log.Printf("⚠️  CHECKPOINT RESET: %s.%s checkpoint (%d) > current (%d), resetting to current count",
 						database, collection, lastCount, currentCount)
 					lastCount = currentCount
 					// Update checkpoint to current count
@@ -1463,10 +1557,10 @@ func detectSimpleChanges(database, collection string) (int, error) {
 
 	newDocuments := int(currentCount - lastCount)
 	if newDocuments > 0 {
-		log.Printf("📊 SIMPLE DETECTION: %s.%s has %d new documents (current: %d, last: %d)", 
+		log.Printf("📊 SIMPLE DETECTION: %s.%s has %d new documents (current: %d, last: %d)",
 			database, collection, newDocuments, currentCount, lastCount)
 	} else {
-		log.Printf("📋 SIMPLE DETECTION: %s.%s has no new documents (current: %d, last: %d)", 
+		log.Printf("📋 SIMPLE DETECTION: %s.%s has no new documents (current: %d, last: %d)",
 			database, collection, currentCount, lastCount)
 	}
 
@@ -1609,7 +1703,7 @@ func detectChangesWithChangeStream(database, collection string) (int, error) {
 	// Get resume token from checkpoint if available
 	var watchOptions *options.ChangeStreamOptions
 	var startFromToken bson.Raw
-	
+
 	if checkpointMgr != nil {
 		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil && len(checkpoint.ResumeToken) > 0 {
 			startFromToken = checkpoint.ResumeToken
@@ -1642,7 +1736,7 @@ func detectChangesWithChangeStream(database, collection string) (int, error) {
 			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
 			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
 		}
-		
+
 		if err != nil {
 			return 0, fmt.Errorf("failed to create change stream: %w", err)
 		}
@@ -1716,7 +1810,7 @@ func detectChangesWithChangeStream(database, collection string) (int, error) {
 	}
 
 	if changeCount > 0 {
-		log.Printf("🎯 CHANGE STREAM DETECTION: Found %d changes for %s.%s - inserts:%d, updates:%d, deletes:%d, replaces:%d", 
+		log.Printf("🎯 CHANGE STREAM DETECTION: Found %d changes for %s.%s - inserts:%d, updates:%d, deletes:%d, replaces:%d",
 			changeCount, database, collection, operationCounts["insert"], operationCounts["update"], operationCounts["delete"], operationCounts["replace"])
 	} else {
 		log.Printf("📋 CHANGE STREAM DETECTION: No changes for %s.%s since last checkpoint", database, collection)
@@ -1763,7 +1857,7 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 	// Get resume token from checkpoint if available
 	var watchOptions *options.ChangeStreamOptions
 	var startFromToken bson.Raw
-	
+
 	if checkpointMgr != nil {
 		if checkpoint := checkpointMgr.GetCheckpoint(database, collection); checkpoint != nil && len(checkpoint.ResumeToken) > 0 {
 			startFromToken = checkpoint.ResumeToken
@@ -1795,7 +1889,7 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
 			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
 		}
-		
+
 		if err != nil {
 			return fmt.Errorf("failed to create change stream: %w", err)
 		}
@@ -1845,7 +1939,7 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 			case "delete":
 				// For delete operations, create a special marker document
 				deleteMarker := bson.M{
-					"_operation":  "delete",
+					"_operation":   "delete",
 					"_documentKey": changeEvent["documentKey"],
 					"_timestamp":   time.Now(),
 				}
@@ -1859,8 +1953,8 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 			case "drop", "rename", "dropDatabase":
 				// DDL operations - create special marker
 				ddlMarker := bson.M{
-					"_operation": opType,
-					"_database":  database,
+					"_operation":  opType,
+					"_database":   database,
 					"_collection": collection,
 					"_timestamp":  time.Now(),
 				}
@@ -1877,8 +1971,8 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 			case "createIndexes", "dropIndexes", "modify":
 				// Index operations - create special marker
 				indexMarker := bson.M{
-					"_operation": opType,
-					"_database":  database,
+					"_operation":  opType,
+					"_database":   database,
 					"_collection": collection,
 					"_timestamp":  time.Now(),
 				}
@@ -1895,8 +1989,8 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 			case "invalidate":
 				// Invalidate operations - create special marker
 				invalidateMarker := bson.M{
-					"_operation": "invalidate",
-					"_database":  database,
+					"_operation":  "invalidate",
+					"_database":   database,
 					"_collection": collection,
 					"_timestamp":  time.Now(),
 					"_reason":     "collection_invalidated",
@@ -1958,8 +2052,8 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 	}
 
 	// Send changes via HTTP fallback (most reliable for incremental sync)
-	log.Printf("🚀 CHANGE STREAM SYNC: Sending %d changed docs (%s) for %s.%s - inserts:%d, updates:%d, deletes:%d, replaces:%d", 
-		len(documents), formatBytes(totalBytes), database, collection, 
+	log.Printf("🚀 CHANGE STREAM SYNC: Sending %d changed docs (%s) for %s.%s - inserts:%d, updates:%d, deletes:%d, replaces:%d",
+		len(documents), formatBytes(totalBytes), database, collection,
 		operationCounts["insert"], operationCounts["update"], operationCounts["delete"], operationCounts["replace"])
 
 	// FORCE HTTP FALLBACK for incremental sync reliability
@@ -1969,12 +2063,12 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 	}
 
 	log.Printf("✅ CHANGE STREAM SYNC: Successfully sent %d docs for %s.%s (resume token updated)", len(documents), database, collection)
-	
+
 	// Return error only for real errors, not timeouts
 	if streamErr != nil && !isTimeoutError {
 		return fmt.Errorf("change stream error: %w", streamErr)
 	}
-	
+
 	return nil
 }
 
@@ -2905,7 +2999,7 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 		if dbConfig.Name == database {
 			for i, coll := range dbConfig.Collections {
 				if coll.Name == collection {
-					collConfig = &dbConfig.Collections[i]  // FIXED: Use slice index, not loop variable address
+					collConfig = &dbConfig.Collections[i] // FIXED: Use slice index, not loop variable address
 					break
 				}
 			}
@@ -2930,7 +3024,7 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 	if collConfig != nil && (len(collConfig.FieldFilter.IncludeFields) > 0 || len(collConfig.FieldFilter.ExcludeFields) > 0) {
 		fieldFilterPipeline := filterEngine.BuildFieldFilterPipeline(&collConfig.FieldFilter)
 		filterPipeline = append(filterPipeline, fieldFilterPipeline...)
-		log.Printf("🔍 INITIAL DUMP FILTER: Applied field filter for %s.%s (include: %v, exclude: %v)", 
+		log.Printf("🔍 INITIAL DUMP FILTER: Applied field filter for %s.%s (include: %v, exclude: %v)",
 			database, collection, collConfig.FieldFilter.IncludeFields, collConfig.FieldFilter.ExcludeFields)
 	}
 
@@ -3233,7 +3327,7 @@ func pushSinglePageHTTP(ctx context.Context, vmSyncEndpoint, database, collectio
 		if dbConfig.Name == database {
 			for i, coll := range dbConfig.Collections {
 				if coll.Name == collection {
-					collConfig = &dbConfig.Collections[i]  // FIXED: Use slice index, not loop variable address
+					collConfig = &dbConfig.Collections[i] // FIXED: Use slice index, not loop variable address
 					break
 				}
 			}
@@ -3258,7 +3352,7 @@ func pushSinglePageHTTP(ctx context.Context, vmSyncEndpoint, database, collectio
 	if collConfig != nil && (len(collConfig.FieldFilter.IncludeFields) > 0 || len(collConfig.FieldFilter.ExcludeFields) > 0) {
 		fieldFilterPipeline := filterEngine.BuildFieldFilterPipeline(&collConfig.FieldFilter)
 		filterPipeline = append(filterPipeline, fieldFilterPipeline...)
-		log.Printf("🔍 INITIAL DUMP FILTER: Applied field filter for %s.%s (include: %v, exclude: %v)", 
+		log.Printf("🔍 INITIAL DUMP FILTER: Applied field filter for %s.%s (include: %v, exclude: %v)",
 			database, collection, collConfig.FieldFilter.IncludeFields, collConfig.FieldFilter.ExcludeFields)
 	}
 
@@ -3552,7 +3646,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("WebSocket upgrade failed: %v", err)
 		return
 	}
-	
+
 	// STABILITY FIX: Ensure connection is always closed and removed from clients map
 	defer func() {
 		conn.Close()
@@ -3675,9 +3769,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				MaxConcurrency: 4,
 				MemoryLimitMB:  2048,
 			}
+			// Extract TCP endpoint from the HTTP request host
+			tcpEndpoint := extractHostDomain(r)
 			endpoints := map[string]string{
-				"tcp":  "localhost:9000", // TODO: Extract from client registration
-				"http": "localhost:8081", // TODO: Extract from client registration
+				"tcp":  tcpEndpoint,                                                    // Use automatically detected TCP endpoint
+				"http": fmt.Sprintf("%s:%d", strings.Split(tcpEndpoint, ":")[0], 8081), // HTTP port 8081
+			}
+
+			// Initialize TCP transport with the detected address if it's not already enabled
+			if !tcpTransportEnabled {
+				log.Printf("🔄 INITIALIZING TCP TRANSPORT: Setting up connection to %s", tcpEndpoint)
+				if err := initializeTCPTransportWithAddress(tcpEndpoint); err != nil {
+					log.Printf("❌ FAILED TO INITIALIZE TCP TRANSPORT: %v", err)
+				} else {
+					log.Printf("✅ TCP TRANSPORT INITIALIZED: Connected to %s", tcpEndpoint)
+				}
 			}
 
 			if err := collectionDistributor.RegisterVM(clientInfo.ClientID, capabilities, endpoints); err != nil {
@@ -5177,7 +5283,7 @@ func watchCollection(dbName, collName string, collConfig models.CollectionConfig
 					// Apply field filtering using the same engine as initial dump
 					if len(collConfig.FieldFilter.IncludeFields) > 0 || len(collConfig.FieldFilter.ExcludeFields) > 0 {
 						filteredDoc := filterEngine.ApplyFieldFilter(fullDocMap, &collConfig.FieldFilter)
-						log.Printf("🔍 REAL-TIME FILTER: Applied field filter to %s.%s change event (include: %v, exclude: %v)", 
+						log.Printf("🔍 REAL-TIME FILTER: Applied field filter to %s.%s change event (include: %v, exclude: %v)",
 							dbName, collName, collConfig.FieldFilter.IncludeFields, collConfig.FieldFilter.ExcludeFields)
 						if docData, err := bson.Marshal(filteredDoc); err == nil {
 							event.FullDocument = bson.Raw(docData)
@@ -7288,10 +7394,10 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 	// This handles the case where VM is connecting right when API is called
 	maxRetries := 3
 	retryDelay := 500 * time.Millisecond
-	
+
 	var targetClients []*websocket.Conn
 	var vmClientDetails []map[string]interface{}
-	
+
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		log.Printf("🔄 RACE FIX: VM detection attempt %d/%d", attempt, maxRetries)
 
@@ -7300,11 +7406,11 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 		log.Printf("🔍 DEBUG INITIAL SYNC: Checking for vm-sync clients. Total clients: %d", len(clients))
 		targetClients = make([]*websocket.Conn, 0)
 		vmClientDetails = make([]map[string]interface{}, 0)
-		
+
 		for client, clientInfo := range clients {
-			log.Printf("🔍 DEBUG INITIAL SYNC: Client - Type: '%s', ID: '%s', ConnectedAt: %v, Status: '%s'", 
+			log.Printf("🔍 DEBUG INITIAL SYNC: Client - Type: '%s', ID: '%s', ConnectedAt: %v, Status: '%s'",
 				clientInfo.ClientType, clientInfo.ClientID, clientInfo.ConnectedAt, clientInfo.Status)
-			
+
 			if clientInfo.ClientType == "vm-sync" {
 				// If specific client requested, filter by ClientID
 				if req.ClientID == "" || clientInfo.ClientID == req.ClientID {
@@ -7329,7 +7435,7 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 			log.Printf("✅ RACE FIX: Found VM clients on attempt %d, proceeding with sync", attempt)
 			break
 		}
-		
+
 		// If this is not the last attempt, wait before retrying
 		if attempt < maxRetries {
 			log.Printf("⏳ RACE FIX: No VM clients found on attempt %d, retrying in %v...", attempt, retryDelay)
@@ -7340,7 +7446,7 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 	if len(targetClients) == 0 {
 		log.Printf("❌ RACE CONDITION DETECTED: No vm-sync clients found for initial sync API call")
 		log.Printf("🔍 RACE DEBUG: Total clients=%d, VM clients details: %+v", len(clients), vmClientDetails)
-		
+
 		if req.ClientID != "" {
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -7353,11 +7459,11 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success":       false,
-				"error":         "no_vm_clients",
-				"message":       "No VM clients connected for initial sync - possible race condition during VM startup",
-				"total_clients": len(clients),
-				"debug_info":    vmClientDetails,
+				"success":         false,
+				"error":           "no_vm_clients",
+				"message":         "No VM clients connected for initial sync - possible race condition during VM startup",
+				"total_clients":   len(clients),
+				"debug_info":      vmClientDetails,
 				"troubleshooting": "If VM just connected, wait 1-2 seconds and retry. Check VM WebSocket connection status.",
 			})
 		}
@@ -7382,12 +7488,12 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 
 		// Create initial sync message that triggers full database replacement
 		syncMessage := map[string]interface{}{
-			"type":       "initial_sync_trigger",
-			"action":     "replace_database",
-			"client_id":  clientInfo.ClientID,
+			"type":      "initial_sync_trigger",
+			"action":    "replace_database",
+			"client_id": clientInfo.ClientID,
 			"timestamp": time.Now().Format(time.RFC3339),
-			"message":    "API triggered full database replacement",
-			"force":      req.Force,
+			"message":   "API triggered full database replacement",
+			"force":     req.Force,
 		}
 
 		// Send sync trigger message to VM client
@@ -7405,12 +7511,12 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 	// Return response
 	if syncsTriggered > 0 {
 		response := map[string]interface{}{
-			"success":          true,
-			"message":          "Initial sync triggered successfully",
-			"syncs_triggered":  syncsTriggered,
-			"total_targets":    len(targetClients),
-			"timestamp":        time.Now().Format(time.RFC3339),
-			"sync_type":        "full_database_replacement",
+			"success":         true,
+			"message":         "Initial sync triggered successfully",
+			"syncs_triggered": syncsTriggered,
+			"total_targets":   len(targetClients),
+			"timestamp":       time.Now().Format(time.RFC3339),
+			"sync_type":       "full_database_replacement",
 		}
 
 		if len(failedSyncs) > 0 {
@@ -7425,9 +7531,9 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":       false,
-			"error":         "all_syncs_failed",
-			"message":       "Failed to trigger sync on all target clients",
+			"success":        false,
+			"error":          "all_syncs_failed",
+			"message":        "Failed to trigger sync on all target clients",
 			"failed_clients": failedSyncs,
 		})
 	}
@@ -7448,12 +7554,12 @@ func handleVMClientsDebug(w http.ResponseWriter, r *http.Request) {
 		if clientInfo.ClientType == "vm-sync" {
 			vmSyncCount++
 			clientDetail := map[string]interface{}{
-				"client_id":       clientInfo.ClientID,
-				"client_type":     clientInfo.ClientType,
-				"connected_at":    clientInfo.ConnectedAt.Format(time.RFC3339),
-				"status":          clientInfo.Status,
-				"oauth2_valid":    clientInfo.OAuth2Claims != nil,
-				"connection_age":  time.Since(clientInfo.ConnectedAt).String(),
+				"client_id":      clientInfo.ClientID,
+				"client_type":    clientInfo.ClientType,
+				"connected_at":   clientInfo.ConnectedAt.Format(time.RFC3339),
+				"status":         clientInfo.Status,
+				"oauth2_valid":   clientInfo.OAuth2Claims != nil,
+				"connection_age": time.Since(clientInfo.ConnectedAt).String(),
 			}
 			if clientInfo.OAuth2Claims != nil {
 				clientDetail["oauth2_app_id"] = clientInfo.OAuth2Claims.AppID
@@ -7473,4 +7579,19 @@ func handleVMClientsDebug(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+}
+
+// extractHostDomain extracts the host domain from the HTTP request
+// and constructs the TCP endpoint using the host domain and port 9000
+func extractHostDomain(r *http.Request) string {
+	// Get the host from the request
+	hostDomain := r.Host
+
+	// Remove port if present in Host header
+	if colonIndex := strings.Index(hostDomain, ":"); colonIndex != -1 {
+		hostDomain = hostDomain[:colonIndex]
+	}
+
+	// Construct TCP endpoint with port 9000
+	return fmt.Sprintf("%s:%d", hostDomain, 9000)
 }

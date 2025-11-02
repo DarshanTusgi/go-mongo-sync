@@ -52,7 +52,6 @@ sync:
     compression_type: "zstd"  # Use Zstd compression for best ratio
     health_monitor: "30s"  # TCP health monitor interval (checks for VM-sync availability)
     tcp_sender:
-      address: "127.0.0.1:9000"  # vm-sync TCP receiver address (use 127.0.0.1 not localhost)
       parallel_conns: 4
       window_size: 64
       batch_timeout: 60s      # Ultra-stable: 60s timeout
