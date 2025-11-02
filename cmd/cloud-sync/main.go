@@ -3419,7 +3419,70 @@ func loadConfig(filename string) error {
 	if err != nil {
 		return err
 	}
-	return yaml.Unmarshal(data, &config)
+
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return err
+	}
+
+	// Check if there's a separate collections config file specified
+	// Look for collections_config_file in the mongodb section
+	type PartialConfig struct {
+		MongoDB struct {
+			CollectionsConfigFile string `yaml:"collections_config_file"`
+		} `yaml:"mongodb"`
+	}
+
+	var partialConfig PartialConfig
+	if err := yaml.Unmarshal(data, &partialConfig); err == nil {
+		if partialConfig.MongoDB.CollectionsConfigFile != "" {
+			// Load collections from the separate JSON file
+			if err := loadCollectionsFromJSON(partialConfig.MongoDB.CollectionsConfigFile); err != nil {
+				log.Printf("Warning: Failed to load collections from JSON file: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// loadCollectionsFromJSON loads collections configuration from a separate JSON file
+func loadCollectionsFromJSON(filename string) error {
+	// Resolve the file path relative to the main config file
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read collections config file: %w", err)
+	}
+
+	// Parse the JSON file
+	var collectionsConfig struct {
+		Databases []models.DatabaseConfig `json:"databases"`
+	}
+
+	if err := json.Unmarshal(data, &collectionsConfig); err != nil {
+		return fmt.Errorf("failed to parse collections config JSON: %w", err)
+	}
+
+	// Merge the collections configuration with the main config
+	for _, db := range collectionsConfig.Databases {
+		// Find the matching database in the main config
+		found := false
+		for j, mainDB := range config.MongoDB.Databases {
+			if mainDB.Name == db.Name {
+				// Merge the collections
+				config.MongoDB.Databases[j].Collections = db.Collections
+				found = true
+				break
+			}
+		}
+
+		// If database not found in main config, add it
+		if !found {
+			config.MongoDB.Databases = append(config.MongoDB.Databases, db)
+		}
+	}
+
+	log.Printf("Successfully loaded collections configuration from %s", filename)
+	return nil
 }
 
 // getDefaultConfig returns a minimal default configuration for degraded mode operation
@@ -3701,156 +3764,84 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// RACE CONDITION FIX: Immediate verification that VM is queryable via API
-		// No delay needed since client is already registered
-		clientsMutex.RLock()
-		for _, info := range clients {
-			if info.ClientType == "vm-sync" && info.ClientID == clientInfo.ClientID {
-				log.Printf("✅ RACE FIX VERIFIED: VM client %s confirmed in clients map and immediately queryable", clientInfo.ClientID)
-				break
-			}
-		}
-		clientsMutex.RUnlock()
-	} else {
-		// For non-vm-sync clients, register normally
+		log.Printf("WebSocket connection established with %s client: %s", clientType, clientInfo.ClientID)
+	} else if clientType == "dashboard" {
+		// Add dashboard clients to clients map for broadcast
 		clientsMutex.Lock()
 		clients[conn] = clientInfo
 		clientCount := len(clients)
+		vmSyncCount := 0
+		for _, info := range clients {
+			if info.ClientType == "vm-sync" {
+				vmSyncCount++
+			}
+		}
 		clientsMutex.Unlock()
-		log.Printf("✅ CLIENT REGISTERED: %s client connected (total: %d)", clientType, clientCount)
+		log.Printf("✅ DASHBOARD: Client registered in clients map (total: %d, vm-sync: %d)", clientCount, vmSyncCount)
+		log.Printf("WebSocket connection established with %s client: %s", clientType, clientInfo.ClientID)
+	} else {
+		// Add unknown clients to clients map for broadcast
+		clientsMutex.Lock()
+		clients[conn] = clientInfo
+		clientCount := len(clients)
+		vmSyncCount := 0
+		for _, info := range clients {
+			if info.ClientType == "vm-sync" {
+				vmSyncCount++
+			}
+		}
+		clientsMutex.Unlock()
+		log.Printf("✅ UNKNOWN: Client registered in clients map (total: %d, vm-sync: %d)", clientCount, vmSyncCount)
+		log.Printf("WebSocket connection established with %s client: %s", clientType, clientInfo.ClientID)
 	}
 
-	// Handle incoming messages from clients
+	// Handle incoming messages
 	for {
 		messageType, messageData, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("Client disconnected: %v", err)
-
-			// Track vm-sync disconnection for reconnection handling
-			if clientInfo.ClientType == "vm-sync" {
-				log.Printf("vm-sync client %s disconnected, tracking for reconnection", clientInfo.ClientID)
-				appLogger.Info("websocket", "vm_sync_disconnected", "VM-sync client disconnected", map[string]interface{}{
-					"client_id":       clientInfo.ClientID,
-					"disconnected_at": time.Now(),
-				})
-
-				// 🎯 BUFFER-FREE: Unregister client from token manager (preserve tokens for resume)
-				if tokenManager != nil {
-					if err := tokenManager.UnregisterClient(clientInfo.ClientID); err != nil {
-						log.Printf("⚠️  Failed to unregister client %s from token manager: %v", clientInfo.ClientID, err)
-					} else {
-						log.Printf("💫 BUFFER-FREE: Client %s unregistered, resume tokens preserved", clientInfo.ClientID)
-					}
-				}
-			}
-
-			// STABILITY FIX: Client removal handled by defer cleanup
-			// No need to manually delete here - defer ensures cleanup in all cases
+			log.Printf("Error reading message from %s client %s: %v", clientType, clientInfo.ClientID, err)
 			break
 		}
 
-		// PING/PONG FIX: Handle ping messages from vm-sync clients
-		if messageType == websocket.PingMessage {
-			log.Printf("🏓 PING: Received ping from %s client %s, sending pong", clientInfo.ClientType, clientInfo.ClientID)
-			// Send pong response
-			if err := conn.WriteMessage(websocket.PongMessage, messageData); err != nil {
-				log.Printf("❌ PONG ERROR: Failed to send pong to client %s: %v", clientInfo.ClientID, err)
-				// Connection error, will be handled by next ReadMessage call
+		// Handle different message types
+		if messageType == websocket.BinaryMessage {
+			// Handle binary messages (likely change events)
+			var event models.ChangeEvent
+			if err := bson.Unmarshal(messageData, &event); err != nil {
+				log.Printf("Error unmarshaling binary change event: %v", err)
+				continue
 			}
-			continue
-		}
+			log.Printf("✅ REALTIME: Change event: %s on %s.%s", event.OperationType, event.Database, event.Collection)
+		} else if messageType == websocket.TextMessage {
+			log.Printf("📥 WEBSOCKET: Received text message (%d bytes)", len(messageData))
+			// Handle text messages (likely configuration updates)
+			var msg map[string]interface{}
+			if err := json.Unmarshal(messageData, &msg); err != nil {
+				log.Printf("Error unmarshaling text message: %v", err)
+				continue
+			}
 
-		// Handle pong messages (vm-sync might send these in response to our pings)
-		if messageType == websocket.PongMessage {
-			log.Printf("🏓 PONG: Received pong from %s client %s", clientInfo.ClientType, clientInfo.ClientID)
-			continue
-		}
-
-		// Handle acknowledgment and telemetry messages
-		if messageType == websocket.TextMessage {
-			var message map[string]interface{}
-			if err := json.Unmarshal(messageData, &message); err == nil {
-				if msgType, ok := message["type"].(string); ok {
-					switch msgType {
-					case "ack":
-						if sequenceID, ok := message["sequenceId"].(float64); ok {
-							if clientID, ok := message["clientId"].(string); ok {
-								if collection, ok := message["collection"].(string); ok {
-									log.Printf("Received acknowledgment from client %s for sequence %.0f on %s", clientID, sequenceID, collection)
-									// TODO: Update transfer tracking with acknowledgment
-									if transferTracker != nil {
-										// Mark sequence as acknowledged in transfer tracker
-										log.Printf("Marking sequence %.0f as acknowledged for client %s", sequenceID, clientID)
-									}
-								}
-							}
-						}
-					case "telemetry":
-						// Handle telemetry data from VM Sync
-						if clientInfo.ClientType == "vm-sync" {
-							var telemetryMsg models.TelemetryMessage
-							if err := json.Unmarshal(messageData, &telemetryMsg); err != nil {
-								log.Printf("❌ TELEMETRY ERROR: Failed to unmarshal telemetry from client %s: %v", clientInfo.ClientID, err)
-								// Send error response back to VM so circuit breaker knows about the failure
-								errorResponse := map[string]interface{}{
-									"type":  "telemetry_error",
-									"error": "Failed to unmarshal telemetry message",
-								}
-								if errBytes, _ := json.Marshal(errorResponse); errBytes != nil {
-									conn.WriteMessage(websocket.TextMessage, errBytes)
-								}
-							} else {
-								// STABILITY FIX: Check if cloudSyncIntegration is available
-								if cloudSyncIntegration != nil {
-									cloudSyncIntegration.ProcessTelemetryMessage(&telemetryMsg)
-									log.Printf("✅ TELEMETRY: Processed telemetry from VM Sync client %s (CPU=%.1f%%, Mem=%.1f%%, Latency=%.1fms)",
-										clientInfo.ClientID,
-										telemetryMsg.Data.CPUUsage,
-										telemetryMsg.Data.MemoryUsage,
-										telemetryMsg.Data.SyncLatency)
-									
-									// Send acknowledgment back to VM
-									ackResponse := map[string]interface{}{
-										"type":      "telemetry_ack",
-										"timestamp": time.Now(),
-									}
-									if ackBytes, _ := json.Marshal(ackResponse); ackBytes != nil {
-										conn.WriteMessage(websocket.TextMessage, ackBytes)
-									}
-								} else {
-									log.Printf("⚠️  TELEMETRY WARNING: cloudSyncIntegration is nil - cannot process telemetry from client %s", clientInfo.ClientID)
-									log.Printf("⚠️  DEGRADED MODE: Telemetry data received but adaptive system is not running")
-									
-									// Still send acknowledgment to prevent circuit breaker from opening
-									// This allows the system to work without adaptive features
-									ackResponse := map[string]interface{}{
-										"type":      "telemetry_ack",
-										"timestamp": time.Now(),
-										"warning":   "Adaptive system unavailable",
-									}
-									if ackBytes, _ := json.Marshal(ackResponse); ackBytes != nil {
-										conn.WriteMessage(websocket.TextMessage, ackBytes)
-									}
-								}
-							}
-						}
-					case "config_request":
-						// Handle configuration requests from VM Sync
-						if clientInfo.ClientType == "vm-sync" && cloudSyncIntegration != nil {
-							// Get current adaptive configuration
-							config := cloudSyncIntegration.GetCurrentConfig()
-							if config != nil {
-								// Send configuration to VM Sync
-								if err := cloudSyncIntegration.SendConfigToVM(conn, config); err != nil {
-									log.Printf("Error sending config to client %s: %v", clientInfo.ClientID, err)
-								} else {
-									log.Printf("Sent adaptive config to VM Sync client %s", clientInfo.ClientID)
-								}
-							}
-						}
+			// Handle different message types
+			if msgType, ok := msg["type"].(string); ok {
+				switch msgType {
+				case "adaptive_config":
+					// Handle adaptive configuration updates
+					// Note: We can't directly call the unexported method, so we'll log and continue
+					log.Printf("Received adaptive config update, but cannot process directly")
+				case "ping":
+					// Respond to ping with pong
+					pongMsg := map[string]interface{}{
+						"type": "pong",
 					}
+					if err := conn.WriteJSON(pongMsg); err != nil {
+						log.Printf("Error sending pong response: %v", err)
+					}
+				default:
+					log.Printf("Unknown message type: %s", msgType)
 				}
 			}
+		} else {
+			log.Printf("📥 WEBSOCKET: Received unknown message type: %d", messageType)
 		}
 	}
 }

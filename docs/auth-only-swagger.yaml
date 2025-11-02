@@ -1,0 +1,336 @@
+openapi: 3.0.3
+info:
+  title: Go Data Sync OAuth2 Authentication API
+  description: |
+    # OAuth2 Authentication API for Go Data Sync
+    
+    This is a focused API specification for OAuth2 authentication endpoints only.
+    It provides client credentials flow for secure authentication with the Go Data Sync system.
+    
+    ## Authentication Flow
+    1. Obtain client credentials (client_id and client_secret) from the OAuth2 administration
+    2. Request an access token using the `/api/auth/token` endpoint
+    3. Use the Bearer token in the Authorization header for other API calls
+    
+    ## Security
+    - Client secrets are bcrypt-hashed in the database
+    - JWT tokens are signed with HMAC-SHA256
+    - Tokens have a 1-hour expiry time
+  version: "1.0.0"
+  contact:
+    name: Go Data Sync API Support
+    url: https://github.com/your-org/go-data-sync-http
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Development server
+  - url: https://api.yourdomain.com
+    description: Production server
+
+security:
+  - BearerAuth: []
+
+paths:
+  # ==================== OAUTH2 AUTHENTICATION ====================
+  /api/auth/token:
+    post:
+      tags:
+        - OAuth2 Authentication
+      summary: Obtain OAuth2 Access Token
+      description: |
+        Implements OAuth2 Client Credentials Grant flow to obtain access tokens for API authentication.
+        
+        **Flow:**
+        1. Client provides client_id and client_secret
+        2. Server validates credentials against MongoDB
+        3. Returns JWT bearer token with 1-hour expiry
+      operationId: getOAuth2Token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+            example:
+              grant_type: "client_credentials"
+              client_id: "vm_sync_3e67555ad3836e65"
+              client_secret: "4684a92c64ad93d075018f0152fc5d0ac2f9d73ba2589b32c30e664e82e21e95"
+      responses:
+        '200':
+          description: Successfully obtained access token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+              example:
+                access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                token_type: "Bearer"
+                expires_in: 3599
+                scope: "[sync data:read data:write]"
+        '400':
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuth2Error'
+              example:
+                error: "invalid_request"
+                error_description: "grant_type, client_id, and client_secret are required"
+        '401':
+          description: Invalid client credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuth2Error'
+              example:
+                error: "invalid_client"
+                error_description: "Invalid client credentials"
+
+  /api/auth/validate:
+    post:
+      tags:
+        - OAuth2 Authentication
+      summary: Validate JWT Token
+      description: |
+        Internal endpoint for validating JWT tokens and retrieving claims information.
+        Used by other services to verify token authenticity and extract user context.
+      operationId: validateToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - token
+              properties:
+                token:
+                  type: string
+                  description: JWT token to validate
+                  example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+      responses:
+        '200':
+          description: Token is valid
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+                    example: true
+                  client_id:
+                    type: string
+                    example: "vm_sync_3e67555ad3836e65"
+                  client_type:
+                    type: string
+                    example: "vm-sync"
+                  app_id:
+                    type: string
+                    example: "vm-sync-test-working"
+                  scopes:
+                    type: array
+                    items:
+                      type: string
+                    example: ["sync", "data:read", "data:write"]
+                  expires_at:
+                    type: integer
+                    format: int64
+                    description: Unix timestamp
+                    example: 1758890731
+        '401':
+          description: Invalid or expired token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuth2Error'
+
+  # ==================== OAUTH2 ADMIN ENDPOINTS ====================
+  /api/auth/admin/clients:
+    post:
+      tags:
+        - OAuth2 Administration
+      summary: Create New OAuth2 Client
+      description: |
+        Creates new OAuth2 client credentials with cryptographically secure client_id and client_secret.
+      operationId: createOAuth2Client
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClientRequest'
+            example:
+              app_id: "vm-sync-production"
+              name: "Production VM-Sync Instance"
+              description: "OAuth2 client for production VM synchronization"
+              scopes: ["sync", "data:read", "data:write", "metrics:read"]
+              vm_metadata:
+                hostname: "prod-vm-01"
+                max_collections: 50
+      responses:
+        '200':
+          description: Client created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateClientResponse'
+        '400':
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+    # ==================== AUTHENTICATION SCHEMAS ====================
+    TokenRequest:
+      type: object
+      required:
+        - grant_type
+        - client_id
+        - client_secret
+      properties:
+        grant_type:
+          type: string
+          description: OAuth2 grant type (must be 'client_credentials')
+          example: "client_credentials"
+        client_id:
+          type: string
+          description: OAuth2 client identifier
+          example: "vm_sync_3e67555ad3836e65"
+        client_secret:
+          type: string
+          description: OAuth2 client secret
+          example: "4684a92c64ad93d075018f0152fc5d0ac2f9d73ba2589b32c30e664e82e21e95"
+
+    TokenResponse:
+      type: object
+      required:
+        - access_token
+        - token_type
+        - expires_in
+      properties:
+        access_token:
+          type: string
+          description: JWT access token
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        token_type:
+          type: string
+          description: Token type (always 'Bearer')
+          example: "Bearer"
+        expires_in:
+          type: integer
+          description: Token expiry time in seconds
+          example: 3600
+        scope:
+          type: string
+          description: Granted scopes
+          example: "sync data:read data:write"
+
+    OAuth2Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error code
+          enum: [invalid_request, invalid_client, invalid_grant, unauthorized_client, unsupported_grant_type, invalid_scope]
+        error_description:
+          type: string
+          description: Human-readable error description
+        error_uri:
+          type: string
+          description: URI to error documentation
+
+    CreateClientRequest:
+      type: object
+      required:
+        - app_id
+        - name
+        - scopes
+      properties:
+        app_id:
+          type: string
+          description: Application identifier
+          example: "vm-sync-production"
+        name:
+          type: string
+          description: Client name
+          example: "Production VM-Sync Instance"
+        description:
+          type: string
+          description: Client description
+          example: "OAuth2 client for production VM synchronization"
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Requested scopes
+          example: ["sync", "data:read", "data:write", "metrics:read"]
+        vm_metadata:
+          type: object
+          description: VM-specific metadata
+          properties:
+            hostname:
+              type: string
+              example: "prod-vm-01"
+            max_collections:
+              type: integer
+              example: 50
+
+    CreateClientResponse:
+      type: object
+      properties:
+        client_id:
+          type: string
+          description: Generated OAuth2 client identifier
+          example: "vm_sync_3e67555ad3836e65"
+        client_secret:
+          type: string
+          description: Generated OAuth2 client secret (64-character hex string)
+          example: "4684a92c64ad93d075018f0152fc5d0ac2f9d73ba2589b32c30e664e82e21e95"
+        app_id:
+          type: string
+          description: Application identifier
+          example: "vm-sync-production"
+        name:
+          type: string
+          description: Client name
+          example: "Production VM-Sync Instance"
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Granted scopes
+          example: ["sync", "data:read", "data:write", "metrics:read"]
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+          example: "2023-06-15T14:30:00Z"
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+        timestamp:
+          type: string
+          format: date-time
+          description: Error timestamp
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
