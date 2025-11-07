@@ -43,13 +43,6 @@ mongodb:
   uri: "mongodb://localhost:27017/?retryWrites=true&w=majority"
   timeout: 30s
 
-# Collections to sync from real_transfer_test database
-# Format: "source-db.collection:target-db.collection" or "source-db.collection" (uses same name)
-collections:
-  - "real_transfer_test.products:local_sync_test.products"
-  - "real_transfer_test.customers:local_sync_test.customers"
-  - "real_transfer_test.orders:local_sync_test.orders"
-  - "real_transfer_test.inventory:local_sync_test.inventory"
 # Sync configuration
 sync:
   initial_sync: true

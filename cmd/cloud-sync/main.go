@@ -7370,7 +7370,12 @@ func generateRecommendations(stats map[string]interface{}) []string {
 // handleInitialSync triggers a full database replacement sync
 func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
+	licenseKey := r.Header.Get("licensekey")
+	expectedLicenseKey := os.Getenv("INFRA_LICENSE_KEY")
+	if licenseKey == "" || expectedLicenseKey == "" || licenseKey != expectedLicenseKey {
+		http.Error(w, `{"error":"unauthorized","error_description":"Invalid or missing licensekey header"}`, http.StatusUnauthorized)
+		return
+	}
 	// Parse request body for optional parameters
 	type InitialSyncRequest struct {
 		ClientID string `json:"client_id"` // Optional: specific client to sync to

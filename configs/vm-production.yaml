@@ -35,13 +35,6 @@ mongodb:
   uri: "${MONGODB_URI}"
   timeout: 30s
 
-# Collections to sync - Production collections
-# Format: "source-db.collection:target-db.collection" or "source-db.collection" (uses same name)
-collections:
-  - "${SOURCE_DATABASE}.products:${TARGET_DATABASE}.products"
-  - "${SOURCE_DATABASE}.customers:${TARGET_DATABASE}.customers"
-  - "${SOURCE_DATABASE}.orders:${TARGET_DATABASE}.orders"
-  - "${SOURCE_DATABASE}.inventory:${TARGET_DATABASE}.inventory"
 
 sync:
   initial_sync: true

@@ -325,34 +325,18 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 	log.Printf("📦 TCP BATCH RECEIVED: %s seq=%d, %d docs (%s)", stream, batchSeq, len(documents), formatBytes(totalBytes))
 
 	// Parse stream name to extract database and collection
-	parts := parseStreamName(stream)
-	var sourceDatabase, sourceCollection string
-
-	if len(parts) >= 2 {
-		// Direct format: "database.collection"
-		sourceDatabase = parts[0]
-		sourceCollection = parts[1]
-	} else if len(parts) == 0 || strings.HasPrefix(stream, "stream_") {
-		// TCP numeric stream format - use intelligent stream assignment
-		log.Printf("🔍 TCP STREAM MAPPING: %s - using intelligent assignment", stream)
-
-		// Use the new intelligent mapping function
-		var err error
-		sourceDatabase, sourceCollection, err = getOrAssignStreamMapping(stream)
-		if err != nil {
-			return fmt.Errorf("failed to assign stream mapping: %v", err)
-		}
-	} else {
+	// In the new approach, stream names are in format "database.collection"
+	parts := strings.Split(stream, ".")
+	if len(parts) < 2 {
 		return fmt.Errorf("invalid stream name format: %s", stream)
 	}
 
-	// Map source collection to target collection based on configuration
-	fullSourceCollection := fmt.Sprintf("%s.%s", sourceDatabase, sourceCollection)
-	log.Printf("🔍 DEBUG MAPPING: Attempting to map fullSourceCollection='%s'", fullSourceCollection)
-	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
-	if err != nil {
-		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
-	}
+	sourceDatabase := parts[0]
+	sourceCollection := parts[1]
+
+	// In the new approach, we use the same database and collection names as the source
+	targetDatabase := sourceDatabase
+	targetCollection := sourceCollection
 
 	log.Printf("🔄 TCP MAPPING: %s.%s -> %s.%s", sourceDatabase, sourceCollection, targetDatabase, targetCollection)
 

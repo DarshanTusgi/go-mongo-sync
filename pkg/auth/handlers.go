@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -12,12 +13,19 @@ import (
 
 // setupAuthRoutes sets up OAuth2 authentication routes
 func SetupAuthRoutes(router *mux.Router, authService *ClientCredentialsService) {
-	// OAuth2 client creation endpoint (public for testing)
-	router.HandleFunc("/api/auth/admin/clients", handleCreateClient(authService)).Methods("POST")
-
 	// Admin endpoints for client management (require authentication)
-	// Note: These must come after the public POST route to avoid conflicts
-	router.Handle("/api/auth/admin/clients", adminAuthMiddleware(http.HandlerFunc(handleListClients(authService)))).Methods("GET")
+	// Using a single route with method-based handlers to ensure consistent middleware application
+	router.Handle("/api/auth/admin/clients", adminAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "POST":
+			handleCreateClient(authService)(w, r)
+		case "GET":
+			handleListClients(authService)(w, r)
+		default:
+			http.Error(w, `{"error":"method_not_allowed","error_description":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+	}))).Methods("POST", "GET")
+
 	router.Handle("/api/auth/admin/clients/{client_id}", adminAuthMiddleware(http.HandlerFunc(handleRevokeClient(authService)))).Methods("DELETE")
 
 	// OAuth2 token endpoint (public)
@@ -193,18 +201,12 @@ func handleRevokeClient(authService *ClientCredentialsService) http.HandlerFunc 
 // adminAuthMiddleware validates admin access
 func adminAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// For now, check for admin API key
-		apiKey := r.Header.Get("X-Admin-API-Key")
-		if apiKey == "" {
-			http.Error(w, `{"error":"unauthorized","error_description":"Admin API key required"}`, http.StatusUnauthorized)
-			return
-		}
-
-		// TODO: Validate API key against database or config
-		// expectedAPIKey := config.Auth.AdminAPIKey // Add this to config
-		expectedAPIKey := "admin-api-key-placeholder" // TODO: Move to config
-		if apiKey != expectedAPIKey {
-			http.Error(w, `{"error":"forbidden","error_description":"Invalid admin API key"}`, http.StatusForbidden)
+		// Check for licensekey header and validate against environment variable
+		licenseKey := r.Header.Get("licensekey")
+		expectedLicenseKey := os.Getenv("INFRA_LICENSE_KEY")
+		
+		if licenseKey == "" || expectedLicenseKey == "" || licenseKey != expectedLicenseKey {
+			http.Error(w, `{"error":"unauthorized","error_description":"Invalid or missing licensekey header"}`, http.StatusUnauthorized)
 			return
 		}
 
