@@ -33,9 +33,9 @@ cloud_sync:
   # OAuth2 authentication (required for vm-sync)
   oauth2:
     enabled: true
-    # Using live-generated credentials
-    client_id: "vm_sync_33730300798c7635"
-    client_secret: "f5574391677d130886ff1ba016de18942b5bf362749e7d3d750259bfaa284e80"
+    # Tenant-aware credentials for kotak-default (WORKING)
+    client_id: "vm_sync_4a6f51d83a9ab940"
+    client_secret: "7cba319d85f5ac8134120b7b479821045e866d73c69d2e34be27f0413db7bead"
     token_url: "http://localhost:8080/api/auth/token"
 
 mongodb:

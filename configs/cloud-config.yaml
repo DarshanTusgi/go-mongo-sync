@@ -108,6 +108,13 @@ sequence:
 fence:
   enabled: true
 
+# Multi-tenancy configuration
+# Set TENANT_NAME and COMMUNITY_NAME environment variables
+# Example: TENANT_NAME=kotak COMMUNITY_NAME=community1
+tenant:
+  name: ""        # Leave empty to use TENANT_NAME env variable (default: "default")
+  community: ""   # Leave empty to use COMMUNITY_NAME env variable (default: "default")
+
 # Performance tuning
 performance:
   max_workers: 4      # Increase to 8-16 for production

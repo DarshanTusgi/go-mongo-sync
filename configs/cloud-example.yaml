@@ -169,6 +169,11 @@ sequence:
 fence:
   enabled: true
 
+# Multi-tenancy configuration
+tenant:
+  name: "${TENANT_NAME:-default}"        # Tenant name from env or default
+  community: "${COMMUNITY_NAME:-default}" # Community name from env or default
+
 # Performance tuning
 performance:
   max_workers: 4      # Increase to 8-16 for production

@@ -452,10 +452,14 @@ func main() {
 
 	// Initialize checkpoint manager with graceful fallback
 	if config.Checkpoint.Enabled && mongoConnected {
+		// Apply tenant-aware naming
+		checkpointDB := config.GetTenantDatabaseName(config.Checkpoint.Database)
+		checkpointColl := config.GetTenantCollectionName(config.Checkpoint.Collection)
+		
 		checkpointConfig := &resume.CheckpointConfig{
 			MongoURI:        config.MongoDB.URI,
-			Database:        config.Checkpoint.Database,
-			Collection:      config.Checkpoint.Collection,
+			Database:        checkpointDB,
+			Collection:      checkpointColl,
 			PersistInterval: time.Duration(config.Checkpoint.SaveInterval) * time.Second,
 			Enabled:         config.Checkpoint.Enabled,
 		}
@@ -469,7 +473,7 @@ func main() {
 		} else {
 			log.Println("✅ Checkpoint manager initialized successfully")
 			log.Printf("📋 CHECKPOINT CONFIG: Database: %s, Collection: %s, SaveInterval: %vs",
-				config.Checkpoint.Database, config.Checkpoint.Collection, config.Checkpoint.SaveInterval)
+				checkpointDB, checkpointColl, config.Checkpoint.SaveInterval)
 		}
 	} else {
 		log.Printf("⚠️  CHECKPOINT DISABLED: Enabled=%v, MongoDB Connected=%v", config.Checkpoint.Enabled, mongoConnected)
@@ -486,6 +490,11 @@ func main() {
 		trackingConfig := convertTrackingConfig(config.Tracking)
 		// Use the same MongoDB URI as the main service
 		trackingConfig.MongoURI = config.MongoDB.URI
+		// Apply tenant-aware naming
+		trackingConfig.Database = config.GetTenantDatabaseName(config.Tracking.Database)
+		trackingConfig.StateCollection = config.GetTenantCollectionName(config.Tracking.StateCollection)
+		trackingConfig.BatchCollection = config.GetTenantCollectionName(config.Tracking.BatchCollection)
+		
 		transferTracker, err = tracking.NewTransferTracker(trackingConfig)
 		if err != nil {
 			log.Printf("WARNING: Failed to initialize transfer tracker: %v", err)
@@ -493,7 +502,8 @@ func main() {
 			transferTracker = nil
 			config.Tracking.Enabled = false
 		} else if transferTracker.IsEnabled() {
-			log.Println("Transfer tracking enabled")
+			log.Printf("✅ Transfer tracker enabled: Database=%s, StateCollection=%s, BatchCollection=%s",
+				trackingConfig.Database, trackingConfig.StateCollection, trackingConfig.BatchCollection)
 		} else {
 			log.Println("Transfer tracking disabled")
 		}
@@ -503,11 +513,15 @@ func main() {
 
 	// Initialize sequence generator with graceful fallback
 	if config.Sequence.Enabled && mongoConnected {
+		// Apply tenant-aware naming
+		sequenceDB := config.GetTenantDatabaseName(config.Sequence.Database)
+		sequenceColl := config.GetTenantCollectionName(config.Sequence.Collection)
+		
 		sequenceConfig := &sequence.GeneratorConfig{
 			Enabled:    config.Sequence.Enabled,
 			MongoURI:   config.MongoDB.URI,
-			Database:   config.Sequence.Database,
-			Collection: config.Sequence.Collection,
+			Database:   sequenceDB,
+			Collection: sequenceColl,
 			BatchSize:  config.Sequence.BatchSize,
 			NodeID:     config.Sequence.NodeID,
 		}
@@ -518,7 +532,8 @@ func main() {
 			sequenceGen = nil
 			config.Sequence.Enabled = false
 		} else {
-			log.Printf("Sequence generator initialized for node %s", config.Sequence.NodeID)
+			log.Printf("✅ Sequence generator initialized: Database=%s, Collection=%s, Node=%s",
+				sequenceDB, sequenceColl, config.Sequence.NodeID)
 		}
 	} else {
 		log.Println("Sequence generator disabled or MongoDB unavailable")
@@ -567,27 +582,35 @@ func main() {
 
 	// Initialize OAuth2 authentication service
 	jwtSecret := []byte("your-jwt-secret-key") // TODO: Move to config
+	// Apply tenant-aware naming
+	oauth2DB := config.GetTenantDatabaseName("oauth2_auth")
+	oauth2Coll := config.GetTenantCollectionName("clients")
+	
 	authService = auth.NewClientCredentialsService(
 		mongoClient,
-		"oauth2_auth",       // database
-		"clients",           // collection
+		oauth2DB,            // tenant-aware database
+		oauth2Coll,          // tenant-aware collection
 		jwtSecret,           // JWT secret
 		"cloud-sync",        // issuer
 		[]string{"vm-sync"}, // audience
 	)
-	log.Println("OAuth2 authentication service initialized successfully")
+	log.Printf("✅ OAuth2 authentication service initialized: Database=%s, Collection=%s", oauth2DB, oauth2Coll)
 	appLogger.Info("cloud-sync", "startup", "OAuth2 authentication service initialized", map[string]interface{}{
-		"database":   "oauth2_auth",
-		"collection": "clients",
+		"database":   oauth2DB,
+		"collection": oauth2Coll,
 		"issuer":     "cloud-sync",
 	})
 
 	// Initialize buffer-free resume token manager (ELIMINATES MEMORY BUFFERS)
 	log.Println("🚀 BUFFER-FREE: Initializing resume token manager (no memory buffers)...")
+	// Apply tenant-aware naming
+	resumeTokenDB := config.GetTenantDatabaseName("vm_resume_tokens")
+	resumeTokenColl := config.GetTenantCollectionName("client_tokens")
+	
 	tokenManagerConfig := &resume.TokenManagerConfig{
 		MongoURI:        config.MongoDB.URI,
-		Database:        "vm_resume_tokens",
-		Collection:      "client_tokens",
+		Database:        resumeTokenDB,
+		Collection:      resumeTokenColl,
 		PersistInterval: 5 * time.Second,
 		CleanupInterval: 1 * time.Hour,
 		RetentionDays:   7,
@@ -599,7 +622,8 @@ func main() {
 		log.Printf("DEGRADED MODE: Continuing without buffer-free system (fallback to degraded mode)")
 		tokenManager = nil
 	} else {
-		log.Println("✅ BUFFER-FREE: Resume token manager initialized successfully")
+		log.Printf("✅ BUFFER-FREE: Resume token manager initialized - Database=%s, Collection=%s",
+			resumeTokenDB, resumeTokenColl)
 		// Initialize buffer-free change handler
 		bufferFreeHandler = resume.NewBufferFreeChangeHandler(tokenManager, mongoClient, broadcast)
 		log.Println("🎯 BUFFER-FREE: Change handler initialized (zero memory buffer usage)")

@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"fmt"
+	"os"
+	"time"
+)
 
 // Config represents the server-side configuration
 type Config struct {
@@ -14,6 +18,7 @@ type Config struct {
 	Tracking        TrackingConfig        `yaml:"tracking"`
 	Sequence        SequenceConfig        `yaml:"sequence"`
 	Fence           FenceConfig           `yaml:"fence"`
+	Tenant          TenantConfig          `yaml:"tenant"` // Multi-tenancy configuration
 }
 
 // CloudSyncConfig represents the client-side configuration
@@ -238,4 +243,40 @@ type TCPReceiverConfig struct {
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval" json:"heartbeat_interval"` // Heartbeat interval
 	MaxBatchSize      int           `yaml:"max_batch_size" json:"max_batch_size"`         // Maximum batch size
 	TLSEnabled        bool          `yaml:"tls_enabled" json:"tls_enabled"`               // Enable TLS encryption
+}
+
+// TenantConfig defines multi-tenancy configuration
+type TenantConfig struct {
+	Name      string `yaml:"name" json:"name"`           // Tenant name (e.g., "kotak")
+	Community string `yaml:"community" json:"community"` // Community name (e.g., "default")
+}
+
+// GetTenantCollectionName generates collection name with tenant and community suffix
+// Example: "sync_tracking" -> "sync_tracking_kotak_default"
+func (c *Config) GetTenantCollectionName(baseName string) string {
+	tenantName := c.Tenant.Name
+	communityName := c.Tenant.Community
+
+	// Fallback to environment variables if not set in config
+	if tenantName == "" {
+		tenantName = os.Getenv("TENANT_ID")
+		if tenantName == "" {
+			tenantName = "default"
+		}
+	}
+
+	if communityName == "" {
+		communityName = os.Getenv("COMMUNITY_NAME")
+		if communityName == "" {
+			communityName = "default"
+		}
+	}
+
+	return fmt.Sprintf("%s_%s_%s", baseName, tenantName, communityName)
+}
+
+// GetTenantDatabaseName generates database name with tenant and community suffix
+// Example: "sync_tracking" -> "sync_tracking_kotak_default"
+func (c *Config) GetTenantDatabaseName(baseName string) string {
+	return c.GetTenantCollectionName(baseName)
 }
