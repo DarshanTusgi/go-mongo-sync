@@ -1,6 +1,10 @@
 // 🚀 GOD MODE Dashboard JavaScript - Enhanced Real-time Monitoring
 class CloudSyncDashboard {
     constructor() {
+        const path = window.location.pathname;
+        const dashboardIndex = path.indexOf('/dashboard');
+        this.basePath = dashboardIndex > 0 ? path.substring(0, dashboardIndex) : '';
+        console.log('Detected base path:', this.basePath);
         this.websocket = null;
         this.refreshInterval = null;
         this.currentPage = 1;
@@ -110,7 +114,7 @@ class CloudSyncDashboard {
 
     connectWebSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const wsUrl = `${protocol}//${window.location.host}${this.basePath}/ws`;
         
         this.websocket = new WebSocket(wsUrl);
         
@@ -174,8 +178,8 @@ class CloudSyncDashboard {
 
     async loadMetrics() {
         try {
-            console.log('📊 Loading metrics from /api/dashboard/metrics...');
-            const response = await fetch('/api/dashboard/metrics');
+            console.log(`📊 Loading metrics from ${this.basePath}/api/dashboard/metrics...`);
+            const response = await fetch(`${this.basePath}/api/dashboard/metrics`);
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
@@ -191,8 +195,8 @@ class CloudSyncDashboard {
 
     async loadHealthStatus() {
         try {
-            console.log('🏥 Loading health status from /health...');
-            const response = await fetch('/health');
+            console.log(`🏥 Loading health status from ${this.basePath}/health...`);
+            const response = await fetch(`${this.basePath}/health`);
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
@@ -216,8 +220,8 @@ class CloudSyncDashboard {
                 search: this.filters.search
             });
             
-            console.log(`📜 Loading logs from /api/dashboard/logs?${params}...`);
-            const response = await fetch(`/api/dashboard/logs?${params}`);
+            console.log(`📜 Loading logs from ${this.basePath}/api/dashboard/logs?${params}...`);
+            const response = await fetch(`${this.basePath}/api/dashboard/logs?${params}`);
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
@@ -376,7 +380,7 @@ class CloudSyncDashboard {
 
     async executeControl(action) {
         try {
-            const response = await fetch(`/api/control/${action}`, {
+            const response = await fetch(`${this.basePath}/api/control/${action}`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'

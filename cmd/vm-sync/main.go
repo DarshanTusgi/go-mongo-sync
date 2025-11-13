@@ -516,11 +516,11 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 	// In the new approach without mapping, use the same database and collection names as the source
 	targetDatabase := database
 	targetCollection := collection
-	
+
 	// Apply indexes if provided in metadata
 	if indexesRaw, exists := metadata["indexes"]; exists && indexesRaw != nil {
 		log.Printf("🔍 VM INDEXES: Found indexes field, type=%T", indexesRaw)
-		
+
 		var indexes bson.A
 		if arr, ok := indexesRaw.(bson.A); ok {
 			indexes = arr
@@ -532,15 +532,15 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 			log.Printf("❌ VM INDEXES: Unexpected type %T, cannot process", indexesRaw)
 			return fmt.Errorf("indexes field has unexpected type: %T", indexesRaw)
 		}
-		
+
 		// Convert bson.A to []interface{} for index creation
 		indexModels := make([]mongo.IndexModel, 0, len(indexes))
 		for i, idx := range indexes {
 			log.Printf("🔍 VM INDEX %d: type=%T, value=%+v", i, idx, idx)
-			
+
 			// Handle both bson.D and map[string]interface{} types
 			var idxMap map[string]interface{}
-			
+
 			if idxDoc, ok := idx.(bson.D); ok {
 				log.Printf("🔍 VM INDEX %d: Successfully cast to bson.D", i)
 				// Convert bson.D to map[string]interface{}
@@ -555,12 +555,12 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 				log.Printf("❌ VM INDEX %d: Unexpected type %T, skipping", i, idx)
 				continue
 			}
-			
+
 			// Now process the index map
 			keys := bson.D{}
 			options := options.Index()
 			indexName := ""
-			
+
 			// Extract keys
 			if keysRaw, ok := idxMap["keys"]; ok {
 				if keysMap, ok := keysRaw.(map[string]interface{}); ok {
@@ -584,7 +584,7 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 					log.Printf("❌ VM INDEX %d: keys field has unexpected type: %T", i, keysRaw)
 				}
 			}
-			
+
 			// Extract name
 			if nameRaw, ok := idxMap["name"]; ok {
 				if name, ok := nameRaw.(string); ok {
@@ -593,7 +593,7 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 					log.Printf("🔍 VM INDEX %d: Found name: %s", i, name)
 				}
 			}
-			
+
 			// Extract unique
 			if uniqueRaw, ok := idxMap["unique"]; ok {
 				if unique, ok := uniqueRaw.(bool); ok {
@@ -601,13 +601,13 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 					log.Printf("🔍 VM INDEX %d: Found unique: %v", i, unique)
 				}
 			}
-			
+
 			// Skip default _id_ index
 			if indexName == "_id_" {
 				log.Printf("⏭️ VM INDEX %d: Skipping default _id_ index", i)
 				continue
 			}
-			
+
 			if len(keys) > 0 {
 				indexModels = append(indexModels, mongo.IndexModel{
 					Keys:    keys,
@@ -1283,7 +1283,9 @@ func loadConfig(filename string) error {
 	if err != nil {
 		return err
 	}
-	err = yaml.Unmarshal(data, &config)
+	expandedData := os.ExpandEnv(string(data))
+
+	err = yaml.Unmarshal([]byte(expandedData), &config)
 	if err != nil {
 		return err
 	}

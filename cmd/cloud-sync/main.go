@@ -456,7 +456,7 @@ func main() {
 		// Apply tenant-aware naming
 		checkpointDB := config.GetTenantDatabaseName(config.Checkpoint.Database)
 		checkpointColl := config.GetTenantCollectionName(config.Checkpoint.Collection)
-		
+
 		checkpointConfig := &resume.CheckpointConfig{
 			MongoURI:        config.MongoDB.URI,
 			Database:        checkpointDB,
@@ -495,7 +495,7 @@ func main() {
 		trackingConfig.Database = config.GetTenantDatabaseName(config.Tracking.Database)
 		trackingConfig.StateCollection = config.GetTenantCollectionName(config.Tracking.StateCollection)
 		trackingConfig.BatchCollection = config.GetTenantCollectionName(config.Tracking.BatchCollection)
-		
+
 		transferTracker, err = tracking.NewTransferTracker(trackingConfig)
 		if err != nil {
 			log.Printf("WARNING: Failed to initialize transfer tracker: %v", err)
@@ -517,7 +517,7 @@ func main() {
 		// Apply tenant-aware naming
 		sequenceDB := config.GetTenantDatabaseName(config.Sequence.Database)
 		sequenceColl := config.GetTenantCollectionName(config.Sequence.Collection)
-		
+
 		sequenceConfig := &sequence.GeneratorConfig{
 			Enabled:    config.Sequence.Enabled,
 			MongoURI:   config.MongoDB.URI,
@@ -586,7 +586,7 @@ func main() {
 	// Apply tenant-aware naming
 	oauth2DB := config.GetTenantDatabaseName("oauth2_auth")
 	oauth2Coll := config.GetTenantCollectionName("clients")
-	
+
 	authService = auth.NewClientCredentialsService(
 		mongoClient,
 		oauth2DB,            // tenant-aware database
@@ -607,7 +607,7 @@ func main() {
 	// Apply tenant-aware naming
 	resumeTokenDB := config.GetTenantDatabaseName("vm_resume_tokens")
 	resumeTokenColl := config.GetTenantCollectionName("client_tokens")
-	
+
 	tokenManagerConfig := &resume.TokenManagerConfig{
 		MongoURI:        config.MongoDB.URI,
 		Database:        resumeTokenDB,
@@ -751,6 +751,19 @@ func main() {
 	basePath := getBasePath()
 	log.Printf("API Base Path: %s", basePath)
 
+	// Check for CLOUD_DOMAIN environment variable for public URL
+	cloudDomain := os.Getenv("CLOUD_DOMAIN")
+	var baseURL string
+
+	if cloudDomain != "" {
+		// Use CLOUD_DOMAIN for public-facing URL
+		baseURL = fmt.Sprintf("https://%s%s", cloudDomain, basePath)
+	} else {
+		// Fallback to config (for local development)
+		baseURL = fmt.Sprintf("http://%s:%d%s", config.Server.Host, config.Server.Port, basePath)
+	}
+
+	fmt.Println("Base URL:", baseURL)
 	// Setup HTTP routes
 	router := mux.NewRouter()
 
@@ -3635,8 +3648,9 @@ func loadConfig(filename string) error {
 	if err != nil {
 		return err
 	}
+	expandedData := os.ExpandEnv(string(data))
 
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	if err := yaml.Unmarshal([]byte(expandedData), &config); err != nil {
 		return err
 	}
 
@@ -3649,7 +3663,7 @@ func loadConfig(filename string) error {
 	}
 
 	var partialConfig PartialConfig
-	if err := yaml.Unmarshal(data, &partialConfig); err == nil {
+	if err := yaml.Unmarshal([]byte(expandedData), &partialConfig); err == nil {
 		if partialConfig.MongoDB.CollectionsConfigFile != "" {
 			// Load collections from the separate JSON file
 			if err := loadCollectionsFromJSON(partialConfig.MongoDB.CollectionsConfigFile); err != nil {
@@ -3666,11 +3680,11 @@ func loadConfig(filename string) error {
 func expandEnvVars(data []byte) []byte {
 	// Convert to string for regex processing
 	str := string(data)
-	
+
 	// Regular expression to match ${VAR_NAME} or ${VAR_NAME:-default}
 	// Supports: ${VAR}, ${VAR:-default_value}
 	re := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
-	
+
 	// Replace all occurrences
 	expanded := re.ReplaceAllStringFunc(str, func(match string) string {
 		// Extract variable name and default value
@@ -3678,24 +3692,24 @@ func expandEnvVars(data []byte) []byte {
 		if len(submatches) < 2 {
 			return match // Return original if pattern doesn't match
 		}
-		
+
 		varName := submatches[1]
 		defaultValue := ""
 		if len(submatches) > 2 {
 			defaultValue = submatches[2]
 		}
-		
+
 		// Get environment variable value
 		envValue := os.Getenv(varName)
-		
+
 		// Use environment value if set, otherwise use default
 		if envValue != "" {
 			return envValue
 		}
-		
+
 		return defaultValue
 	})
-	
+
 	return []byte(expanded)
 }
 
@@ -3721,7 +3735,7 @@ func loadCollectionsFromJSON(filename string) error {
 
 	// STEP 2: Expand environment variables in the JSON content
 	expandedData := expandEnvVars(data)
-	
+
 	log.Printf("📝 CONFIG: Environment variable expansion completed for %s", filename)
 
 	// STEP 3: Parse the JSON file with expanded environment variables
@@ -3739,19 +3753,19 @@ func loadCollectionsFromJSON(filename string) error {
 		if i < len(originalConfig.Databases) {
 			collectionsConfig.Databases[i].OriginalTemplate = originalConfig.Databases[i].Name
 		}
-		
+
 		// Compute target database name for VM-sync by replacing ${database_name} with "1kosmos"
 		// This is ONLY for database.name routing to VM-sync
 		targetName := collectionsConfig.Databases[i].OriginalTemplate
 		if targetName == "" {
 			targetName = collectionsConfig.Databases[i].Name
 		}
-		
+
 		// Replace ${database_name} with hardcoded "1kosmos" for VM-sync routing
 		// Support both ${database_name} and ${database_name:-default} patterns
 		dbNamePattern := regexp.MustCompile(`\$\{database_name(?::-[^}]*)?\}`)
 		collectionsConfig.Databases[i].TargetDatabaseName = dbNamePattern.ReplaceAllString(targetName, "1kosmos")
-		
+
 		log.Printf("📋 DB ROUTING: Source='%s' (expanded from '%s') -> Target='%s' (for VM-sync)",
 			collectionsConfig.Databases[i].Name,
 			collectionsConfig.Databases[i].OriginalTemplate,
@@ -3859,7 +3873,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if clientInfo, exists := clients[conn]; exists {
 			delete(clients, conn)
 			log.Printf("🗑️  CLEANUP: Removed %s client %s from clients map (defer cleanup)", clientInfo.ClientType, clientInfo.ClientID)
-			
+
 			// Remove TCP address from Address Manager if this is a vm-sync client
 			if clientInfo.ClientType == "vm-sync" {
 				addressMgr := transport.GetAddressManager()
@@ -3986,7 +4000,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				"tcp":  tcpEndpoint,                                                    // Use automatically detected TCP endpoint
 				"http": fmt.Sprintf("%s:%d", strings.Split(tcpEndpoint, ":")[0], 8081), // HTTP port 8081
 			}
-			
+
 			// Store TCP address in Address Manager for global access
 			addressMgr := transport.GetAddressManager()
 			addressMgr.SetAddress(clientInfo.ClientID, tcpEndpoint)

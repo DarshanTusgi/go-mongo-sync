@@ -42,6 +42,9 @@ COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 # Copy configuration files
 COPY --chown=cloudsync:cloudsync configs/ ./configs/
 
+# Copy API documentation
+COPY --chown=cloudsync:cloudsync docs/ ./docs/
+
 # Copy web assets for dashboard
 COPY --chown=cloudsync:cloudsync web/ ./web/
 

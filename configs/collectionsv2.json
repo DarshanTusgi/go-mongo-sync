@@ -1,0 +1,551 @@
+
+{
+  "databases": [
+    {
+      "name": "authn-${SOURCE_DATABASE}",
+      "enabled": true,
+      "priority": 1,
+      "collections": [
+        {
+          "name": "authenticationjourney_v2",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 1,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "tenantId",
+              "communityId",
+              "name",
+              "enabled",
+              "requestingAppId",
+              "decision"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "tenantId", "operator": "eq", "value": "${COMMUNITY_ID}" },
+              { "field": "communityId", "operator": "eq", "value": "${TENANT_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "authenticationjourneys",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 2,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "tenantId",
+              "communityId",
+              "name",
+              "enabled",
+              "groups",
+              "applications",
+              "decision"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_ID}" },
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "authschemes",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 3,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "tag",
+              "communityId",
+              "enabled",
+              "isDefault",
+              "modules",
+              "dbModule"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "externalidps",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 4,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "tenantId",
+              "communityId",
+              "connection",
+              "routingPolicy"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_ID}" },
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "serviceproviders",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 5,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "communityId",
+              "name",
+              "environment",
+              "type",
+              "logo",
+              "saml_config",
+              "forceReauthentication"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "idps",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 6,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "communityId",
+              "type",
+              "oidc_config"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "users-mgmt-${SOURCE_DATABASE}",
+      "enabled": true,
+      "priority": 2,
+      "collections": [
+        {
+          "name": "authmodules",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 1,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "type",
+              "subtype",
+              "method",
+              "communityId",
+              "name",
+              "enabled",
+              "mode",
+              "config",
+              "kerberos_config",
+              "lastEnabledAt",
+              "enhanced_security_on"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "brokerconnections",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 2,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "uid",
+              "name",
+              "communityId",
+              "authModuleId",
+              "enabled",
+              "authorized",
+              "connected",
+              "publicKey",
+              "version",
+              "connectedAt",
+              "lastPingAt",
+              "ip",
+              "port",
+              "licenseHash",
+              "siteAddress",
+              "podInfo",
+              "os",
+              "isSCEPSupported",
+              "isNDESBypassSupported",
+              "__v",
+              "lastDisconnectedAt"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "user_locks",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 3,
+          "field_filter": {
+            "include_fields": [
+              "__v",
+              "_id",
+              "communityId",
+              "userId",
+              "createdAt",
+              "lockedBy",
+              "message",
+              "tenantId",
+              "updatedAt"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" },
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "user_properties",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 4,
+          "field_filter": {
+            "include_fields": [
+              "__v",
+              "_id",
+              "communityId",
+              "tenantId",
+              "user",
+              "aliases",
+              "landlines",
+              "mobiles"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" },
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "userattributes",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 5,
+          "field_filter": {
+            "include_fields": [
+              "__v",
+              "_id",
+              "moduleId",
+              "name",
+              "attribute"
+            ],
+            "always_include": ["_id"]
+          }
+        },
+        {
+          "name": "users",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 6,
+          "field_filter": {
+            "include_fields": [
+              "__v",
+              "_id",
+              "uid",
+              "tenantId",
+              "communityId",
+              "username",
+              "password",
+              "type",
+              "roleValue",
+              "status",
+              "firstname",
+              "lastname",
+              "email1",
+              "email1_verified",
+              "disabled"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" },
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_ID}" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "adminconsole-${SOURCE_DATABASE}",
+      "enabled": true,
+      "priority": 3,
+      "collections": [
+        {
+          "name": "communities",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 1,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "tenantid",
+              "JwtPublicKey",
+              "JwtPrivateKey",
+              "logo",
+              "EcdsaPublicKey",
+              "EcdsaPrivateKey",
+              "accountsPerPerson",
+              "personsPerAccount",
+              "personLimitRule",
+              "otpMaxAttempts",
+              "otpLockDurationMinutes",
+              "userOnboardingAuthType",
+              "name",
+              "_class"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "name", "operator": "eq", "value": "box" }
+            ]
+          }
+        },
+        {
+          "name": "msg_gateways",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 2,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "type",
+              "username",
+              "password",
+              "serviceUrl",
+              "channels",
+              "senderEmail",
+              "active",
+              "timeoutValue",
+              "auth",
+              "protocol",
+              "port",
+              "communityId",
+              "tenantId",
+              "name",
+              "_class"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" },
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "tenants",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 3,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "dns",
+              "firstname",
+              "country",
+              "companyname",
+              "companyemail",
+              "licensekey",
+              "lastname",
+              "phonenumber",
+              "tenanttype",
+              "displayTenantInfoForPersona",
+              "tenanttag",
+              "name",
+              "_class"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "_id", "operator": "eq", "value": "${TENANT_ID}" }
+            ]
+          }
+        },
+        {
+          "name": "servicekeys",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 4,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "tag",
+              "keyId",
+              "keySecret",
+              "type",
+              "disabled",
+              "_class"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "type", "operator": "eq", "value": "hawk" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "rules-engine-${SOURCE_DATABASE}",
+      "enabled": true,
+      "priority": 4,
+      "collections": [
+        {
+          "name": "rules",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 1,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "name",
+              "category",
+              "tags",
+              "tenantId",
+              "communityId",
+              "enabled",
+              "createdBy",
+              "criteria",
+              "conditions",
+              "onMatch",
+              "ipDecimalList",
+              "__v"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_ID}" },
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_ID}" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+        "name" : "caas-${SOURCE_DATABASE}",
+        "enabled" : true,
+        "priority" : 5,
+        "collections" : [        
+            {
+                "name" : "service_components",
+                "enabled" : true,
+                "batch_size" : 100,
+                "priority" : 1,
+                "field_filter" : {
+                "include_fields" : ["_id", "name", "url"],
+                "always_include" : [ "_id"]
+                },
+                "document_filter" : {
+                "criteria" : [] 
+                }
+          },
+            {
+                "name" : "configstores",
+                "enabled" : true,
+                "batch_size" : 100,
+                "priority" : 1,
+                "field_filter" : {
+                "include_fields" : [
+                    "_id", "key", "value"],
+                "always_include" : [ "_id" ]
+                },
+                "document_filter" : {
+                "criteria" : [] 
+                }
+          }
+        ]
+    },
+    {
+        "name" : "caas-${SOURCE_DATABASE}",
+        "enabled" : true,
+        "priority" : 6,
+        "collections" : [
+            {
+                "name" : "service_components",
+                "enabled" : true,
+                "batch_size" : 100,
+                "priority" : 1,
+                "field_filter" : {
+                "include_fields" : ["_id", "name", "url"],
+                "always_include" : [ "_id"]
+                },
+                "document_filter" : {
+                "criteria" : [] 
+                }
+            },
+            {
+                "name" : "configstores",
+                "enabled" : true,
+                "batch_size" : 100,
+                "priority" : 1,
+                "field_filter" : {
+                "include_fields" : [
+                    "_id", "key", "value"],
+                "always_include" : [ "_id" ]
+                },
+                "document_filter" : {
+                "criteria" : [] 
+                }
+          }
+        ]
+    }
+]
+}

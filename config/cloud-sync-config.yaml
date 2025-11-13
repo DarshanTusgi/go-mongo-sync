@@ -1,0 +1,178 @@
+# Cloud-sync HTTP server configuration
+# 
+# License Configuration (Environment Variables):
+# CLOUD_SYNC_LICENSE="cloud-tag,cloud-uuid-123"  # Cloud-sync license key
+# VM_SYNC_LICENSES="vm-tag1,vm-uuid-456,vm-tag2,vm-uuid-789"  # Comma-separated VM licenses
+# 
+# License validation ensures only authorized vm-sync instances can connect
+# via WebSocket. Both cloud-sync and vm-sync must have valid licenses.
+#
+# Production Environment Variables (optional):
+# MONGODB_URI: Your MongoDB connection string
+# ENCRYPTION_KEY: Base64 encoded 32-byte encryption key
+# ENCRYPTION_KEY_ID: Unique identifier for your encryption key
+
+server:
+  port: 8080
+  host: "localhost"  # Use "0.0.0.0" for production to listen on all interfaces
+  read_timeout: "15s"  # Increase to "30s" for production
+  write_timeout: "15s"  # Increase to "30s" for production
+  idle_timeout: "60s"   # Increase to "120s" for production
+
+mongodb:
+  # Real test database connection
+  uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
+  timeout: 30s
+  databases:
+    - name: "real_transfer_test"
+      enabled: true
+      priority: 1
+      collections:
+        - name: "products"
+          enabled: true
+          batch_size: 50   # Moderate batch size for testing
+          priority: 1
+          field_filter:
+            include_fields: ["_id", "product_id", "name", "description", "category", "price", "cost", "status", "stock_quantity", "sku", "weight", "dimensions", "tags", "rating", "reviews_count", "created_at", "updated_at"]
+            always_include: ["_id"]
+          # Document filter: only sync active products with price > 0
+          document_filter:
+            criteria:
+              - field: "status"
+                operator: "eq"
+                value: "active"
+              - field: "price"
+                operator: "gt"
+                value: 0
+        - name: "customers"
+          enabled: true
+          batch_size: 30   # Smaller batch for detailed customer data
+          priority: 2
+          field_filter:
+            include_fields: ["_id", "customer_id", "first_name", "last_name", "email", "phone", "status", "verified", "address", "preferences", "total_orders", "total_spent", "created_at", "last_login"]
+            always_include: ["_id"]
+          # Document filter: only sync verified active customers
+          document_filter:
+            criteria:
+              - field: "verified"
+                operator: "eq"
+                value: true
+              - field: "status"
+                operator: "eq"
+                value: "active"
+        - name: "orders"
+          enabled: true
+          batch_size: 25   # Smaller batch for complex order data
+          priority: 3
+          field_filter:
+            include_fields: ["_id", "order_id", "customer_id", "customer_object_id", "status", "items", "subtotal", "shipping_cost", "tax", "total_amount", "payment_method", "payment_status", "shipping_address", "notes", "created_at", "updated_at"]
+            always_include: ["_id"]
+          # Document filter: only sync paid orders
+          document_filter:
+            criteria:
+              - field: "payment_status"
+                operator: "eq"
+                value: "paid"
+        - name: "inventory"
+          enabled: true
+          batch_size: 40   # Medium batch for inventory data
+          priority: 4
+          field_filter:
+            include_fields: ["_id", "inventory_id", "product_id", "product_object_id", "warehouse_location", "bin_location", "quantity_on_hand", "quantity_reserved", "quantity_available", "reorder_point", "reorder_quantity", "unit_cost", "last_counted", "expiration_date", "supplier", "created_at", "updated_at"]
+            always_include: ["_id"]
+          # Document filter: only sync items with stock > 0
+          document_filter:
+            criteria:
+              - field: "quantity_on_hand"
+                operator: "gt"
+                value: 0
+
+# WebSocket configuration
+websocket:
+  enabled: true
+  endpoint: "/ws"
+  max_connections: 100
+  ping_interval: "30s"
+  pong_timeout: "10s"
+
+# Sync configuration
+sync:
+  initial_sync: true
+  realtime_sync: false  # DISABLED - incremental sync must use HTTP
+  scheduler_sync: true  # ENABLED for HTTP-based incremental sync
+  scheduler_interval: "30s"  # Quick interval for testing real-time feel
+  resumable_initial_sync: true  # Enable resumable initial sync to avoid full re-sync on restart
+  batch_size: 1000
+  parallel_collections: true
+  max_workers: 4
+  # TCP Transport Configuration for high-performance data transfer
+  transport:
+    mode: "tcp"  # Use TCP for initial/full sync (bulk data)
+    http_fallback: true  # Enable HTTP fallback for incremental sync
+    compression_type: "zstd"  # Use Zstd compression
+    health_monitor: "30s"  # Transport health monitor interval
+    tcp_sender:
+      address: "127.0.0.1:9000"  # vm-sync TCP receiver address (use 127.0.0.1 not localhost)
+      parallel_conns: 4
+      window_size: 64
+      batch_timeout: 60s      # Increased to 60s for ultra-stability
+      conn_timeout: 180s      # Increased to 180s for ultra-stable connections
+      keep_alive: 120s        # Increased to 120s for persistent connections
+      max_retries: 8          # Increased to 8 for maximum reliability
+      retry_backoff: 3s       # Increased to 3s for proper recovery
+      buffer_size: 1048576    # Increased to 1MB for large transfers
+      max_batch_size: 67108864  # Increased to 64MB for efficiency
+      tls_enabled: false
+
+# Encryption configuration
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  # Development key (use ${ENCRYPTION_KEY_ID} for production)
+  key_id: "cloud-sync-key-001"
+  # Development key (use ${ENCRYPTION_KEY} for production)
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"  # Base64 encoded 32-byte key
+
+# Logging configuration
+logging:
+  level: "info"  # Use "warn" for production
+  format: "json"
+  output: "stdout"
+
+# Checkpoint configuration for resumable synchronization
+checkpoint:
+  enabled: true
+  database: "sync_checkpoints"
+  collection: "resume_tokens"
+  save_interval_seconds: 5
+  cleanup_enabled: true
+  retention_days: 30
+
+# Watermark-based tracking configuration
+# Tracks client sync progress using watermarks to prevent duplicates
+tracking:
+  enabled: true
+  mongo_uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"  # Use ${MONGODB_URI} for production
+  database: "sync_tracking"
+  state_collection: "client_sync_states"     # Tracks watermark-based sync state per client
+  batch_collection: "transfer_batches"       # Tracks transfer batch operations
+
+# Sequence number generation for ordered event processing
+sequence:
+  enabled: true
+  database: "sync_sequences"
+  collection: "sequence_counters"
+  batch_size: 1000
+  node_id: "cloud-sync-node-001"
+
+# Cluster time fence for snapshot consistency
+fence:
+  enabled: true
+
+# Performance tuning
+performance:
+  max_workers: 4      # Increase to 8-16 for production
+  buffer_size: 1000
+  batch_timeout: "5s"
+  retry_attempts: 3
+  retry_delay: "2s"
