@@ -1,0 +1,55 @@
+{
+  "databases": [
+    {
+      "name": "authn-${SOURCE_DATABASE}",
+      "enabled": true,
+      "priority": 1,
+      "collections": [
+        {
+          "name": "users_${TENANT_ID:-default}",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 1,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "tenantId",
+              "communityId",
+              "username",
+              "email"
+            ],
+            "always_include": ["_id"]
+          },
+          "document_filter": {
+            "criteria": [
+              { "field": "tenantId", "operator": "eq", "value": "${TENANT_FILTER_ID}" },
+              { "field": "communityId", "operator": "eq", "value": "${COMMUNITY_FILTER_ID:-68418b2587942f1d3158a799}" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "${DB_PREFIX:-users}-mgmt",
+      "enabled": true,
+      "priority": 2,
+      "collections": [
+        {
+          "name": "profiles",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 1,
+          "field_filter": {
+            "include_fields": [
+              "_id",
+              "userId",
+              "firstName",
+              "lastName"
+            ],
+            "always_include": ["_id"]
+          }
+        }
+      ]
+    }
+  ]
+}

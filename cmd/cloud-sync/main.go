@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1408,6 +1409,12 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 
 		// Extract document for insert/update/replace operations
 		if fullDoc, ok := changeEvent["fullDocument"]; ok {
+			// CRITICAL: Apply document filters to incremental sync (same as initial sync)
+			if !matchesDocumentFilter(database, collection, fullDoc) {
+				log.Printf("🚫 FILTER SKIP: Document filtered out from %s.%s (does not match criteria)", database, collection)
+				continue // Skip this document
+			}
+
 			docBytes, err := bson.Marshal(fullDoc)
 			if err != nil {
 				log.Printf("⚠️  Failed to marshal document: %v", err)
@@ -1441,6 +1448,16 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 			log.Printf("⏰ STREAM TIMEOUT: %s.%s reached 25s timeout (normal behavior)", database, collection)
 		} else {
 			log.Printf("⚠️  STREAM ERROR: %s.%s - %v", database, collection, streamErr)
+		}
+	}
+
+	// CRITICAL FIX: Get resume token even if no changes occurred
+	// This ensures we don't miss changes between polling cycles
+	if changeCount == 0 {
+		currentToken := changeStream.ResumeToken()
+		if len(currentToken) > 0 {
+			lastResumeToken = currentToken
+			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (no changes, but token saved for next cycle)", database, collection)
 		}
 	}
 
@@ -1617,6 +1634,122 @@ func buildDocumentFilter(database, collection string) bson.M {
 		}
 	}
 	return bson.M{} // No filter if collection not found
+}
+
+// matchesDocumentFilter checks if a document matches the configured document filter
+// Used for incremental sync to ensure filtered documents are excluded
+func matchesDocumentFilter(database, collection string, document interface{}) bool {
+	// Get collection config
+	for _, db := range config.MongoDB.Databases {
+		if db.Name == database {
+			for _, coll := range db.Collections {
+				if coll.Name == collection {
+					// If no document filter criteria, accept all documents
+					if len(coll.DocumentFilter.Criteria) == 0 {
+						return true
+					}
+
+					// Convert document to bson.M for field access
+					docMap, ok := document.(bson.M)
+					if !ok {
+						// Try to convert via marshaling
+						docBytes, err := bson.Marshal(document)
+						if err != nil {
+							return true // Accept on error
+						}
+						err = bson.Unmarshal(docBytes, &docMap)
+						if err != nil {
+							return true // Accept on error
+						}
+					}
+
+					// Check each criterion
+					for _, criterion := range coll.DocumentFilter.Criteria {
+						fieldValue, exists := docMap[criterion.Field]
+						if !exists {
+							// If field doesn't exist, consider it as not matching
+							return false
+						}
+
+						// Apply operator check
+						switch criterion.Operator {
+						case "eq":
+							if fieldValue != criterion.Value {
+								return false
+							}
+						case "ne":
+							if fieldValue == criterion.Value {
+								return false // ne means "not equal", so if equal, reject
+							}
+						case "gt":
+							// Type assertion for comparison
+							if !compareValues(fieldValue, criterion.Value, "gt") {
+								return false
+							}
+						case "gte":
+							if !compareValues(fieldValue, criterion.Value, "gte") {
+								return false
+							}
+						case "lt":
+							if !compareValues(fieldValue, criterion.Value, "lt") {
+								return false
+							}
+						case "lte":
+							if !compareValues(fieldValue, criterion.Value, "lte") {
+								return false
+							}
+						}
+					}
+
+					// All criteria matched
+					return true
+				}
+			}
+		}
+	}
+
+	// No config found, accept document by default
+	return true
+}
+
+// compareValues performs type-aware comparison for filter matching
+func compareValues(fieldValue interface{}, criterionValue interface{}, operator string) bool {
+	// Simple numeric comparison (extend as needed)
+	fv, fok := fieldValue.(float64)
+	cv, cok := criterionValue.(float64)
+
+	if fok && cok {
+		switch operator {
+		case "gt":
+			return fv > cv
+		case "gte":
+			return fv >= cv
+		case "lt":
+			return fv < cv
+		case "lte":
+			return fv <= cv
+		}
+	}
+
+	// String comparison
+	fvs, foks := fieldValue.(string)
+	cvs, coks := criterionValue.(string)
+
+	if foks && coks {
+		switch operator {
+		case "gt":
+			return fvs > cvs
+		case "gte":
+			return fvs >= cvs
+		case "lt":
+			return fvs < cvs
+		case "lte":
+			return fvs <= cvs
+		}
+	}
+
+	// Default to true if types don't match
+	return true
 }
 
 func buildAggregationPipeline(database, collection string, filter bson.M) mongo.Pipeline {
@@ -2040,6 +2173,11 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 		vmSyncEndpoint = "http://localhost:8081"
 	}
 
+	// CRITICAL FIX: Apply database name transformation for VM-sync routing
+	// This ensures incremental sync uses the same target database as initial dump
+	targetDatabase := getTargetDatabaseForVMSync(database)
+	log.Printf("📋 INCREMENTAL DB ROUTING: Source='%s' → Target='%s' for collection %s", database, targetDatabase, collection)
+
 	// Convert documents to DataResponse format
 	// Convert [][]byte to []bson.Raw
 	bsonDocs := make([]bson.Raw, len(documents))
@@ -2048,7 +2186,7 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 	}
 
 	response := models.DataResponse{
-		Database:   database,
+		Database:   targetDatabase, // Use target database name
 		Collection: collection,
 		Documents:  bsonDocs,
 		Count:      int64(len(documents)),
@@ -2060,8 +2198,8 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 		return fmt.Errorf("failed to marshal documents: %v", err)
 	}
 
-	// Send HTTP request to vm-sync
-	url := fmt.Sprintf("%s/api/v1/push/%s/%s", vmSyncEndpoint, database, collection)
+	// Send HTTP request to vm-sync with target database name
+	url := fmt.Sprintf("%s/api/v1/push/%s/%s", vmSyncEndpoint, targetDatabase, collection)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %v", err)
@@ -2083,7 +2221,7 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 		return fmt.Errorf("HTTP request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	log.Printf("✅ HTTP INCREMENTAL SYNC: Successfully sent %d documents for %s.%s", len(documents), database, collection)
+	log.Printf("✅ HTTP INCREMENTAL SYNC: Successfully sent %d documents for %s.%s → %s.%s", len(documents), database, collection, targetDatabase, collection)
 	return nil
 }
 
@@ -2844,7 +2982,9 @@ func pushIncrementalPageTCP(ctx context.Context, cursor *mongo.Cursor, database,
 
 	// Send documents via TCP
 	if len(documents) > 0 {
-		streamName := fmt.Sprintf("%s.%s.incremental", database, collection)
+		// IMPORTANT: Use target database name for VM-sync routing (handles ${database_name} -> "1kosmos" replacement)
+		targetDatabase := getTargetDatabaseForVMSync(database)
+		streamName := fmt.Sprintf("%s.%s.incremental", targetDatabase, collection)
 
 		// TCP transfer with monitoring
 		tcpSendStart := time.Now()
@@ -3023,7 +3163,9 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 	}
 
 	// Create stream name for this collection
-	streamName := fmt.Sprintf("%s.%s", database, collection)
+	// IMPORTANT: Use target database name for VM-sync routing (handles ${database_name} -> "1kosmos" replacement)
+	targetDatabase := getTargetDatabaseForVMSync(database)
+	streamName := fmt.Sprintf("%s.%s", targetDatabase, collection)
 
 	// Log document collection phase
 	docCollectionTime := time.Since(tcpStartTime)
@@ -3104,6 +3246,22 @@ func formatBytes(bytes int) string {
 	} else {
 		return fmt.Sprintf("%.2f MB", float64(bytes)/(1024*1024))
 	}
+}
+
+// getTargetDatabaseForVMSync returns the target database name for VM-sync routing
+// This implements the special ${database_name} -> "1kosmos" replacement
+func getTargetDatabaseForVMSync(sourceDatabase string) string {
+	// Search through config to find matching database and return its TargetDatabaseName
+	for _, db := range config.MongoDB.Databases {
+		if db.Name == sourceDatabase {
+			if db.TargetDatabaseName != "" {
+				return db.TargetDatabaseName
+			}
+			break
+		}
+	}
+	// Fallback: return source database name if no mapping found
+	return sourceDatabase
 }
 
 // getTCPReceiverFromSender returns a receiver reference from the sender (for checkpoint coordination)
@@ -3453,7 +3611,9 @@ func sendMetadataTCP(ctx context.Context, database, collection string) error {
 	log.Printf("🔍 CLOUD METADATA: Marshaled %d bytes for %s.%s", len(metadataBytes), database, collection)
 
 	// Send metadata as a special stream
-	metadataStreamName := fmt.Sprintf("%s.%s.metadata", database, collection)
+	// IMPORTANT: Use target database name for VM-sync routing (handles ${database_name} -> "1kosmos" replacement)
+	targetDatabase := getTargetDatabaseForVMSync(database)
+	metadataStreamName := fmt.Sprintf("%s.%s.metadata", targetDatabase, collection)
 	if err := tcpSender.SendBatch(metadataStreamName, [][]byte{metadataBytes}); err != nil {
 		return fmt.Errorf("failed to send metadata: %v", err)
 	}
@@ -3501,7 +3661,47 @@ func loadConfig(filename string) error {
 	return nil
 }
 
+// expandEnvVars replaces ${VAR_NAME} patterns with environment variable values
+// Example: "authn-${SOURCE_DATABASE}" with SOURCE_DATABASE=prod becomes "authn-prod"
+func expandEnvVars(data []byte) []byte {
+	// Convert to string for regex processing
+	str := string(data)
+	
+	// Regular expression to match ${VAR_NAME} or ${VAR_NAME:-default}
+	// Supports: ${VAR}, ${VAR:-default_value}
+	re := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
+	
+	// Replace all occurrences
+	expanded := re.ReplaceAllStringFunc(str, func(match string) string {
+		// Extract variable name and default value
+		submatches := re.FindStringSubmatch(match)
+		if len(submatches) < 2 {
+			return match // Return original if pattern doesn't match
+		}
+		
+		varName := submatches[1]
+		defaultValue := ""
+		if len(submatches) > 2 {
+			defaultValue = submatches[2]
+		}
+		
+		// Get environment variable value
+		envValue := os.Getenv(varName)
+		
+		// Use environment value if set, otherwise use default
+		if envValue != "" {
+			return envValue
+		}
+		
+		return defaultValue
+	})
+	
+	return []byte(expanded)
+}
+
 // loadCollectionsFromJSON loads collections configuration from a separate JSON file
+// Supports environment variable substitution using ${VAR_NAME} or ${VAR_NAME:-default} syntax
+// SPECIAL HANDLING: For database.name, tracks original template and computes target name for VM-sync
 func loadCollectionsFromJSON(filename string) error {
 	// Resolve the file path relative to the main config file
 	data, err := os.ReadFile(filename)
@@ -3509,23 +3709,65 @@ func loadCollectionsFromJSON(filename string) error {
 		return fmt.Errorf("failed to read collections config file: %w", err)
 	}
 
-	// Parse the JSON file
+	// STEP 1: Parse the original JSON to capture database name templates BEFORE expansion
+	var originalConfig struct {
+		Databases []struct {
+			Name string `json:"name"`
+		} `json:"databases"`
+	}
+	if err := json.Unmarshal(data, &originalConfig); err != nil {
+		return fmt.Errorf("failed to parse original collections config JSON: %w", err)
+	}
+
+	// STEP 2: Expand environment variables in the JSON content
+	expandedData := expandEnvVars(data)
+	
+	log.Printf("📝 CONFIG: Environment variable expansion completed for %s", filename)
+
+	// STEP 3: Parse the JSON file with expanded environment variables
 	var collectionsConfig struct {
 		Databases []models.DatabaseConfig `json:"databases"`
 	}
 
-	if err := json.Unmarshal(data, &collectionsConfig); err != nil {
+	if err := json.Unmarshal(expandedData, &collectionsConfig); err != nil {
 		return fmt.Errorf("failed to parse collections config JSON: %w", err)
 	}
 
-	// Merge the collections configuration with the main config
+	// STEP 4: Post-process database configs to set OriginalTemplate and TargetDatabaseName
+	for i := range collectionsConfig.Databases {
+		// Store the original template (before env var expansion)
+		if i < len(originalConfig.Databases) {
+			collectionsConfig.Databases[i].OriginalTemplate = originalConfig.Databases[i].Name
+		}
+		
+		// Compute target database name for VM-sync by replacing ${database_name} with "1kosmos"
+		// This is ONLY for database.name routing to VM-sync
+		targetName := collectionsConfig.Databases[i].OriginalTemplate
+		if targetName == "" {
+			targetName = collectionsConfig.Databases[i].Name
+		}
+		
+		// Replace ${database_name} with hardcoded "1kosmos" for VM-sync routing
+		// Support both ${database_name} and ${database_name:-default} patterns
+		dbNamePattern := regexp.MustCompile(`\$\{database_name(?::-[^}]*)?\}`)
+		collectionsConfig.Databases[i].TargetDatabaseName = dbNamePattern.ReplaceAllString(targetName, "1kosmos")
+		
+		log.Printf("📋 DB ROUTING: Source='%s' (expanded from '%s') -> Target='%s' (for VM-sync)",
+			collectionsConfig.Databases[i].Name,
+			collectionsConfig.Databases[i].OriginalTemplate,
+			collectionsConfig.Databases[i].TargetDatabaseName)
+	}
+
+	// STEP 5: Merge the collections configuration with the main config
 	for _, db := range collectionsConfig.Databases {
 		// Find the matching database in the main config
 		found := false
 		for j, mainDB := range config.MongoDB.Databases {
 			if mainDB.Name == db.Name {
-				// Merge the collections
+				// Merge the collections and routing metadata
 				config.MongoDB.Databases[j].Collections = db.Collections
+				config.MongoDB.Databases[j].OriginalTemplate = db.OriginalTemplate
+				config.MongoDB.Databases[j].TargetDatabaseName = db.TargetDatabaseName
 				found = true
 				break
 			}

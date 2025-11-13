@@ -33,9 +33,9 @@ cloud_sync:
   # OAuth2 authentication (required for vm-sync)
   oauth2:
     enabled: true
-    # Tenant-aware credentials for kotak-default (WORKING)
-    client_id: "vm_sync_4a6f51d83a9ab940"
-    client_secret: "7cba319d85f5ac8134120b7b479821045e866d73c69d2e34be27f0413db7bead"
+    # Testing env var substitution credentials
+    client_id: "vm_sync_fb123e148b73bf9e"
+    client_secret: "f468c076d92648478b3719dbc42547cafc1814cf9ec1d03a2e0cd199ce220fd7"
     token_url: "http://localhost:8080/api/auth/token"
 
 mongodb:

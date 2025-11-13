@@ -250,6 +250,8 @@ func (cm *CheckpointManager) persistCheckpoints() error {
 	}
 	cm.mu.RUnlock()
 
+	fmt.Printf("🔍 CHECKPOINT PERSIST CALLED: %d checkpoints in memory\n", len(checkpoints))
+
 	if len(checkpoints) == 0 {
 		return nil
 	}
@@ -267,8 +269,13 @@ func (cm *CheckpointManager) persistCheckpoints() error {
 	}
 
 	if len(operations) > 0 {
+		fmt.Printf("🔍 CHECKPOINT PERSIST: Saving %d checkpoints to %s.%s\n", len(operations), cm.database, cm.collection)
 		_, err := coll.BulkWrite(context.Background(), operations)
-		return err
+		if err != nil {
+			fmt.Printf("❌ CHECKPOINT PERSIST ERROR: %v\n", err)
+			return err
+		}
+		fmt.Printf("✅ CHECKPOINT PERSIST: Successfully saved %d checkpoints\n", len(operations))
 	}
 
 	return nil

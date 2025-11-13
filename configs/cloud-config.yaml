@@ -24,7 +24,7 @@ mongodb:
   uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
   timeout: 30s
   # Collections configuration is now loaded from collections.json
-  collections_config_file: "configs/collections.json"  # Load collections from JSON file
+  collections_config_file: "configs/collections-test.json"  # Load collections from JSON file with env var substitution
   # The databases section has been removed since collections are loaded from the JSON file
 
 # WebSocket configuration
