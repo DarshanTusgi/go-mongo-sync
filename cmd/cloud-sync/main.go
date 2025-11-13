@@ -291,90 +291,22 @@ func initializeTCPTransport() error {
 		return nil
 	}
 
-	// Validate TCP sender configuration
-	if config.Sync.Transport.TCPSender.Address == "" {
-		return fmt.Errorf("TCP sender address not configured")
-	}
-
-	// Create high-performance TCP sender configuration for billion-document transfers
-	senderConfig := transport.SenderConfig{
-		Address:       config.Sync.Transport.TCPSender.Address,
-		ParallelConns: config.Sync.Transport.TCPSender.ParallelConns,
-		WindowSize:    config.Sync.Transport.TCPSender.WindowSize,
-		BatchTimeout:  config.Sync.Transport.TCPSender.BatchTimeout,
-		ConnTimeout:   config.Sync.Transport.TCPSender.ConnTimeout,
-		KeepAlive:     config.Sync.Transport.TCPSender.KeepAlive,
-		MaxRetries:    config.Sync.Transport.TCPSender.MaxRetries,
-		RetryBackoff:  config.Sync.Transport.TCPSender.RetryBackoff,
-		BufferSize:    config.Sync.Transport.TCPSender.BufferSize,
-		MaxBatchSize:  config.Sync.Transport.TCPSender.MaxBatchSize,
-	}
-
-	// OPTIMIZED: Set compression type with high-performance options for billion-document transfers
-	switch config.Sync.Transport.CompressionType {
-	case "zstd":
-		senderConfig.Compression = transport.CompressionTypeZstd
-	case "lz4":
-		senderConfig.Compression = transport.CompressionTypeLZ4
-	case "none":
-		senderConfig.Compression = transport.CompressionTypeNone
-	default:
-		// Default to Zstd for best compression ratio on massive datasets
-		senderConfig.Compression = transport.CompressionTypeZstd
-		log.Printf("Unknown compression type '%s', defaulting to zstd", config.Sync.Transport.CompressionType)
-	}
-
-	// OPTIMIZED: Apply high-performance defaults for massive datasets
-	if senderConfig.ParallelConns <= 0 {
-		senderConfig.ParallelConns = 8 // Increased for billion-document performance
-	}
-	if senderConfig.WindowSize <= 0 {
-		senderConfig.WindowSize = 128 // Larger window for better throughput
-	}
-	if senderConfig.BatchTimeout == 0 {
-		senderConfig.BatchTimeout = 10 * time.Second // Longer timeout for large batches
-	}
-	if senderConfig.ConnTimeout == 0 {
-		senderConfig.ConnTimeout = 60 * time.Second // Longer connection timeout
-	}
-	if senderConfig.KeepAlive == 0 {
-		senderConfig.KeepAlive = 30 * time.Second
-	}
-	if senderConfig.MaxRetries <= 0 {
-		senderConfig.MaxRetries = 5 // More retries for reliability
-	}
-	if senderConfig.RetryBackoff == 0 {
-		senderConfig.RetryBackoff = 2 * time.Second // Longer backoff
-	}
-	if senderConfig.BufferSize <= 0 {
-		senderConfig.BufferSize = 1024 * 1024 // 1MB buffer for billion-document transfers
-	}
-	if senderConfig.MaxBatchSize <= 0 {
-		senderConfig.MaxBatchSize = 64 * 1024 * 1024 // 64MB max batch for large datasets
-	}
-
-	// Create TCP sender
-	sender, err := transport.NewSender(senderConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create TCP sender: %w", err)
-	}
-
-	// Test connection to ensure vm-sync is reachable
-	if err := testTCPConnection(senderConfig.Address); err != nil {
-		log.Printf("WARNING: TCP connection test failed: %v", err)
-		if !config.Sync.Transport.HTTPFallback {
-			return fmt.Errorf("TCP connection failed and HTTP fallback disabled: %w", err)
+	// Try to get address from config first, then from Address Manager
+	address := config.Sync.Transport.TCPSender.Address
+	if address == "" {
+		// No address in config, try Address Manager
+		addressMgr := transport.GetAddressManager()
+		var err error
+		address, err = addressMgr.GetAnyAddress()
+		if err != nil {
+			log.Printf("⚠️ TCP transport: No address in config or Address Manager - waiting for VM authentication")
+			return fmt.Errorf("TCP sender address not configured and no VM authenticated yet")
 		}
-		log.Printf("TCP transport will use HTTP fallback when needed")
+		log.Printf("✅ TCP ADDRESS: Retrieved from Address Manager: %s", address)
 	}
 
-	tcpSender = sender
-	tcpTransportEnabled = true
-
-	log.Printf("🚀 TCP TRANSPORT OPTIMIZED: address=%s, parallel_conns=%d, window_size=%d, buffer=%s, max_batch=%s, compression=%s",
-		senderConfig.Address, senderConfig.ParallelConns, senderConfig.WindowSize,
-		formatBytes(senderConfig.BufferSize), formatBytes(senderConfig.MaxBatchSize), config.Sync.Transport.CompressionType)
-	return nil
+	// Use the common initialization function with the discovered address
+	return initializeTCPTransportWithAddress(address)
 }
 
 // testTCPConnection tests if the TCP receiver is accepting connections without interfering with the protocol
@@ -3458,6 +3390,11 @@ func sendMetadataTCP(ctx context.Context, database, collection string) error {
 	if err != nil {
 		log.Printf("Warning: Failed to collect indexes for %s.%s: %v", database, collection, err)
 		indexes = []models.IndexInfo{} // Empty slice if failed
+	} else {
+		log.Printf("🔍 CLOUD METADATA: Collected %d indexes for %s.%s", len(indexes), database, collection)
+		for i, idx := range indexes {
+			log.Printf("🔍 CLOUD INDEX %d: name=%s, unique=%v, keys=%v", i, idx.Name, idx.Unique, string(idx.Keys))
+		}
 	}
 
 	// Collect collection options
@@ -3489,6 +3426,7 @@ func sendMetadataTCP(ctx context.Context, database, collection string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %v", err)
 	}
+	log.Printf("🔍 CLOUD METADATA: Marshaled %d bytes for %s.%s", len(metadataBytes), database, collection)
 
 	// Send metadata as a special stream
 	metadataStreamName := fmt.Sprintf("%s.%s.metadata", database, collection)
@@ -3655,6 +3593,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if clientInfo, exists := clients[conn]; exists {
 			delete(clients, conn)
 			log.Printf("🗑️  CLEANUP: Removed %s client %s from clients map (defer cleanup)", clientInfo.ClientType, clientInfo.ClientID)
+			
+			// Remove TCP address from Address Manager if this is a vm-sync client
+			if clientInfo.ClientType == "vm-sync" {
+				addressMgr := transport.GetAddressManager()
+				addressMgr.RemoveAddress(clientInfo.ClientID)
+				log.Printf("✅ TCP ADDRESS CLEANUP: Removed address for client %s", clientInfo.ClientID)
+			}
 		}
 		clientsMutex.Unlock()
 	}()
@@ -3775,6 +3720,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				"tcp":  tcpEndpoint,                                                    // Use automatically detected TCP endpoint
 				"http": fmt.Sprintf("%s:%d", strings.Split(tcpEndpoint, ":")[0], 8081), // HTTP port 8081
 			}
+			
+			// Store TCP address in Address Manager for global access
+			addressMgr := transport.GetAddressManager()
+			addressMgr.SetAddress(clientInfo.ClientID, tcpEndpoint)
+			log.Printf("✅ TCP ADDRESS STORED: %s -> %s", clientInfo.ClientID, tcpEndpoint)
 
 			// Initialize TCP transport with the detected address if it's not already enabled
 			if !tcpTransportEnabled {

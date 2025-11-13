@@ -489,6 +489,15 @@ func parseStreamName(stream string) []string {
 	return strings.Split(stream, ".")
 }
 
+// getMapKeys returns the keys of a map as a slice
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // handleTCPMetadata processes metadata received via TCP
 func handleTCPMetadata(database, collection string, documents [][]byte) error {
 	if len(documents) != 1 {
@@ -501,83 +510,139 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 		return fmt.Errorf("failed to unmarshal metadata: %v", err)
 	}
 
-	log.Printf("📊 METADATA PROCESSING: %s.%s metadata", database, collection)
+	log.Printf("📊 METADATA PROCESSING: %s.%s metadata (%d bytes)", database, collection, len(documents[0]))
+	log.Printf("🔍 VM METADATA: Keys in metadata: %v", getMapKeys(metadata))
 
-	// Map source to target collection based on configuration
-	fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
-	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
-	if err != nil {
-		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
-	}
-
-	log.Printf("🎯 METADATA MAPPING: %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
-
-	// Extract and process indexes
-	if indexesData, ok := metadata["indexes"]; ok {
-		if indexesArray, ok := indexesData.([]interface{}); ok {
-			log.Printf("🔍 INDEXES: Processing %d indexes for %s.%s", len(indexesArray), targetDatabase, targetCollection)
-			
-			// Convert to models.IndexInfo
-			var indexes []models.IndexInfo
-			for _, indexData := range indexesArray {
-				if indexBytes, err := bson.Marshal(indexData); err == nil {
-					var indexInfo models.IndexInfo
-					if err := bson.Unmarshal(indexBytes, &indexInfo); err == nil {
-						indexes = append(indexes, indexInfo)
-					} else {
-						log.Printf("⚠️ METADATA: Failed to unmarshal index: %v", err)
-					}
-				}
-			}
-			
-			// Recreate indexes on target collection
-			if len(indexes) > 0 {
-				targetColl := mongoClient.Database(targetDatabase).Collection(targetCollection)
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer cancel()
-				
-				if err := recreateIndexes(ctx, targetColl, indexes); err != nil {
-					log.Printf("❌ METADATA: Failed to recreate indexes for %s.%s: %v", targetDatabase, targetCollection, err)
-				} else {
-					log.Printf("✅ METADATA: Successfully recreated %d indexes for %s.%s", len(indexes), targetDatabase, targetCollection)
-				}
-			}
-		}
-	}
-
-	// Extract and process collection options
-	if collOptionsData, ok := metadata["collectionOptions"]; ok && collOptionsData != nil {
-		log.Printf("⚙️ COLLECTION OPTIONS: Processing for %s.%s", targetDatabase, targetCollection)
+	// In the new approach without mapping, use the same database and collection names as the source
+	targetDatabase := database
+	targetCollection := collection
+	
+	// Apply indexes if provided in metadata
+	if indexesRaw, exists := metadata["indexes"]; exists && indexesRaw != nil {
+		log.Printf("🔍 VM INDEXES: Found indexes field, type=%T", indexesRaw)
 		
-		if collOptionsBytes, err := bson.Marshal(collOptionsData); err == nil {
-			var collOptions models.CollectionOptions
-			if err := bson.Unmarshal(collOptionsBytes, &collOptions); err == nil {
-				// Apply collection options
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer cancel()
-				
-				if err := applyCollectionOptions(ctx, mongoClient.Database(targetDatabase), targetCollection, &collOptions); err != nil {
-					log.Printf("❌ METADATA: Failed to apply collection options for %s.%s: %v", targetDatabase, targetCollection, err)
-				} else {
-					log.Printf("✅ METADATA: Successfully applied collection options for %s.%s", targetDatabase, targetCollection)
+		var indexes bson.A
+		if arr, ok := indexesRaw.(bson.A); ok {
+			indexes = arr
+			log.Printf("🔍 VM INDEXES: Successfully cast to bson.A, length=%d", len(indexes))
+		} else if arr, ok := indexesRaw.([]interface{}); ok {
+			indexes = arr
+			log.Printf("🔍 VM INDEXES: Successfully cast to []interface{}, length=%d", len(indexes))
+		} else {
+			log.Printf("❌ VM INDEXES: Unexpected type %T, cannot process", indexesRaw)
+			return fmt.Errorf("indexes field has unexpected type: %T", indexesRaw)
+		}
+		
+		// Convert bson.A to []interface{} for index creation
+		indexModels := make([]mongo.IndexModel, 0, len(indexes))
+		for i, idx := range indexes {
+			log.Printf("🔍 VM INDEX %d: type=%T, value=%+v", i, idx, idx)
+			
+			// Handle both bson.D and map[string]interface{} types
+			var idxMap map[string]interface{}
+			
+			if idxDoc, ok := idx.(bson.D); ok {
+				log.Printf("🔍 VM INDEX %d: Successfully cast to bson.D", i)
+				// Convert bson.D to map[string]interface{}
+				idxMap = make(map[string]interface{})
+				for _, elem := range idxDoc {
+					idxMap[elem.Key] = elem.Value
 				}
+			} else if m, ok := idx.(map[string]interface{}); ok {
+				log.Printf("🔍 VM INDEX %d: Successfully cast to map[string]interface{}", i)
+				idxMap = m
 			} else {
-				log.Printf("⚠️ METADATA: Failed to unmarshal collection options: %v", err)
+				log.Printf("❌ VM INDEX %d: Unexpected type %T, skipping", i, idx)
+				continue
+			}
+			
+			// Now process the index map
+			keys := bson.D{}
+			options := options.Index()
+			indexName := ""
+			
+			// Extract keys
+			if keysRaw, ok := idxMap["keys"]; ok {
+				if keysMap, ok := keysRaw.(map[string]interface{}); ok {
+					// Convert map to bson.D
+					for k, v := range keysMap {
+						if intVal, ok := v.(int); ok {
+							keys = append(keys, bson.E{Key: k, Value: intVal})
+						} else if int32Val, ok := v.(int32); ok {
+							keys = append(keys, bson.E{Key: k, Value: int32Val})
+						} else if int64Val, ok := v.(int64); ok {
+							keys = append(keys, bson.E{Key: k, Value: int64Val})
+						} else {
+							keys = append(keys, bson.E{Key: k, Value: v})
+						}
+					}
+					log.Printf("🔍 VM INDEX %d: Found keys: %v", i, keys)
+				} else if keysDoc, ok := keysRaw.(bson.D); ok {
+					keys = keysDoc
+					log.Printf("🔍 VM INDEX %d: Found keys (bson.D): %v", i, keys)
+				} else {
+					log.Printf("❌ VM INDEX %d: keys field has unexpected type: %T", i, keysRaw)
+				}
+			}
+			
+			// Extract name
+			if nameRaw, ok := idxMap["name"]; ok {
+				if name, ok := nameRaw.(string); ok {
+					options.SetName(name)
+					indexName = name
+					log.Printf("🔍 VM INDEX %d: Found name: %s", i, name)
+				}
+			}
+			
+			// Extract unique
+			if uniqueRaw, ok := idxMap["unique"]; ok {
+				if unique, ok := uniqueRaw.(bool); ok {
+					options.SetUnique(unique)
+					log.Printf("🔍 VM INDEX %d: Found unique: %v", i, unique)
+				}
+			}
+			
+			// Skip default _id_ index
+			if indexName == "_id_" {
+				log.Printf("⏭️ VM INDEX %d: Skipping default _id_ index", i)
+				continue
+			}
+			
+			if len(keys) > 0 {
+				indexModels = append(indexModels, mongo.IndexModel{
+					Keys:    keys,
+					Options: options,
+				})
+				log.Printf("✅ VM INDEX %d: Created index model for '%s'", i, indexName)
+			} else {
+				log.Printf("❌ VM INDEX %d: No keys found, skipping index '%s'", i, indexName)
 			}
 		}
+
+		if len(indexModels) > 0 {
+			coll := mongoClient.Database(targetDatabase).Collection(targetCollection)
+			if _, err := coll.Indexes().CreateMany(context.Background(), indexModels); err != nil {
+				return fmt.Errorf("failed to create indexes: %v", err)
+			}
+			log.Printf("✅ VM INDEXES: Created %d indexes", len(indexModels))
+		} else {
+			log.Printf("⚠️ VM INDEXES: No index models to create for %s.%s", targetDatabase, targetCollection)
+		}
+	} else {
+		log.Printf("⚠️ VM METADATA: No indexes field found in metadata for %s.%s", targetDatabase, targetCollection)
 	}
 
 	// Process snapshot fence info
 	if snapshotFenceData, ok := metadata["snapshotFence"]; ok && snapshotFenceData != nil {
 		log.Printf("🔒 SNAPSHOT FENCE: Processing for %s.%s", targetDatabase, targetCollection)
-		
+
 		if fenceBytes, err := bson.Marshal(snapshotFenceData); err == nil {
 			var snapshotFence models.SnapshotFenceInfo
 			if err := bson.Unmarshal(fenceBytes, &snapshotFence); err == nil {
 				// Store snapshot fence information for change stream coordination
 				log.Printf("✅ METADATA: Snapshot fence processed - ClusterTime: %v, OperationTime: %v",
 					snapshotFence.ClusterTime, snapshotFence.OperationTime)
-				
+
 				// Validate that change streams can start consistently with this fence
 				if clusterFence != nil && clusterFence.IsEnabled() {
 					if err := clusterFence.ValidateChangeStreamStart(convertToSnapshotFence(&snapshotFence), snapshotFence.OperationTime); err != nil {
@@ -835,7 +900,7 @@ func main() {
 		log.Println("✅ WebSocket connection closed gracefully")
 	}
 	websocketConnMutex.RUnlock()
-	
+
 	if vmSyncIntegration != nil {
 		if transmitter := vmSyncIntegration.GetTransmitter(); transmitter != nil {
 			transmitter.MarkDisconnected()
@@ -911,10 +976,10 @@ func startHTTPServer() {
 	}
 
 	log.Printf("🚀 VM-SYNC HTTP SERVER: Starting on %s:%d", host, port)
-	log.Printf("📋 HTTP CONFIG: ReadTimeout=%v, WriteTimeout=%v, IdleTimeout=%v", 
+	log.Printf("📋 HTTP CONFIG: ReadTimeout=%v, WriteTimeout=%v, IdleTimeout=%v",
 		httpServer.ReadTimeout, httpServer.WriteTimeout, httpServer.IdleTimeout)
 	log.Printf("🔗 ENDPOINTS: Push=/api/v1/push/{db}/{coll}, Health=/health")
-	
+
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server failed: %v", err)
 	}
@@ -947,7 +1012,7 @@ func handlePushData(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("🚀 RECEIVED INCREMENTAL DATA: %s.%s with %d documents", database, collection, len(dataResponse.Documents))
-		
+
 		// Process incremental data directly
 		if err := processIncrementalData(database, collection, &dataResponse); err != nil {
 			log.Printf("Error processing incremental data: %v", err)
@@ -975,7 +1040,7 @@ func handlePushData(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("📦 RECEIVED JSON DATA: %s.%s page %d with %d documents", database, collection, pageResult.PageNumber, len(pageResult.Documents))
 		}
-		
+
 		// Process initial sync data
 		if err := processPushedData(database, collection, &pageResult); err != nil {
 			log.Printf("Error processing pushed data: %v", err)
@@ -1059,12 +1124,9 @@ func processIncrementalData(database, collection string, dataResponse *models.Da
 		return nil
 	}
 
-	// Map source collection to target collection based on configuration
-	fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
-	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
-	if err != nil {
-		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
-	}
+	// In the new approach without mapping, use the same database and collection names as the source
+	targetDatabase := database
+	targetCollection := collection
 
 	log.Printf("🔄 INCREMENTAL MAPPING: %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
 
@@ -1151,7 +1213,7 @@ func processIncrementalData(database, collection string, dataResponse *models.Da
 		log.Printf("✅ INCREMENTAL DELETE: Successfully deleted %d documents from %s.%s", len(deleteOperations), targetDatabase, targetCollection)
 	}
 
-	log.Printf("✅ INCREMENTAL SYNC: Successfully processed %d total operations (%d upserts, %d deletes) for %s.%s", 
+	log.Printf("✅ INCREMENTAL SYNC: Successfully processed %d total operations (%d upserts, %d deletes) for %s.%s",
 		len(dataResponse.Documents), len(regularDocs), len(deleteOperations), targetDatabase, targetCollection)
 	return nil
 }
@@ -1161,12 +1223,9 @@ func processPushedData(database, collection string, pageResult *PageResult) erro
 		return fmt.Errorf("page result contains error: %v", pageResult.Error)
 	}
 
-	// Map source collection to target collection based on configuration
-	fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
-	targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
-	if err != nil {
-		return fmt.Errorf("failed to map source collection %s: %v", fullSourceCollection, err)
-	}
+	// In the new approach without mapping, use the same database and collection names as the source
+	targetDatabase := database
+	targetCollection := collection
 
 	log.Printf("🔄 HTTP MAPPING: %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
 
@@ -1856,12 +1915,12 @@ func handleIndexOperation(operation string, docMap bson.M, database, collection 
 	// Index operations are metadata changes that may need special handling
 	// For now, log the operation - in production, you might want to replicate index changes
 	log.Printf("🔍 INDEX OPERATION: %s for %s.%s", operation, database, collection)
-	
+
 	// You could implement actual index replication here if needed:
 	// - Parse operationDescription for index definitions
 	// - Apply createIndex/dropIndex operations to target
 	// - Handle index modifications
-	
+
 	return nil
 }
 
@@ -1929,7 +1988,7 @@ func insertDocumentsBatch(database, collection string, documents []bson.Raw) err
 				log.Printf("Error unmarshaling document: %v", err)
 				continue
 			}
-			
+
 			// Create upsert operation using _id as filter
 			if id, ok := doc["_id"]; ok {
 				filter := bson.M{"_id": id}
@@ -2015,12 +2074,12 @@ func connectWebSocket() error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Store connection globally for graceful shutdown
 	websocketConnMutex.Lock()
 	websocketConn = conn
 	websocketConnMutex.Unlock()
-	
+
 	// Note: Connection will be managed by the adaptive integration, not closed here
 
 	log.Println("Connected to WebSocket for real-time sync")
@@ -2204,7 +2263,7 @@ func connectWebSocket() error {
 					}
 					continue
 				}
-				log.Printf("✅ REALTIME: Received change event: %s on %s.%s (FullDoc: %d bytes, DocKey: %d bytes)", 
+				log.Printf("✅ REALTIME: Received change event: %s on %s.%s (FullDoc: %d bytes, DocKey: %d bytes)",
 					event.OperationType, event.Database, event.Collection, len(event.FullDocument), len(event.DocumentKey))
 			}
 		} else if messageType == websocket.TextMessage {
@@ -2687,11 +2746,11 @@ func handleInitialSyncTrigger(jsonMsg map[string]interface{}, conn *websocket.Co
 
 	// Send acknowledgment first
 	ackMsg := map[string]interface{}{
-		"type":       "initial_sync_ack",
-		"status":     "started",
-		"client_id":  clientID,
-		"timestamp":  time.Now().Format(time.RFC3339),
-		"message":    "Initial sync started - performing full database replacement",
+		"type":      "initial_sync_ack",
+		"status":    "started",
+		"client_id": clientID,
+		"timestamp": time.Now().Format(time.RFC3339),
+		"message":   "Initial sync started - performing full database replacement",
 	}
 
 	if err := conn.WriteJSON(ackMsg); err != nil {
@@ -2743,16 +2802,9 @@ func handleInitialSyncTrigger(jsonMsg map[string]interface{}, conn *websocket.Co
 
 			log.Printf("🔄 INITIAL SYNC PARALLEL: [%d/%d] Processing %s.%s", index+1, totalCollections, database, collection)
 
-			// Map source to target collection
-			fullSourceCollection := fmt.Sprintf("%s.%s", database, collection)
-			targetDatabase, targetCollection, err := mapSourceToTarget(fullSourceCollection)
-			if err != nil {
-				log.Printf("❌ INITIAL SYNC: Failed to map collection %s: %v", fullSourceCollection, err)
-				failedMutex.Lock()
-				failedCollections = append(failedCollections, collName)
-				failedMutex.Unlock()
-				return
-			}
+			// In the new approach without mapping, use the same database and collection names as the source
+			targetDatabase := database
+			targetCollection := collection
 
 			log.Printf("🎯 INITIAL SYNC PARALLEL: Mapped %s.%s -> %s.%s", database, collection, targetDatabase, targetCollection)
 

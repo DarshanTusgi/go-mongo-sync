@@ -204,7 +204,7 @@ func adminAuthMiddleware(next http.Handler) http.Handler {
 		// Check for licensekey header and validate against environment variable
 		licenseKey := r.Header.Get("licensekey")
 		expectedLicenseKey := os.Getenv("INFRA_LICENSE_KEY")
-		
+
 		if licenseKey == "" || expectedLicenseKey == "" || licenseKey != expectedLicenseKey {
 			http.Error(w, `{"error":"unauthorized","error_description":"Invalid or missing licensekey header"}`, http.StatusUnauthorized)
 			return
