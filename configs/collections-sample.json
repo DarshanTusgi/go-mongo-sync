@@ -1,0 +1,69 @@
+{
+  "_comment": "═══════════════════════════════════════════════════════════════════════",
+  "_comment2": "         CLOUD-SYNC COLLECTIONS CONFIGURATION SAMPLE",
+  "_comment3": "  Define databases, collections, filters, and target mappings",
+  "_comment4": "═══════════════════════════════════════════════════════════════════════",
+  "_comment5": "",
+  "_comment6": "ENVIRONMENT VARIABLE EXPANSION:",
+  "_comment7": "  ${database_name:-default}  - Expands to env var or 'default'",
+  "_comment8": "  Example: database_name=abc → real_transfer-abc",
+  "_comment9": "",
+  "_comment10": "FEATURES:",
+  "_comment11": "  ✓ Document filters - Exclude unwanted documents",
+  "_comment12": "  ✓ Field filters - Project specific fields only",
+  "_comment13": "  ✓ Database routing - Source → Target name mapping",
+  "_comment14": "  ✓ Priority-based sync - Control sync order",
+  "_comment15": "",
+  
+  "databases": [
+    {
+      "name": "real_transfer-${database_name:-test}",
+      "target_database_name": "real_transfer-1kosmos",
+      "enabled": true,
+      "priority": 1,
+      "collections": [
+        {
+          "name": "products",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 1,
+          "document_filter": {
+            "criteria": [
+              {
+                "field": "status",
+                "operator": "ne",
+                "value": "deleted",
+                "_comment": "Exclude deleted products from sync"
+              }
+            ]
+          },
+          "field_filter": {
+            "include_fields": ["_id", "product_id", "name", "price", "category", "status"],
+            "always_include": ["_id"],
+            "_comment": "Only sync specified fields (reduces transfer size)"
+          }
+        },
+        {
+          "name": "inventory",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 2,
+          "field_filter": {
+            "include_fields": ["_id", "inventory_id", "product_id", "quantity", "warehouse_location"],
+            "always_include": ["_id"]
+          }
+        },
+        {
+          "name": "orders",
+          "enabled": true,
+          "batch_size": 100,
+          "priority": 3,
+          "field_filter": {
+            "include_fields": ["_id", "order_id", "customer_id", "items", "total", "status", "created_at"],
+            "always_include": ["_id"]
+          }
+        }
+      ]
+    }
+  ]
+}

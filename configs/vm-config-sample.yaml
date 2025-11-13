@@ -1,0 +1,176 @@
+# ═══════════════════════════════════════════════════════════════════════
+#                     VM-SYNC SAMPLE CONFIGURATION
+#         Cloud-Sync → Local MongoDB Data Synchronization
+# ═══════════════════════════════════════════════════════════════════════
+#
+# REQUIRED CONFIGURATION:
+#   - Local MongoDB URI (default: mongodb://localhost:27017)
+#   - Cloud-sync endpoints (HTTP + WebSocket)
+#   - OAuth2 credentials for authentication
+#
+# FEATURES ENABLED:
+#   ✓ TCP receiver (port 9000, ultra-stable)
+#   ✓ OAuth2 authentication
+#   ✓ Cluster mode (multi-instance HA)
+#   ✓ AES-256-GCM encryption
+#   ✓ Resume capability
+#   ✓ Health checks
+#   ✓ Metrics collection
+
+# ═══════════════════════════════════════════════════════════════════════
+#                         SERVER CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+server:
+  port: 8081
+  host: "0.0.0.0"             # Listen on all interfaces
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+
+# ═══════════════════════════════════════════════════════════════════════
+#                    CLOUD-SYNC CONNECTION SETTINGS
+# ═══════════════════════════════════════════════════════════════════════
+
+cloud_sync:
+  http_url: "http://localhost:8080"
+  ws_url: "ws://localhost:8080/ws"
+  http_timeout: "600s"          # 10 minutes for large transfers
+  
+  # OAuth2 authentication (required)
+  oauth2:
+    enabled: true
+    client_id: "vm_sync_fb123e148b73bf9e"
+    client_secret: "f468c076d92648478b3719dbc42547cafc1814cf9ec1d03a2e0cd199ce220fd7"
+    token_url: "http://localhost:8080/api/auth/token"
+
+# ═══════════════════════════════════════════════════════════════════════
+#                     LOCAL MONGODB CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+mongodb:
+  uri: "mongodb://localhost:27017/?retryWrites=true&w=majority"
+  timeout: 30s
+
+# ═══════════════════════════════════════════════════════════════════════
+#      COLLECTION MAPPING (Auto-assigned by Cloud-Sync)
+# ═══════════════════════════════════════════════════════════════════════
+# NOTE: Collections are auto-assigned by cloud-sync distributor.
+#       No manual configuration needed!
+# ═══════════════════════════════════════════════════════════════════════
+
+collections: []
+  # Automatically assigned by cloud-sync based on load balancing
+  # Example format (if manual override needed):
+  # - "source-db.collection:target-db.collection"
+# ═══════════════════════════════════════════════════════════════════════
+#                   SYNC & TRANSPORT CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+sync:
+  initial_sync: true
+  realtime_sync: false
+  scheduler_sync: true
+  scheduler_interval: "30m"
+  resumable_initial_sync: true
+  batch_size: 100
+  parallel_collections: true
+  max_workers: 4
+  retry_attempts: 3
+  retry_delay: "5s"
+  
+  # TCP transport receiver
+  transport:
+    mode: "tcp"
+    http_fallback: true
+    compression_type: "zstd"
+    
+    tcp_receiver:
+      listen_addr: "0.0.0.0:9000"       # TCP receiver port
+      max_connections: 20
+      read_timeout: 200s
+      write_timeout: 120s
+      buffer_size: 1048576              # 1MB buffer
+      disk_checkpoint: true
+      checkpoint_dir: "/tmp/vm-sync-tcp-checkpoints"
+      heartbeat_interval: 90s
+      max_batch_size: 67108864          # 64MB max batch
+      tls_enabled: false
+
+# ═══════════════════════════════════════════════════════════════════════
+#                 CLUSTER & SECURITY CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+# Cluster configuration for HA
+cluster:
+  enabled: true
+  node_id: "vm-sync-node-1"
+  discovery_port: 9090
+  heartbeat_interval: "10s"
+  election_timeout: "5s"
+  log_level: "info"
+
+# Encryption (must match cloud-sync)
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  key_id: "cloud-sync-key-001"
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"
+
+# Connection settings
+connection:
+  reconnect_interval: "5s"
+  max_reconnect_attempts: 10
+  connection_timeout: "300s"
+  keepalive_interval: "30s"
+
+# ═══════════════════════════════════════════════════════════════════════
+#              OBSERVABILITY & PERSISTENCE CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  include_timestamps: true
+
+performance:
+  buffer_size: 10000
+  flush_interval: "500ms"
+  max_batch_wait: "5s"
+  compression_enabled: true
+
+health:
+  enabled: true
+  port: 8081
+  path: "/health"
+  interval: "30s"
+
+metrics:
+  enabled: true
+  port: 8082
+  path: "/metrics"
+  collection_interval: "10s"
+
+checkpoint:
+  enabled: true
+  database: "vm_sync_checkpoints"
+  collection: "client_resume_tokens"
+  save_interval_seconds: 3
+  cleanup_enabled: true
+  retention_days: 7
+
+watermarks:
+  enabled: true
+  database: "vm_sync_watermarks"
+  collection: "event_watermarks"
+
+sequence:
+  enabled: true
+  database: "vm_sync_sequences"
+  collection: "sequence_counters"
+  batch_size: 500
+  node_id: "vm-sync-node-001"
+
+fence:
+  enabled: true

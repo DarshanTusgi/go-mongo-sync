@@ -1,33 +1,58 @@
-# Cloud-sync HTTP server configuration
-# 
-# License Configuration (Environment Variables):
-# CLOUD_SYNC_LICENSE="cloud-tag,cloud-uuid-123"  # Cloud-sync license key
-# VM_SYNC_LICENSES="vm-tag1,vm-uuid-456,vm-tag2,vm-uuid-789"  # Comma-separated VM licenses
-# 
-# License validation ensures only authorized vm-sync instances can connect
-# via WebSocket. Both cloud-sync and vm-sync must have valid licenses.
+# ═══════════════════════════════════════════════════════════════════════
+#                    CLOUD-SYNC SAMPLE CONFIGURATION
+#              MongoDB Atlas → VM-Sync Data Synchronization
+# ═══════════════════════════════════════════════════════════════════════
 #
-# Production Environment Variables (optional):
-# MONGODB_URI: Your MongoDB connection string
-# ENCRYPTION_KEY: Base64 encoded 32-byte encryption key
-# ENCRYPTION_KEY_ID: Unique identifier for your encryption key
+# REQUIRED ENVIRONMENT VARIABLES:
+#   database_name=<your-db-suffix>       # Example: abc → real_transfer-abc
+#   TENANT_NAME=<tenant>                 # Example: kotak
+#   COMMUNITY_NAME=<community>           # Example: default
+#   INFRA_LICENSE_KEY=<license-key>      # Example: admin-key-123
+#
+# OPTIONAL ENVIRONMENT VARIABLES:
+#   MONGODB_URI=<connection-string>      # Override MongoDB URI
+#   ENCRYPTION_KEY=<base64-key>          # 32-byte encryption key
+#   VM_SYNC_ENDPOINT=<url>               # VM-sync HTTP endpoint
+#
+# FEATURES ENABLED:
+#   ✓ Document filtering (exclude deleted records)
+#   ✓ Field filtering (project specific fields only)
+#   ✓ Database routing (source → target name mapping)
+#   ✓ TCP transport (4 parallel connections, ultra-stable)
+#   ✓ Resume tokens (fault-tolerant CDC)
+#   ✓ OAuth2 authentication
+#   ✓ Scheduler-based incremental sync (1-minute interval)
+#   ✓ AES-256-GCM encryption
+#   ✓ Multi-tenancy support
+
+# ═══════════════════════════════════════════════════════════════════════
+#                         SERVER CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
 
 server:
   port: 8080
-  host: "localhost"  # Use "0.0.0.0" for production to listen on all interfaces
-  read_timeout: "15s"  # Increase to "30s" for production
-  write_timeout: "15s"  # Increase to "30s" for production
-  idle_timeout: "60s"   # Increase to "120s" for production
+  host: "0.0.0.0"         # Listen on all interfaces for production
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+
+# ═══════════════════════════════════════════════════════════════════════
+#                      MONGODB SOURCE CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
 
 mongodb:
-  # Real test database connection
+  # MongoDB Atlas connection (source database)
   uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
   timeout: 30s
-  # Collections configuration is now loaded from collections.json
-  collections_config_file: "configs/collections-test.json"  # Load collections from JSON file with env var substitution
-  # The databases section has been removed since collections are loaded from the JSON file
+  
+  # Collections configuration file (with document & field filters)
+  collections_config_file: "configs/collections-sample.json"
 
-# WebSocket configuration
+# ═══════════════════════════════════════════════════════════════════════
+#                    WEBSOCKET & SYNC CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+# WebSocket configuration for vm-sync connectivity
 websocket:
   enabled: true
   endpoint: "/ws"
@@ -35,50 +60,54 @@ websocket:
   ping_interval: "30s"
   pong_timeout: "10s"
 
-# Sync configuration
+# Synchronization settings
 sync:
-  initial_sync: true
-  realtime_sync: false  # Disabled in favor of scheduler-based sync
-  scheduler_sync: true  # Enable configurable scheduler-based synchronization
-  scheduler_interval: "1m"  # 1 minute for testing (changed from 30m for validation)
-  resumable_initial_sync: true  # Enable resumable initial sync to avoid full re-sync on restart
-  batch_size: 10000       # PERFORMANCE: Increased from 1000 to 10,000 for billion-doc scale (100x fewer queries)
+  initial_sync: true              # Enable initial bulk dump
+  realtime_sync: false            # Disabled (use scheduler_sync instead)
+  scheduler_sync: true            # Scheduler-based incremental sync
+  scheduler_interval: "1m"        # 1-minute incremental sync cycle
+  resumable_initial_sync: true    # Resume from last checkpoint
+  batch_size: 10000               # Documents per batch
   parallel_collections: true
-  max_workers: 16         # PERFORMANCE: Increased from 4 to 16 for massive parallelism (4x faster)
-  # Ultra-Stable TCP Transport Configuration for production reliability
+  max_workers: 16                 # Parallel worker threads
+  
+  # TCP transport configuration (primary mode)
   transport:
-    mode: "tcp"  # Use TCP transport for initial dumps ("http" for legacy mode)
-    http_fallback: false  # DO NOT fall back to HTTP if TCP fails - TCP is PRIMARY
-    compression_type: "zstd"  # Use Zstd compression for best ratio
-    health_monitor: "30s"  # TCP health monitor interval (checks for VM-sync availability)
+    mode: "tcp"                   # Primary: TCP, Fallback: HTTP
+    http_fallback: false          # TCP is mandatory (no HTTP fallback)
+    compression_type: "zstd"      # Zstd compression
+    health_monitor: "30s"         # TCP health check interval
+    
     tcp_sender:
-      parallel_conns: 4
-      window_size: 64
-      batch_timeout: 60s      # Ultra-stable: 60s timeout
-      conn_timeout: 180s      # Ultra-stable: 180s connection timeout
-      keep_alive: 120s        # Ultra-stable: 120s keep-alive
-      max_retries: 8          # Ultra-stable: 8 retries for maximum reliability
-      retry_backoff: 3s       # Ultra-stable: 3s backoff for proper recovery
-      buffer_size: 1048576    # Ultra-stable: 1MB buffer for large transfers
-      max_batch_size: 67108864  # Ultra-stable: 64MB batches for efficiency
+      parallel_conns: 4           # 4 parallel TCP connections
+      window_size: 64             # Flow control window
+      batch_timeout: 60s
+      conn_timeout: 180s
+      keep_alive: 120s
+      max_retries: 8
+      retry_backoff: 3s
+      buffer_size: 1048576        # 1MB buffer
+      max_batch_size: 67108864    # 64MB max batch
       tls_enabled: false
 
-# Encryption configuration
+# ═══════════════════════════════════════════════════════════════════════
+#              SECURITY & PERSISTENCE CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+# AES-256-GCM encryption
 encryption:
   enabled: true
   algorithm: "AES-256-GCM"
-  # Development key (use ${ENCRYPTION_KEY_ID} for production)
   key_id: "cloud-sync-key-001"
-  # Development key (use ${ENCRYPTION_KEY} for production)
-  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"  # Base64 encoded 32-byte key
+  key: "dGVzdC1lbmNyeXB0aW9uLWtleS0yNTYtYml0cy1mb3ItYWVzLWdj"  # Base64 32-byte key
 
 # Logging configuration
 logging:
-  level: "info"  # Use "warn" for production
+  level: "info"          # Options: debug, info, warn, error
   format: "json"
   output: "stdout"
 
-# Checkpoint configuration for resumable synchronization
+# Resume token checkpoint storage (MongoDB Atlas)
 checkpoint:
   enabled: true
   database: "sync_checkpoints"
@@ -87,16 +116,15 @@ checkpoint:
   cleanup_enabled: true
   retention_days: 30
 
-# Watermark-based tracking configuration
-# Tracks client sync progress using watermarks to prevent duplicates
+# Transfer tracking for exactly-once delivery
 tracking:
   enabled: true
-  mongo_uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"  # Use ${MONGODB_URI} for production
+  mongo_uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
   database: "sync_tracking"
-  state_collection: "client_sync_states"     # Tracks watermark-based sync state per client
-  batch_collection: "transfer_batches"       # Tracks transfer batch operations
+  state_collection: "client_sync_states"
+  batch_collection: "transfer_batches"
 
-# Sequence number generation for ordered event processing
+# Sequence generation for ordered events
 sequence:
   enabled: true
   database: "sync_sequences"
@@ -104,20 +132,24 @@ sequence:
   batch_size: 1000
   node_id: "cloud-sync-node-001"
 
-# Cluster time fence for snapshot consistency
+# Cluster time fence for consistency
 fence:
   enabled: true
 
-# Multi-tenancy configuration
-# Set TENANT_NAME and COMMUNITY_NAME environment variables
-# Example: TENANT_NAME=kotak COMMUNITY_NAME=community1
-tenant:
-  name: ""        # Leave empty to use TENANT_NAME env variable (default: "default")
-  community: ""   # Leave empty to use COMMUNITY_NAME env variable (default: "default")
+# ═══════════════════════════════════════════════════════════════════════
+#                     MULTI-TENANCY CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
 
-# Performance tuning
+tenant:
+  name: ""               # Set via TENANT_NAME env var
+  community: ""          # Set via COMMUNITY_NAME env var
+
+# ═══════════════════════════════════════════════════════════════════════
+#                      PERFORMANCE TUNING
+# ═══════════════════════════════════════════════════════════════════════
+
 performance:
-  max_workers: 4      # Increase to 8-16 for production
+  max_workers: 16          # Maximum parallel workers
   buffer_size: 1000
   batch_timeout: "5s"
   retry_attempts: 3
