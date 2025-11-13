@@ -79,12 +79,12 @@ type SyncConfig struct {
 
 // DatabaseConfig represents configuration for a specific database
 type DatabaseConfig struct {
-	Name               string             `yaml:"name"`
-	Enabled            bool               `yaml:"enabled"`
-	Priority           int                `yaml:"priority"`
-	Collections        []CollectionConfig `yaml:"collections"`
-	OriginalTemplate   string             `json:"-"` // Original template before env var expansion (for VM-sync routing)
-	TargetDatabaseName string             `json:"-"` // Target database name for VM-sync (after ${database_name} -> "1kosmos" replacement)
+	Name               string             `yaml:"name" json:"name"`
+	Enabled            bool               `yaml:"enabled" json:"enabled"`
+	Priority           int                `yaml:"priority" json:"priority"`
+	Collections        []CollectionConfig `yaml:"collections" json:"collections"`
+	OriginalTemplate   string             `json:"-" yaml:"-"` // Original template before env var expansion (internal use only)
+	TargetDatabaseName string             `yaml:"target_database_name,omitempty" json:"target_database_name,omitempty"` // Target database name for VM-sync routing
 }
 
 // CollectionConfig represents configuration for a specific collection

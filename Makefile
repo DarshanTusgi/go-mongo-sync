@@ -61,10 +61,9 @@ build-vm-sync: create-dirs
 # Copy configuration files
 copy-configs: create-dirs
 	@echo "📋 Copying configuration files..."
-	@cp configs/cloud-example.yaml $(CONFIG_DIR)/cloud-example.yaml
-	@cp configs/cloud-production.yaml $(CONFIG_DIR)/cloud-production.yaml
-	@cp configs/vm-example.yaml $(CONFIG_DIR)/vm-example.yaml
-	@cp configs/vm-production.yaml $(CONFIG_DIR)/vm-production.yaml
+	@cp configs/cloud-config.yaml $(CONFIG_DIR)/cloud-config.yaml
+	@cp configs/collections-sample.json $(CONFIG_DIR)/collections-sample.json
+	@cp configs/vm-config-sample.yaml $(CONFIG_DIR)/vm-config-sample.yaml
 	@echo "✅ Configuration files copied"
 
 # Generate start scripts
@@ -93,10 +92,9 @@ runnables: clean build-cloud-sync build-vm-sync copy-configs generate-scripts
 	@echo "  ./$(SCRIPTS_DIR)/deploy.sh start        # Start both services"
 	@echo ""
 	@echo "📁 Configuration Files:"
-	@echo "  $(CONFIG_DIR)/cloud-example.yaml        # Cloud-sync example config"
-	@echo "  $(CONFIG_DIR)/cloud-production.yaml     # Cloud-sync production config"
-	@echo "  $(CONFIG_DIR)/vm-example.yaml           # VM-sync example config"
-	@echo "  $(CONFIG_DIR)/vm-production.yaml        # VM-sync production config"
+	@echo "  $(CONFIG_DIR)/cloud-config.yaml         # Cloud-sync configuration"
+	@echo "  $(CONFIG_DIR)/collections-sample.json   # Collections with filters"
+	@echo "  $(CONFIG_DIR)/vm-config-sample.yaml     # VM-sync configuration"
 	@echo ""
 	@echo "🌐 Access Points:"
 	@echo "  Cloud-sync Dashboard: http://localhost:8080/dashboard"

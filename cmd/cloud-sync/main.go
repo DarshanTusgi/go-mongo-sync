@@ -1310,6 +1310,10 @@ func runIncrementalSync() {
 		if !database.Enabled {
 			continue
 		}
+		// DEBUG: Log database name to verify environment variable expansion
+		log.Printf("🔍 INCREMENTAL SYNC DEBUG: Database Name='%s', OriginalTemplate='%s', TargetName='%s'",
+			database.Name, database.OriginalTemplate, database.TargetDatabaseName)
+		
 		for _, collection := range database.Collections {
 			if !collection.Enabled {
 				continue
@@ -2493,13 +2497,28 @@ func handleSwaggerSpec(w http.ResponseWriter, r *http.Request) {
 
 	// Get base path and update the spec with dynamic server URL
 	basePath := getBasePath()
-	baseURL := fmt.Sprintf("http://%s:%d%s", config.Server.Host, config.Server.Port, basePath)
+	
+	// CRITICAL FIX: Use CLOUD_DOMAIN for Kubernetes deployments
+	// This ensures Swagger shows the correct public URL instead of 0.0.0.0
+	cloudDomain := os.Getenv("CLOUD_DOMAIN")
+	var baseURL string
+	
+	if cloudDomain != "" {
+		// Use CLOUD_DOMAIN for public-facing URL (Kubernetes/production)
+		baseURL = fmt.Sprintf("https://%s%s", cloudDomain, basePath)
+		log.Printf("📄 SWAGGER: Using CLOUD_DOMAIN for server URL: %s", baseURL)
+	} else {
+		// Fallback to config (for local development)
+		baseURL = fmt.Sprintf("http://%s:%d%s", config.Server.Host, config.Server.Port, basePath)
+		log.Printf("📄 SWAGGER: Using local config for server URL: %s", baseURL)
+	}
 
-	// Replace placeholder server URL in the spec if needed
+	// Replace placeholder server URL in the spec
 	specContent := string(specData)
-	if basePath != "" {
-		// Update server URLs in the spec to include base path
+	if basePath != "" || cloudDomain != "" {
+		// Update server URLs in the spec to use correct base URL
 		specContent = strings.ReplaceAll(specContent, "http://localhost:8080", baseURL)
+		log.Printf("📄 SWAGGER: Replaced server URLs with: %s", baseURL)
 	}
 
 	w.Header().Set("Content-Type", "application/x-yaml")
@@ -2508,7 +2527,7 @@ func handleSwaggerSpec(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(specContent))
 
-	log.Printf("Served Swagger specification at %s%s", baseURL, "/docs/swagger.yaml")
+	log.Printf("✅ SWAGGER: Served specification at %s/docs/swagger.yaml", baseURL)
 }
 
 // checkVMSyncCheckpoint checks if vm-sync has existing checkpoint data for a collection
@@ -3754,19 +3773,30 @@ func loadCollectionsFromJSON(filename string) error {
 			collectionsConfig.Databases[i].OriginalTemplate = originalConfig.Databases[i].Name
 		}
 
-		// Compute target database name for VM-sync by replacing ${database_name} with "1kosmos"
-		// This is ONLY for database.name routing to VM-sync
-		targetName := collectionsConfig.Databases[i].OriginalTemplate
-		if targetName == "" {
-			targetName = collectionsConfig.Databases[i].Name
+		// Only compute target database name if NOT already specified in JSON
+		// This allows manual override via "target_database_name" field in JSON
+		if collectionsConfig.Databases[i].TargetDatabaseName == "" {
+			// Compute target database name for VM-sync by replacing ${database_name} with "1kosmos"
+			// This is ONLY for database.name routing to VM-sync
+			targetName := collectionsConfig.Databases[i].OriginalTemplate
+			if targetName == "" {
+				targetName = collectionsConfig.Databases[i].Name
+			}
+
+			// Replace ${database_name} with hardcoded "1kosmos" for VM-sync routing
+			// Support both ${database_name} and ${database_name:-default} patterns
+			dbNamePattern := regexp.MustCompile(`\$\{database_name(?::-[^}]*)?\}`)
+			collectionsConfig.Databases[i].TargetDatabaseName = dbNamePattern.ReplaceAllString(targetName, "1kosmos")
+			log.Printf("📦 DB ROUTING AUTO-COMPUTED: Source='%s' -> Target='%s' (auto-generated)",
+				collectionsConfig.Databases[i].Name,
+				collectionsConfig.Databases[i].TargetDatabaseName)
+		} else {
+			log.Printf("🎯 DB ROUTING EXPLICIT: Source='%s' -> Target='%s' (from JSON config)",
+				collectionsConfig.Databases[i].Name,
+				collectionsConfig.Databases[i].TargetDatabaseName)
 		}
 
-		// Replace ${database_name} with hardcoded "1kosmos" for VM-sync routing
-		// Support both ${database_name} and ${database_name:-default} patterns
-		dbNamePattern := regexp.MustCompile(`\$\{database_name(?::-[^}]*)?\}`)
-		collectionsConfig.Databases[i].TargetDatabaseName = dbNamePattern.ReplaceAllString(targetName, "1kosmos")
-
-		log.Printf("📋 DB ROUTING: Source='%s' (expanded from '%s') -> Target='%s' (for VM-sync)",
+		log.Printf("📋 DB CONFIG LOADED: Name='%s', OriginalTemplate='%s', TargetName='%s'",
 			collectionsConfig.Databases[i].Name,
 			collectionsConfig.Databases[i].OriginalTemplate,
 			collectionsConfig.Databases[i].TargetDatabaseName)
