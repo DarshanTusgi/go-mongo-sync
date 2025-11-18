@@ -651,28 +651,9 @@ func main() {
 		"peak_hour_ready":          true,
 	})
 
-	// EARLY INIT: Initialize TCP transport before dependent components to avoid race conditions
-	// This ensures TCP is ready before initial dump starts and other sync components depend on it
-	log.Println("🚀 TCP INIT: Initializing TCP transport for initial dump readiness...")
-	if err := initializeTCPTransportWithRetry(); err != nil {
-		log.Printf("WARNING: Failed to initialize TCP transport after retries: %v", err)
-		log.Printf("DEGRADED MODE: Using HTTP transport for data transfer")
-		tcpTransportEnabled = false
-
-		// Start TCP transport health monitor if TCP is configured as primary
-		if config.Sync.Transport.Mode == "tcp" {
-			log.Printf("🔍 TCP MONITOR: Starting TCP transport health monitor for automatic reconnection")
-			go startTCPHealthMonitor()
-		}
-	} else if tcpTransportEnabled {
-		log.Println("✅ TCP TRANSPORT: Initialized successfully - ready for initial dump")
-		appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
-
-		// Start TCP transport health monitor even when initially successful
-		if config.Sync.Transport.Mode == "tcp" {
-			go startTCPHealthMonitor()
-		}
-	}
+	// DEFERRED: TCP transport will be initialized AFTER HTTP server is ready
+	// This ensures all endpoints are available before attempting VM-sync connection
+	log.Println("⏳ TCP INIT: Deferred until after HTTP server startup")
 
 	// Initialize adaptive system components with graceful fallback
 	log.Println("Initializing adaptive system...")
@@ -874,6 +855,32 @@ func main() {
 			}
 		}
 	}()
+
+	// Wait for HTTP server to be ready (brief delay to ensure endpoints are available)
+	time.Sleep(2 * time.Second)
+	log.Println("✅ HTTP SERVER: Ready and accepting connections")
+
+	// NOW initialize TCP transport AFTER HTTP server is ready
+	log.Println("🚀 TCP INIT: Initializing TCP transport now that HTTP endpoints are ready...")
+	if err := initializeTCPTransportWithRetry(); err != nil {
+		log.Printf("WARNING: Failed to initialize TCP transport after retries: %v", err)
+		log.Printf("DEGRADED MODE: Using HTTP transport for data transfer")
+		tcpTransportEnabled = false
+
+		// Start TCP transport health monitor if TCP is configured as primary
+		if config.Sync.Transport.Mode == "tcp" {
+			log.Printf("🔍 TCP MONITOR: Starting TCP transport health monitor for automatic reconnection")
+			go startTCPHealthMonitor()
+		}
+	} else if tcpTransportEnabled {
+		log.Println("✅ TCP TRANSPORT: Initialized successfully - ready for initial dump")
+		appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
+
+		// Start TCP transport health monitor even when initially successful
+		if config.Sync.Transport.Mode == "tcp" {
+			go startTCPHealthMonitor()
+		}
+	}
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
