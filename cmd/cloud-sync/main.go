@@ -342,9 +342,16 @@ func startTCPHealthMonitor() {
 	for {
 		select {
 		case <-ticker.C:
+			// FIX PROBLEM #2: Only monitor TCP if we're NOT in incremental sync phase
+			// During incremental sync, HTTP is used (TCP port closed is NORMAL)
+			initialDumpMutex.RLock()
+			dumpCompleted := initialDumpCompletedOnce
+			initialDumpMutex.RUnlock()
+
 			// Only try to reconnect if TCP is configured as primary but not currently enabled
-			if config.Sync.Transport.Mode == "tcp" && !tcpTransportEnabled {
-				log.Printf("🔍 TCP HEALTH CHECK: Attempting to reconnect to %s", config.Sync.Transport.TCPSender.Address)
+			// AND we haven't completed initial dump yet (still need TCP)
+			if config.Sync.Transport.Mode == "tcp" && !tcpTransportEnabled && !dumpCompleted {
+				log.Printf("🔍 TCP HEALTH CHECK: Attempting to reconnect to %s (initial dump phase)", config.Sync.Transport.TCPSender.Address)
 
 				if err := testTCPConnection(config.Sync.Transport.TCPSender.Address); err == nil {
 					log.Printf("✨ TCP AVAILABLE: VM-sync detected! Reinitializing TCP transport...")
@@ -359,9 +366,9 @@ func startTCPHealthMonitor() {
 				} else {
 					log.Printf("🔶 TCP UNAVAILABLE: VM-sync still not reachable (%v)", err)
 				}
-			} else if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled {
-				// TCP is working fine, reduce monitoring frequency to avoid interference
-				log.Printf("✅ TCP HEALTHY: TCP transport is operational, reducing health check frequency")
+			} else if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled && !dumpCompleted {
+				// TCP is working fine during initial dump, reduce monitoring frequency to avoid interference
+				log.Printf("✅ TCP HEALTHY: TCP transport is operational during initial dump, reducing health check frequency")
 
 				// Switch to much less frequent monitoring when TCP is working
 				ticker.Reset(5 * time.Minute) // Check every 5 minutes instead of 30 seconds
@@ -369,8 +376,15 @@ func startTCPHealthMonitor() {
 				// Optional: Skip actual connection test when TCP is working to avoid interference
 				// The main data transfer will detect if TCP fails anyway
 				continue
-			} else if config.Sync.Transport.Mode == "tcp" {
-				// TCP is enabled, verify it's still working
+			} else if dumpCompleted {
+				// FIX: After initial dump completes, switch to incremental sync mode (HTTP-based)
+				// TCP port will be closed - this is NORMAL, not a failure condition
+				log.Printf("📝 INCREMENTAL SYNC MODE: Initial dump completed, TCP monitoring paused (HTTP used for incremental sync)")
+				// Reduce monitoring to very infrequent checks (just for logging visibility)
+				ticker.Reset(30 * time.Minute)
+				continue
+			} else if config.Sync.Transport.Mode == "tcp" && !dumpCompleted {
+				// TCP is enabled during initial dump, verify it's still working
 				if err := testTCPConnection(config.Sync.Transport.TCPSender.Address); err != nil {
 					log.Printf("⚠️ TCP CONNECTION LOST: %v", err)
 					tcpTransportEnabled = false
@@ -1240,21 +1254,31 @@ func startSchedulerBasedSync() {
 
 	log.Printf("📅 SCHEDULER: Starting with %v interval", config.Sync.SchedulerInterval)
 
-	// Start the scheduler in a goroutine
+	// Start the scheduler in a goroutine with panic recovery
 	go func() {
+		// FIX GAP #3: Panic recovery to prevent scheduler death
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("🚨 SCHEDULER PANIC RECOVERED: %v - Restarting scheduler in 5 seconds...", r)
+				time.Sleep(5 * time.Second)
+				// Restart the scheduler
+				startSchedulerBasedSync()
+			}
+		}()
+
 		ticker := time.NewTicker(config.Sync.SchedulerInterval)
 		defer ticker.Stop()
 
-		// Run initial incremental sync immediately
+		// Run initial incremental sync immediately with panic protection
 		log.Println("🚀 SCHEDULER: Running initial incremental sync...")
-		runIncrementalSync()
+		runIncrementalSyncSafe()
 
 		// Then run on schedule
 		for {
 			select {
 			case <-ticker.C:
 				log.Printf("📅 SCHEDULER: Running scheduled incremental sync (interval: %v)", config.Sync.SchedulerInterval)
-				runIncrementalSync()
+				runIncrementalSyncSafe()
 			case <-context.Background().Done():
 				log.Println("📅 SCHEDULER: Stopping scheduler due to context cancellation")
 				return
@@ -1263,6 +1287,16 @@ func startSchedulerBasedSync() {
 	}()
 
 	log.Println("✅ SCHEDULER: Incremental sync scheduler started successfully")
+}
+
+// runIncrementalSyncSafe wraps runIncrementalSync with panic recovery
+func runIncrementalSyncSafe() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("🚨 INCREMENTAL SYNC PANIC: %v - Sync cycle aborted, will retry next cycle", r)
+		}
+	}()
+	runIncrementalSync()
 }
 
 // startChangeStreamMonitoring starts traditional change stream monitoring (fallback)
@@ -1313,7 +1347,7 @@ func runIncrementalSync() {
 		// DEBUG: Log database name to verify environment variable expansion
 		log.Printf("🔍 INCREMENTAL SYNC DEBUG: Database Name='%s', OriginalTemplate='%s', TargetName='%s'",
 			database.Name, database.OriginalTemplate, database.TargetDatabaseName)
-		
+
 		for _, collection := range database.Collections {
 			if !collection.Enabled {
 				continue
@@ -1476,14 +1510,14 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 			lastResumeToken = currentToken
 			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (no changes, but token saved for next cycle)", database, collection)
 		}
-	}
 
-	// ALWAYS persist resume token (critical for recovery)
-	if checkpointMgr != nil && len(lastResumeToken) > 0 {
-		if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
-			log.Printf("⚠️  Failed to update resume token: %v", err)
-		} else {
-			log.Printf("✅ RESUME TOKEN UPDATED: %s.%s (%d bytes)", database, collection, len(lastResumeToken))
+		// FIX GAP #1: Save resume token immediately when no changes (safe operation)
+		if checkpointMgr != nil && len(lastResumeToken) > 0 {
+			if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
+				log.Printf("⚠️  Failed to update resume token: %v", err)
+			} else {
+				log.Printf("✅ RESUME TOKEN UPDATED: %s.%s (%d bytes) - no changes", database, collection, len(lastResumeToken))
+			}
 		}
 	}
 
@@ -1495,16 +1529,26 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 		return 0, nil
 	}
 
-	// Send changes via HTTP (reliable transport for incremental sync)
+	// FIX GAP #2: Send changes via HTTP with retry mechanism
 	log.Printf("🚀 STREAM SYNC: Sending %d changed docs (%s) for %s.%s - inserts:%d, updates:%d, deletes:%d",
 		len(documents), formatBytes(totalBytes), database, collection,
 		operationCounts["insert"], operationCounts["update"], operationCounts["delete"])
 
-	if err := sendIncrementalChangesViaHTTP(database, collection, documents); err != nil {
-		return 0, fmt.Errorf("HTTP incremental sync failed: %w", err)
+	if err := sendIncrementalChangesViaHTTPWithRetry(database, collection, documents); err != nil {
+		return 0, fmt.Errorf("HTTP incremental sync failed after retries: %w", err)
 	}
 
 	log.Printf("✅ STREAM SYNC: Successfully sent %d docs for %s.%s", len(documents), database, collection)
+
+	// FIX GAP #1: ONLY save resume token AFTER successful HTTP delivery
+	// This prevents data loss if HTTP send fails
+	if checkpointMgr != nil && len(lastResumeToken) > 0 {
+		if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
+			log.Printf("⚠️  Failed to update resume token: %v", err)
+		} else {
+			log.Printf("✅ RESUME TOKEN SAVED: %s.%s (%d bytes) - AFTER successful HTTP delivery", database, collection, len(lastResumeToken))
+		}
+	}
 
 	if streamErr != nil && !isTimeoutError {
 		return 0, fmt.Errorf("change stream error: %w", streamErr)
@@ -2178,6 +2222,39 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 	return nil
 }
 
+// sendIncrementalChangesViaHTTPWithRetry sends incremental changes with retry mechanism (FIX GAP #2)
+func sendIncrementalChangesViaHTTPWithRetry(database, collection string, documents [][]byte) error {
+	const maxRetries = 5
+	const initialBackoff = 2 * time.Second
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := sendIncrementalChangesViaHTTP(database, collection, documents)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("✅ HTTP RETRY SUCCESS: Succeeded on attempt %d/%d for %s.%s", attempt, maxRetries, database, collection)
+			}
+			return nil
+		}
+
+		lastErr = err
+		log.Printf("⚠️  HTTP RETRY: Attempt %d/%d failed for %s.%s: %v", attempt, maxRetries, database, collection, err)
+
+		// Don't sleep after last attempt
+		if attempt < maxRetries {
+			// Exponential backoff: 2s, 4s, 8s, 16s, 32s
+			backoff := initialBackoff * time.Duration(1<<(attempt-1))
+			if backoff > 32*time.Second {
+				backoff = 32 * time.Second
+			}
+			log.Printf("⏳ HTTP RETRY: Waiting %v before attempt %d...", backoff, attempt+1)
+			time.Sleep(backoff)
+		}
+	}
+
+	return fmt.Errorf("failed after %d retry attempts: %w", maxRetries, lastErr)
+}
+
 // sendIncrementalChangesViaHTTP sends incremental changes using HTTP protocol
 func sendIncrementalChangesViaHTTP(database, collection string, documents [][]byte) error {
 	if len(documents) == 0 {
@@ -2497,12 +2574,12 @@ func handleSwaggerSpec(w http.ResponseWriter, r *http.Request) {
 
 	// Get base path and update the spec with dynamic server URL
 	basePath := getBasePath()
-	
+
 	// CRITICAL FIX: Use CLOUD_DOMAIN for Kubernetes deployments
 	// This ensures Swagger shows the correct public URL instead of 0.0.0.0
 	cloudDomain := os.Getenv("CLOUD_DOMAIN")
 	var baseURL string
-	
+
 	if cloudDomain != "" {
 		// Use CLOUD_DOMAIN for public-facing URL (Kubernetes/production)
 		baseURL = fmt.Sprintf("https://%s%s", cloudDomain, basePath)
@@ -4076,12 +4153,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					log.Printf("✅ RACE FIX: Connection signal channel already notified for client %s", clientInfo.ClientID)
 				}
 			} else {
-				// This is a reconnection - trigger catch-up sync
-				log.Printf("vm-sync client %s reconnected, triggering catch-up sync", clientInfo.ClientID)
+				// FIX RECONNECTION DEADLOCK: On reconnection, also signal channel to unblock any waiting process
+				// This handles the case where cloud-sync restarted but vm-sync stayed running
+				log.Printf("🔄 RECONNECTION FIX: vm-sync client %s reconnected, signaling and triggering catch-up sync", clientInfo.ClientID)
 				appLogger.Info("websocket", "vm_sync_reconnected", "VM-sync client reconnected, starting catch-up sync", map[string]interface{}{
 					"client_id":      clientInfo.ClientID,
 					"reconnected_at": time.Now(),
 				})
+
+				// CRITICAL: Signal channel in case cloud-sync is waiting (after cloud-sync restart)
+				select {
+				case vmSyncConnected <- true:
+					log.Printf("✅ RECONNECTION FIX: Signaled vm-sync reconnection to unblock waiting sync process")
+				default:
+					// Channel already has a value or no one is waiting
+					log.Printf("✅ RECONNECTION FIX: No process waiting, proceeding with catch-up sync")
+				}
 
 				// Start catch-up sync in a separate goroutine
 				go func() {
@@ -7735,43 +7822,56 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Trigger initial sync by doing a complete database replacement
-	syncsTriggered := 0
-	failedSyncs := make([]string, 0)
+	// Trigger CLOUD-SYNC to push data (force initial sync mode)
+	log.Printf("🚀 INITIAL SYNC API: Triggering cloud-sync to PUSH data to vm-sync")
 
-	for _, client := range targetClients {
-		// Get client info
-		clientsMutex.RLock()
-		clientInfo, exists := clients[client]
-		clientsMutex.RUnlock()
-
-		if !exists {
-			continue
-		}
-
-		log.Printf("🔄 INITIAL SYNC: Starting full database replacement for client %s", clientInfo.ClientID)
-
-		// Create initial sync message that triggers full database replacement
-		syncMessage := map[string]interface{}{
-			"type":      "initial_sync_trigger",
-			"action":    "replace_database",
-			"client_id": clientInfo.ClientID,
-			"timestamp": time.Now().Format(time.RFC3339),
-			"message":   "API triggered full database replacement",
-			"force":     req.Force,
-		}
-
-		// Send sync trigger message to VM client
-		client.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if err := client.WriteJSON(syncMessage); err != nil {
-			log.Printf("❌ INITIAL SYNC: Failed to send trigger to client %s: %v", clientInfo.ClientID, err)
-			failedSyncs = append(failedSyncs, clientInfo.ClientID)
-			continue
-		}
-
-		syncsTriggered++
-		log.Printf("✅ INITIAL SYNC: Trigger sent to client %s", clientInfo.ClientID)
+	// Get vm-sync endpoint for clearing collections
+	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
+	if vmSyncEndpoint == "" {
+		vmSyncEndpoint = "http://localhost:8081"
 	}
+
+	// CRITICAL: If force mode, clear ALL vm-sync collections BEFORE pushing
+	if req.Force {
+		log.Printf("🔥 FORCE MODE: Clearing ALL vm-sync collections before full replacement")
+
+		// Clear all configured collections on vm-sync
+		for _, dbConfig := range config.MongoDB.Databases {
+			if !dbConfig.Enabled {
+				continue
+			}
+			for _, collConfig := range dbConfig.Collections {
+				if !collConfig.Enabled {
+					continue
+				}
+
+				log.Printf("🗑️ FORCE MODE: Clearing vm-sync collection %s.%s", dbConfig.Name, collConfig.Name)
+				if err := clearVMSyncCollection(vmSyncEndpoint, dbConfig.Name, collConfig.Name); err != nil {
+					log.Printf("⚠️ FORCE MODE: Failed to clear %s.%s: %v (continuing anyway)", dbConfig.Name, collConfig.Name, err)
+				} else {
+					log.Printf("✅ FORCE MODE: Cleared %s.%s", dbConfig.Name, collConfig.Name)
+				}
+			}
+		}
+
+		log.Printf("🔥 FORCE MODE: Enabling force initial sync to bypass resumable state")
+		forceInitialSync = true
+		defer func() {
+			forceInitialSync = false
+			log.Printf("🔥 FORCE MODE: Disabled force initial sync mode")
+		}()
+	}
+
+	// Trigger the same sync process that runs on startup
+	// This will PUSH data from cloud-sync to vm-sync
+	go func() {
+		log.Printf("📊 INITIAL SYNC: Starting sync process for all configured collections...")
+		startSyncProcess()
+		log.Printf("✅ INITIAL SYNC: Sync process completed")
+	}()
+
+	syncsTriggered := len(targetClients)
+	failedSyncs := make([]string, 0)
 
 	// Return response
 	if syncsTriggered > 0 {

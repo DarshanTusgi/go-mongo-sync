@@ -83,7 +83,7 @@ type DatabaseConfig struct {
 	Enabled            bool               `yaml:"enabled" json:"enabled"`
 	Priority           int                `yaml:"priority" json:"priority"`
 	Collections        []CollectionConfig `yaml:"collections" json:"collections"`
-	OriginalTemplate   string             `json:"-" yaml:"-"` // Original template before env var expansion (internal use only)
+	OriginalTemplate   string             `json:"-" yaml:"-"`                                                           // Original template before env var expansion (internal use only)
 	TargetDatabaseName string             `yaml:"target_database_name,omitempty" json:"target_database_name,omitempty"` // Target database name for VM-sync routing
 }
 
