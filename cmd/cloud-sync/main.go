@@ -3118,12 +3118,25 @@ func pushIncrementalPageTCP(ctx context.Context, cursor *mongo.Cursor, database,
 			return 0, fmt.Errorf("TCP transport failed (primary mode, no fallback): %v", err)
 		}
 
+		// CRITICAL FIX: Wait for ACK from VM-sync before marking as success (incremental sync)
+		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: 30s)", database, collection, pageNumber+1)
+		ackWaitStart := time.Now()
+		if err := tcpSender.WaitForAcks(30 * time.Second); err != nil {
+			log.Printf("❌ ACK TIMEOUT: %s.%s page %d - VM-sync did not acknowledge: %v", database, collection, pageNumber+1, err)
+			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {
+				return 0, fmt.Errorf("TCP transport failed and cursor cannot be rewound for HTTP fallback: %v", err)
+			}
+			return 0, fmt.Errorf("TCP ACK timeout (VM-sync unreachable, data not delivered): %w", err)
+		}
+		ackWaitTime := time.Since(ackWaitStart)
+		log.Printf("✅ ACK RECEIVED: %s.%s page %d in %v", database, collection, pageNumber+1, ackWaitTime)
+
 		// Calculate incremental TCP metrics
 		tcpSendTime := time.Since(tcpSendStart)
 		totalTime := time.Since(tcpStartTime)
 		throughputMBps := float64(totalBytes) / tcpSendTime.Seconds() / (1024 * 1024)
 
-		log.Printf("✅ TCP INCREMENTAL SUCCESS: %s.%s page %d/%d - %d docs (%s) in %v (%.2f MB/s) - Total: %v",
+		log.Printf("✅ TCP INCREMENTAL SUCCESS: %s.%s page %d/%d - %d docs (%s) CONFIRMED RECEIVED in %v (%.2f MB/s) - Total: %v",
 			database, collection, pageNumber+1, totalPages, len(documents), formatBytes(totalBytes), tcpSendTime, throughputMBps, totalTime)
 	} else {
 		log.Printf("⚠️  TCP INCREMENTAL SKIP: %s.%s page %d - No documents", database, collection, pageNumber+1)
@@ -3322,15 +3335,32 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 			return fmt.Errorf("TCP transport failed (primary mode, no fallback): %v", err)
 		}
 
+		// CRITICAL FIX: Wait for ACK from VM-sync before marking as success
+		// This prevents false "transferred" counts when VM-sync is unreachable
+		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: 30s)", database, collection, pageNumber)
+		ackWaitStart := time.Now()
+		if err := tcpSender.WaitForAcks(30 * time.Second); err != nil {
+			log.Printf("❌ ACK TIMEOUT: %s.%s page %d - VM-sync did not acknowledge: %v", database, collection, pageNumber, err)
+			// Only fall back to HTTP if TCP is NOT the primary mode and HTTP fallback is enabled
+			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {
+				log.Printf("🔄 ACK FAILED -> HTTP FALLBACK: %s.%s page %d", database, collection, pageNumber)
+				return pushSinglePageHTTP(ctx, getVMSyncHTTPEndpoint(), database, collection, pageNumber, pageSize, totalPages)
+			}
+			// TCP is primary mode - return error (data was NOT received by VM-sync)
+			return fmt.Errorf("TCP ACK timeout (VM-sync unreachable, data not delivered): %w", err)
+		}
+		ackWaitTime := time.Since(ackWaitStart)
+		log.Printf("✅ ACK RECEIVED: %s.%s page %d in %v", database, collection, pageNumber, ackWaitTime)
+
 		// Calculate TCP transfer metrics
 		tcpSendTime := time.Since(tcpSendStart)
 		totalTime := time.Since(tcpStartTime)
 		throughputMBps := float64(totalBytes) / tcpSendTime.Seconds() / (1024 * 1024)
 
-		log.Printf("✅ TCP SUCCESS: %s.%s page %d/%d - %d docs (%s) sent in %v (%.2f MB/s) - Total: %v",
+		log.Printf("✅ TCP SUCCESS: %s.%s page %d/%d - %d docs (%s) CONFIRMED RECEIVED in %v (%.2f MB/s) - Total: %v",
 			database, collection, pageNumber, totalPages, len(documents), formatBytes(totalBytes), tcpSendTime, throughputMBps, totalTime)
 
-		// Update transfer tracking for resumable functionality
+		// NOW SAFE: Update transfer tracking ONLY after ACK confirms delivery
 		if transferTracker != nil && transferTracker.IsEnabled() {
 			clientID := "vm-sync-default" // TODO: Extract from connection context
 			if err := updateTCPTransferProgress(clientID, database, collection, pageNumber, len(documents)); err != nil {
