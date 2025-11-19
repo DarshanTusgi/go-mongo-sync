@@ -112,7 +112,7 @@ sync:
     compression_type: "zstd"  # Use Zstd compression
     health_monitor: "30s"  # Transport health monitor interval
     tcp_sender:
-      address: "127.0.0.1:9000"  # vm-sync TCP receiver address (use 127.0.0.1 not localhost)
+      address: "blockid-dev-box.1kosmos.net:9000"  # vm-sync TCP receiver address (remote VM)
       parallel_conns: 4
       window_size: 64
       batch_timeout: 60s      # Increased to 60s for ultra-stability
