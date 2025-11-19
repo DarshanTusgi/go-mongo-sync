@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -886,15 +885,6 @@ func main() {
 	log.Println("OAuth2 token manager initialized successfully")
 	// Start automatic token refresh
 	vmTokenManager.StartAutoRefresh(context.Background())
-
-	// HTTP-BASED VM REGISTRATION: Register with cloud-sync via HTTP
-	log.Println("🔐 Registering VM with cloud-sync via HTTP...")
-	if err := registerVMWithCloudSync(); err != nil {
-		log.Printf("⚠️ WARNING: Failed to register VM with cloud-sync: %v", err)
-		log.Printf("⚠️ TCP transport may not be initialized on cloud-sync side")
-	} else {
-		log.Println("✅ VM registered successfully with cloud-sync")
-	}
 
 	// Initialize adaptive system components
 	telemetryCollector, err = telemetry.NewCollector(clientID)
@@ -2994,101 +2984,5 @@ func handleInitialSyncTrigger(jsonMsg map[string]interface{}, conn *websocket.Co
 		return fmt.Errorf("initial sync failed: %d collections failed", len(failedCollections))
 	}
 
-	return nil
-}
-
-// registerVMWithCloudSync registers VM with cloud-sync via HTTP endpoint
-func registerVMWithCloudSync() error {
-	log.Printf("🔐 VM REGISTRATION: Starting HTTP-based registration with cloud-sync")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Get fresh OAuth2 token
-	log.Printf("🔑 OAUTH2: Requesting fresh token for registration")
-	token, err := vmTokenManager.GetFreshToken(ctx)
-	if err != nil {
-		log.Printf("❌ OAUTH2 FAILED: Cannot get token - %v", err)
-		return fmt.Errorf("failed to get OAuth2 token: %w", err)
-	}
-	log.Printf("✅ OAUTH2: Token obtained successfully (length: %d)", len(token))
-
-	// CRITICAL FIX: Use cloud-sync URL hostname, not local hostname
-	// Extract hostname from config.CloudSync.HTTPURL
-	httpURL := config.CloudSync.HTTPURL
-	log.Printf("🌐 ENDPOINT DETECTION: Cloud-sync URL = %s", httpURL)
-	
-	// Parse the URL to get hostname
-	var vmHostname string
-	if strings.HasPrefix(httpURL, "http://") {
-		vmHostname = strings.TrimPrefix(httpURL, "http://")
-	} else if strings.HasPrefix(httpURL, "https://") {
-		vmHostname = strings.TrimPrefix(httpURL, "https://")
-	} else {
-		vmHostname = httpURL
-	}
-	// Remove port if present
-	if idx := strings.Index(vmHostname, ":"); idx != -1 {
-		vmHostname = vmHostname[:idx]
-	}
-	log.Printf("🎯 VM HOSTNAME DETECTED: %s", vmHostname)
-
-	// Construct registration request
-	reqBody := map[string]interface{}{
-		"tcp_endpoint":  fmt.Sprintf("%s:9000", vmHostname),
-		"http_endpoint": fmt.Sprintf("%s:8081", vmHostname),
-	}
-	log.Printf("📦 REGISTRATION REQUEST: tcp=%s, http=%s", reqBody["tcp_endpoint"], reqBody["http_endpoint"])
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		log.Printf("❌ JSON MARSHAL FAILED: %v", err)
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-	log.Printf("✅ REQUEST BODY: %s", string(body))
-
-	// Make HTTP request
-	url := fmt.Sprintf("%s/api/vm/register", config.CloudSync.HTTPURL)
-	log.Printf("🔗 HTTP REQUEST: POST %s", url)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(body))
-	if err != nil {
-		log.Printf("❌ HTTP REQUEST CREATION FAILED: %v", err)
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	log.Printf("🔑 AUTHORIZATION: Bearer token attached (length: %d)", len(token))
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	log.Printf("📤 SENDING REQUEST: Waiting for response (timeout: 30s)...")
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("❌ HTTP REQUEST FAILED: %v", err)
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			log.Printf("⏰ REQUEST TIMEOUT: Cloud-sync did not respond in 30s")
-		}
-		return fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-	log.Printf("📥 RESPONSE RECEIVED: Status=%d %s", resp.StatusCode, resp.Status)
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		log.Printf("❌ REGISTRATION FAILED: Status=%d, Body=%s", resp.StatusCode, string(bodyBytes))
-		return fmt.Errorf("registration failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var response map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		log.Printf("❌ RESPONSE DECODE FAILED: %v", err)
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	log.Printf("✅ VM REGISTRATION SUCCESS: %+v", response)
-	if tcpInit, ok := response["tcp_initialized"].(bool); ok && tcpInit {
-		log.Printf("✅ TCP TRANSPORT CONFIRMED: Cloud-sync successfully initialized TCP sender")
-	} else {
-		log.Printf("⚠️ TCP WARNING: tcp_initialized=%v - TCP may not be ready", response["tcp_initialized"])
-	}
 	return nil
 }

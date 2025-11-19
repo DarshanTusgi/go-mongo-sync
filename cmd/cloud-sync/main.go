@@ -200,70 +200,47 @@ func initializeTCPTransportWithAddress(address string) error {
 	}
 
 	// OPTIMIZED: Apply high-performance defaults for massive datasets
-	log.Printf("🔧 TCP SENDER CONFIG: Building configuration for %s", address)
 	if senderConfig.ParallelConns <= 0 {
 		senderConfig.ParallelConns = 8 // Increased for billion-document performance
-		log.Printf("🔧 TCP CONFIG: ParallelConns not set, using default: %d", senderConfig.ParallelConns)
 	}
 	if senderConfig.WindowSize <= 0 {
 		senderConfig.WindowSize = 128 // Larger window for better throughput
-		log.Printf("🔧 TCP CONFIG: WindowSize not set, using default: %d", senderConfig.WindowSize)
 	}
 	if senderConfig.BatchTimeout == 0 {
 		senderConfig.BatchTimeout = 10 * time.Second // Longer timeout for large batches
-		log.Printf("🔧 TCP CONFIG: BatchTimeout not set, using default: %v", senderConfig.BatchTimeout)
 	}
 	if senderConfig.ConnTimeout == 0 {
 		senderConfig.ConnTimeout = 60 * time.Second // Longer connection timeout
-		log.Printf("🔧 TCP CONFIG: ConnTimeout not set, using default: %v", senderConfig.ConnTimeout)
 	}
 	if senderConfig.KeepAlive == 0 {
 		senderConfig.KeepAlive = 30 * time.Second
-		log.Printf("🔧 TCP CONFIG: KeepAlive not set, using default: %v", senderConfig.KeepAlive)
 	}
 	if senderConfig.MaxRetries <= 0 {
 		senderConfig.MaxRetries = 5 // More retries for reliability
-		log.Printf("🔧 TCP CONFIG: MaxRetries not set, using default: %d", senderConfig.MaxRetries)
 	}
 	if senderConfig.RetryBackoff == 0 {
 		senderConfig.RetryBackoff = 2 * time.Second // Longer backoff
-		log.Printf("🔧 TCP CONFIG: RetryBackoff not set, using default: %v", senderConfig.RetryBackoff)
 	}
 	if senderConfig.BufferSize <= 0 {
 		senderConfig.BufferSize = 1024 * 1024 // 1MB buffer for billion-document transfers
-		log.Printf("🔧 TCP CONFIG: BufferSize not set, using default: %s", formatBytes(senderConfig.BufferSize))
 	}
 	if senderConfig.MaxBatchSize <= 0 {
 		senderConfig.MaxBatchSize = 64 * 1024 * 1024 // 64MB max batch for large datasets
-		log.Printf("🔧 TCP CONFIG: MaxBatchSize not set, using default: %s", formatBytes(senderConfig.MaxBatchSize))
 	}
-
-	log.Printf("🛠️ TCP SENDER FINAL CONFIG: address=%s, parallel_conns=%d, window_size=%d, conn_timeout=%v, compression=%s",
-		address, senderConfig.ParallelConns, senderConfig.WindowSize, senderConfig.ConnTimeout, config.Sync.Transport.CompressionType)
 
 	// Create TCP sender
-	log.Printf("🔨 TCP SENDER: Creating TCP sender with %d parallel connections to %s", senderConfig.ParallelConns, address)
 	sender, err := transport.NewSender(senderConfig)
 	if err != nil {
-		log.Printf("❌ TCP SENDER CREATION FAILED: %v", err)
-		log.Printf("❌ TCP SENDER ERROR DETAILS: address=%s, parallel_conns=%d, conn_timeout=%v",
-			address, senderConfig.ParallelConns, senderConfig.ConnTimeout)
 		return fmt.Errorf("failed to create TCP sender: %w", err)
 	}
-	log.Printf("✅ TCP SENDER CREATED: Successfully created sender with %d connections", senderConfig.ParallelConns)
 
 	// Test connection to ensure vm-sync is reachable
-	log.Printf("🔍 TCP CONNECTION TEST: Testing connectivity to %s", senderConfig.Address)
 	if err := testTCPConnection(senderConfig.Address); err != nil {
-		log.Printf("⚠️ TCP CONNECTION TEST FAILED: %v", err)
-		log.Printf("⚠️ TCP TEST ERROR DETAILS: address=%s, timeout=2s", senderConfig.Address)
+		log.Printf("WARNING: TCP connection test failed: %v", err)
 		if !config.Sync.Transport.HTTPFallback {
-			log.Printf("❌ TCP INIT ABORTED: HTTP fallback is disabled, cannot proceed without TCP", )
 			return fmt.Errorf("TCP connection failed and HTTP fallback disabled: %w", err)
 		}
-		log.Printf("⚠️ TCP FALLBACK ENABLED: Will use HTTP fallback when TCP unavailable")
-	} else {
-		log.Printf("✅ TCP CONNECTION TEST PASSED: Successfully connected to %s", senderConfig.Address)
+		log.Printf("TCP transport will use HTTP fallback when needed")
 	}
 
 	tcpSender = sender
@@ -335,22 +312,16 @@ func initializeTCPTransport() error {
 
 // testTCPConnection tests if the TCP receiver is accepting connections without interfering with the protocol
 func testTCPConnection(address string) error {
-	log.Printf("🔌 TCP TEST: Attempting to dial %s with 2s timeout", address)
 	// Just check if the port is listening without creating a full connection
 	// This avoids interfering with the TCP receiver's protocol handling
 	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 	if err != nil {
-		log.Printf("❌ TCP TEST FAILED: Cannot reach %s - %v", address, err)
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			log.Printf("⏰ TCP TEST: Connection timeout - VM may not be ready or network issue")
-		}
 		return fmt.Errorf("TCP port not reachable: %w", err)
 	}
 
 	// Immediately close without sending any data to avoid protocol interference
 	// The VM-sync receiver will see this as a brief connection that closed gracefully
 	conn.Close()
-	log.Printf("✅ TCP TEST SUCCESS: Port %s is reachable and accepting connections", address)
 
 	return nil
 }
@@ -856,9 +827,6 @@ func main() {
 
 	// RACE CONDITION DEBUG: Add VM client status endpoint for troubleshooting
 	apiRouter.HandleFunc("/api/debug/vm-clients", handleVMClientsDebug).Methods("GET")
-
-	// VM REGISTRATION: HTTP-based VM registration (replaces WebSocket auth for TCP address discovery)
-	apiRouter.HandleFunc("/api/vm/register", handleVMRegister).Methods("POST")
 
 	// Serve static files for dashboard
 	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./web/static/"))))
@@ -8043,162 +8011,4 @@ func extractHostDomain(r *http.Request) string {
 
 	// Construct TCP endpoint with port 9000
 	return fmt.Sprintf("%s:%d", hostDomain, 9000)
-}
-
-// VMRegisterRequest represents VM registration request
-type VMRegisterRequest struct {
-	TCPEndpoint    string `json:"tcp_endpoint"`    // e.g., "blockid-dev-box.1kosmos.net:9000"
-	HTTPEndpoint   string `json:"http_endpoint"`   // e.g., "blockid-dev-box.1kosmos.net:8081"
-}
-
-// VMRegisterResponse represents VM registration response
-type VMRegisterResponse struct {
-	Success        bool   `json:"success"`
-	Message        string `json:"message"`
-	ClientID       string `json:"client_id"`
-	TCPInitialized bool   `json:"tcp_initialized"`
-	TCPAddress     string `json:"tcp_address"`
-}
-
-// handleVMRegister handles HTTP-based VM registration (replaces WebSocket auth)
-func handleVMRegister(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	// Extract and validate OAuth2 token from Authorization header
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, `{"error":"unauthorized","error_description":"Authorization header required"}`, http.StatusUnauthorized)
-		return
-	}
-
-	// Extract Bearer token
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		http.Error(w, `{"error":"invalid_token","error_description":"Bearer token required"}`, http.StatusUnauthorized)
-		return
-	}
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-
-	// Validate JWT token
-	claims, err := authService.ValidateToken(token)
-	if err != nil {
-		log.Printf("❌ VM REGISTER: Token validation failed: %v", err)
-		http.Error(w, fmt.Sprintf(`{"error":"invalid_token","error_description":"%s"}`, err.Error()), http.StatusUnauthorized)
-		return
-	}
-
-	log.Printf("✅ VM REGISTER: Token validated for client: %s", claims.ClientID)
-
-	// Parse request body
-	var req VMRegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid_request","error_description":"Invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	// Validate required fields
-	if req.TCPEndpoint == "" {
-		http.Error(w, `{"error":"invalid_request","error_description":"tcp_endpoint is required"}`, http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("📥 VM REGISTER: client_id=%s, tcp=%s, http=%s", claims.ClientID, req.TCPEndpoint, req.HTTPEndpoint)
-
-	// Store TCP address in Address Manager
-	log.Printf("💾 STORING TCP ADDRESS: Saving %s -> %s in Address Manager", claims.ClientID, req.TCPEndpoint)
-	addressMgr := transport.GetAddressManager()
-	addressMgr.SetAddress(claims.ClientID, req.TCPEndpoint)
-	log.Printf("✅ TCP ADDRESS STORED: %s -> %s", claims.ClientID, req.TCPEndpoint)
-
-	// Verify address was stored
-	storedAddr, err := addressMgr.GetAddress(claims.ClientID)
-	if err != nil {
-		log.Printf("❌ ADDRESS VERIFICATION FAILED: Cannot retrieve stored address: %v", err)
-	} else if storedAddr != req.TCPEndpoint {
-		log.Printf("⚠️ ADDRESS MISMATCH: Stored=%s, Expected=%s", storedAddr, req.TCPEndpoint)
-	} else {
-		log.Printf("✅ ADDRESS VERIFIED: Successfully stored and retrieved %s", storedAddr)
-	}
-
-	// Register VM with collection distributor (use default capabilities)
-	capabilities := distribution.VMCapabilities{
-		MaxCollections: 10,
-		SupportsTCP:    true,
-		SupportsHTTP:   true,
-		MaxConcurrency: 4,
-		MemoryLimitMB:  2048,
-	}
-	endpoints := map[string]string{
-		"tcp":  req.TCPEndpoint,
-		"http": req.HTTPEndpoint,
-	}
-
-	if err := collectionDistributor.RegisterVM(claims.ClientID, capabilities, endpoints); err != nil {
-		log.Printf("⚠️ VM REGISTER: Failed to register with distributor: %v", err)
-	} else {
-		log.Printf("🤖 VM REGISTERED: %s ready for intelligent collection distribution", claims.ClientID)
-	}
-
-	// Initialize TCP transport with the registered address
-	log.Printf("🔌 TCP TRANSPORT INIT CHECK: tcpTransportEnabled=%v", tcpTransportEnabled)
-	tcpInitialized := false
-	if !tcpTransportEnabled {
-		log.Printf("🔄 INITIALIZING TCP TRANSPORT: Setting up connection to %s", req.TCPEndpoint)
-		log.Printf("🔧 TCP INIT PARAMETERS: address=%s, mode=%s, http_fallback=%v",
-			req.TCPEndpoint, config.Sync.Transport.Mode, config.Sync.Transport.HTTPFallback)
-		if err := initializeTCPTransportWithAddress(req.TCPEndpoint); err != nil {
-			log.Printf("❌ FAILED TO INITIALIZE TCP TRANSPORT: %v", err)
-			log.Printf("❌ TCP INIT FAILURE DETAILS: This means cloud-sync cannot connect to VM's TCP port")
-			log.Printf("❌ TCP TROUBLESHOOTING: Check if VM-sync is running and port 9000 is accessible")
-		} else {
-			log.Printf("✅ TCP TRANSPORT INITIALIZED: Connected to %s", req.TCPEndpoint)
-			log.Printf("✅ TCP SENDER STATE: tcpTransportEnabled=%v, tcpSender!=nil=%v", tcpTransportEnabled, tcpSender != nil)
-			tcpInitialized = true
-		}
-	} else {
-		log.Printf("✅ TCP TRANSPORT: Already initialized (tcpSender exists)")
-		log.Printf("📊 TCP STATS: tcpTransportEnabled=%v, tcpSender!=nil=%v", tcpTransportEnabled, tcpSender != nil)
-		tcpInitialized = true
-	}
-
-	// Signal that vm-sync has connected
-	vmSyncMutex.Lock()
-	isFirstConnection := !vmSyncConnectedOnce
-	if isFirstConnection {
-		vmSyncConnectedOnce = true
-		// Non-blocking send
-		select {
-		case vmSyncConnected <- true:
-			log.Printf("✅ SIGNALED: vm-sync connection to waiting sync process for client %s", claims.ClientID)
-		default:
-			log.Printf("✅ SIGNALED: Connection signal channel already notified for client %s", claims.ClientID)
-		}
-	}
-	vmSyncMutex.Unlock()
-
-	// Register client in clients map for tracking
-	clientsMutex.Lock()
-	clientInfo := ClientInfo{
-		ClientType:   "vm-sync",
-		ClientID:     claims.ClientID,
-		ConnectedAt:  time.Now(),
-		Status:       "active",
-		OAuth2Claims: claims,
-	}
-	// Note: HTTP-registered VMs are tracked via Address Manager, not WebSocket clients map
-	log.Printf("📊 VM CLIENT INFO: type=%s, client_id=%s, status=%s", clientInfo.ClientType, clientInfo.ClientID, clientInfo.Status)
-	clientsMutex.Unlock()
-
-	log.Printf("✅ VM REGISTER COMPLETE: client_id=%s, tcp_initialized=%v", claims.ClientID, tcpInitialized)
-
-	// Return success response
-	response := VMRegisterResponse{
-		Success:        true,
-		Message:        "VM registered successfully",
-		ClientID:       claims.ClientID,
-		TCPInitialized: tcpInitialized,
-		TCPAddress:     req.TCPEndpoint,
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
 }
