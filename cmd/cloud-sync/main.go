@@ -4104,12 +4104,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 
 				// Validate JWT token
+				log.Printf("🔐 WS AUTH STEP 1: Validating OAuth2 token for vm-sync client (token length: %d)", len(token))
 				claims, err := authService.ValidateToken(token)
 				if err != nil {
-					log.Printf("OAuth2 token validation failed for vm-sync client: %v", err)
+					log.Printf("❌ WS AUTH FAILED: OAuth2 token validation failed: %v", err)
+					log.Printf("❌ TCP BLOCKED: TCP transport will NOT be initialized due to auth failure")
 					conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"error","message":"OAuth2 token validation failed: %s"}`, err.Error())))
 					return
 				}
+				log.Printf("✅ WS AUTH STEP 2: Token validated successfully - client_id=%s, app_id=%s", claims.ClientID, claims.AppID)
 
 				// Token is valid, store OAuth2 info in client info
 				clientInfo.ClientID = claims.ClientID // Use OAuth2 client ID
@@ -4166,13 +4169,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			log.Printf("✅ TCP ADDRESS STORED: %s -> %s", clientInfo.ClientID, tcpEndpoint)
 
 			// Initialize TCP transport with the detected address if it's not already enabled
+			log.Printf("🔍 TCP STATUS CHECK: tcpTransportEnabled=%v, tcpSender=%v", tcpTransportEnabled, tcpSender != nil)
 			if !tcpTransportEnabled {
-				log.Printf("🔄 INITIALIZING TCP TRANSPORT: Setting up connection to %s", tcpEndpoint)
+				log.Printf("🔄 TCP INIT: First VM connection - initializing TCP transport to %s", tcpEndpoint)
 				if err := initializeTCPTransportWithAddress(tcpEndpoint); err != nil {
-					log.Printf("❌ FAILED TO INITIALIZE TCP TRANSPORT: %v", err)
+					log.Printf("❌ TCP INIT FAILED: %v - Will retry on next connection", err)
 				} else {
-					log.Printf("✅ TCP TRANSPORT INITIALIZED: Connected to %s", tcpEndpoint)
+					log.Printf("✅ TCP INIT SUCCESS: Connected to %s with %d parallel connections", tcpEndpoint, config.Sync.Transport.TCPSender.ParallelConns)
 				}
+			} else {
+				log.Printf("ℹ️  TCP ALREADY ENABLED: Skipping re-initialization (tcpSender active: %v)", tcpSender != nil)
+				log.Printf("ℹ️  TCP HEALTH: If transfer fails, check TCP health monitor logs or manually reinitialize")
 			}
 
 			if err := collectionDistributor.RegisterVM(clientInfo.ClientID, capabilities, endpoints); err != nil {
@@ -7998,17 +8005,22 @@ func handleVMClientsDebug(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// extractHostDomain extracts the host domain from the HTTP request
-// and constructs the TCP endpoint using the host domain and port 9000
+// extractHostDomain extracts the client's IP from the HTTP request
+// and constructs the TCP endpoint using the client's IP and port 9000
 func extractHostDomain(r *http.Request) string {
-	// Get the host from the request
-	hostDomain := r.Host
-
-	// Remove port if present in Host header
-	if colonIndex := strings.Index(hostDomain, ":"); colonIndex != -1 {
-		hostDomain = hostDomain[:colonIndex]
+	// Get the actual client IP from RemoteAddr (not r.Host which is server address)
+	clientAddr := r.RemoteAddr
+	
+	// RemoteAddr format is "IP:port", extract just the IP
+	if colonIndex := strings.LastIndex(clientAddr, ":"); colonIndex != -1 {
+		clientAddr = clientAddr[:colonIndex]
 	}
+	
+	// Remove IPv6 brackets if present
+	clientAddr = strings.Trim(clientAddr, "[]")
+	
+	log.Printf("🔍 TCP ENDPOINT DETECTION: Client IP=%s (from RemoteAddr=%s)", clientAddr, r.RemoteAddr)
 
 	// Construct TCP endpoint with port 9000
-	return fmt.Sprintf("%s:%d", hostDomain, 9000)
+	return fmt.Sprintf("%s:%d", clientAddr, 9000)
 }
