@@ -231,6 +231,7 @@ type TCPSenderConfig struct {
 	BufferSize    int           `yaml:"buffer_size" json:"buffer_size"`       // Buffer size for connections
 	MaxBatchSize  int           `yaml:"max_batch_size" json:"max_batch_size"` // Maximum batch size
 	TLSEnabled    bool          `yaml:"tls_enabled" json:"tls_enabled"`       // Enable TLS encryption
+	AckTimeout    time.Duration `yaml:"ack_timeout" json:"ack_timeout"`       // ACK wait timeout (for geo-distributed systems: 60-120s recommended)
 }
 
 // TCPReceiverConfig defines TCP receiver configuration

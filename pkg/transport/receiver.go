@@ -126,6 +126,9 @@ func (r *tcpReceiver) Start() error {
 		return fmt.Errorf("failed to listen on %s: %w", r.config.ListenAddr, err)
 	}
 
+	// CRITICAL FIX: Log successful listener startup
+	log.Printf("✅ TCP RECEIVER LISTENING: %s (ready to accept connections)", r.config.ListenAddr)
+
 	r.wg.Add(1)
 	go r.acceptLoop()
 
@@ -133,6 +136,7 @@ func (r *tcpReceiver) Start() error {
 	r.wg.Add(1)
 	go r.heartbeatLoop()
 
+	log.Printf("🚀 TCP RECEIVER STARTED: acceptLoop and heartbeat running")
 	return nil
 }
 
@@ -222,6 +226,10 @@ func (r *tcpReceiver) handleConnection(conn net.Conn) {
 	}
 
 	connID := conn.RemoteAddr().String()
+	
+	// CRITICAL FIX: Log connection immediately after accept
+	log.Printf("🔗 TCP CONNECTION ACCEPTED: %s (new sender connected)", connID)
+	
 	ctx, cancel := context.WithCancel(r.ctx)
 
 	receiverConn := &receiverConnection{
@@ -235,7 +243,10 @@ func (r *tcpReceiver) handleConnection(conn net.Conn) {
 	// Add to connections map
 	r.mu.Lock()
 	r.connections[connID] = receiverConn
+	connCount := len(r.connections)
 	r.mu.Unlock()
+	
+	log.Printf("📊 TCP CONNECTION COUNT: %d active connection(s)", connCount)
 
 	// Start handling this connection
 	r.wg.Add(1)
@@ -459,11 +470,14 @@ func (rc *receiverConnection) handleLoop() {
 			// Handle message types with comprehensive logging
 			switch header.MsgType {
 			case MsgTypeDocBatch:
+				log.Printf("📦 TCP FRAME RECEIVED: %s MsgType=DocBatch StreamID=%d BatchSeq=%d", rc.id, header.StreamID, header.BatchSeq)
 				rc.handleDocBatch(frame)
 			case MsgTypeResumeRequest:
+				log.Printf("🔄 TCP FRAME RECEIVED: %s MsgType=ResumeRequest", rc.id)
 				rc.handleResumeRequest(frame)
 			case MsgTypeHeartbeat:
 				lastActivity = time.Now()
+				log.Printf("💓 TCP HEARTBEAT: %s", rc.id)
 			default:
 				log.Printf("⚠️ TCP UNKNOWN MESSAGE: %s (type %d)", rc.id, header.MsgType)
 			}
@@ -561,18 +575,27 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 	rc.receiver.stats.batchesReceived.Add(1)
 	rc.receiver.stats.documentsReceived.Add(uint64(len(docs)))
 
-	// Call batch handler
+	// CRITICAL FIX: Call batch handler and handle errors properly
 	if rc.receiver.batchHandler != nil {
+		log.Printf("🔎 CALLING BATCH HANDLER: stream=%s seq=%d docs=%d", actualStreamName, frame.Header.BatchSeq, len(docs))
 		if err := rc.receiver.batchHandler(actualStreamName, frame.Header.BatchSeq, docs); err != nil {
-			rc.receiver.handleError(fmt.Errorf("batch handler error: %w", err))
+			// CRITICAL BUG FIX: Log the error and DO NOT send ACK
+			log.Printf("🔴 BATCH HANDLER FAILED: stream=%s seq=%d error=%v", actualStreamName, frame.Header.BatchSeq, err)
+			rc.receiver.handleError(fmt.Errorf("batch handler error for stream %s seq %d: %w", actualStreamName, frame.Header.BatchSeq, err))
+			rc.receiver.stats.errorCount.Add(1)
+			// DO NOT send ACK - sender will retry
 			return
 		}
+		log.Printf("✅ BATCH HANDLER SUCCESS: stream=%s seq=%d docs=%d", actualStreamName, frame.Header.BatchSeq, len(docs))
+	} else {
+		log.Printf("⚠️ NO BATCH HANDLER: stream=%s seq=%d (handler not registered)", actualStreamName, frame.Header.BatchSeq)
 	}
 
 	// Update checkpoint with actual stream name
 	rc.receiver.SetCheckpoint(actualStreamName, frame.Header.BatchSeq)
 
-	// Send ACK
+	// Send ACK only after successful processing
+	log.Printf("📤 SENDING ACK: stream=%s StreamID=%d BatchSeq=%d", actualStreamName, frame.Header.StreamID, frame.Header.BatchSeq)
 	rc.sendAck(frame.Header.StreamID, frame.Header.BatchSeq)
 }
 

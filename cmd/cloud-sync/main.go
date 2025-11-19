@@ -3119,9 +3119,15 @@ func pushIncrementalPageTCP(ctx context.Context, cursor *mongo.Cursor, database,
 		}
 
 		// CRITICAL FIX: Wait for ACK from VM-sync before marking as success (incremental sync)
-		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: 30s)", database, collection, pageNumber+1)
+		// Use configurable timeout with intelligent defaults (same as initial dump)
+		ackTimeout := config.Sync.Transport.TCPSender.AckTimeout
+		if ackTimeout == 0 {
+			// Smart default: 90s for production (handles most geo-distributed scenarios)
+			ackTimeout = 90 * time.Second
+		}
+		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: %v)", database, collection, pageNumber+1, ackTimeout)
 		ackWaitStart := time.Now()
-		if err := tcpSender.WaitForAcks(30 * time.Second); err != nil {
+		if err := tcpSender.WaitForAcks(ackTimeout); err != nil {
 			log.Printf("❌ ACK TIMEOUT: %s.%s page %d - VM-sync did not acknowledge: %v", database, collection, pageNumber+1, err)
 			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {
 				return 0, fmt.Errorf("TCP transport failed and cursor cannot be rewound for HTTP fallback: %v", err)
@@ -3337,9 +3343,18 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 
 		// CRITICAL FIX: Wait for ACK from VM-sync before marking as success
 		// This prevents false "transferred" counts when VM-sync is unreachable
-		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: 30s)", database, collection, pageNumber)
+		// Use configurable timeout with intelligent defaults:
+		// - Same region/datacenter: 30s (default)
+		// - Geo-distributed (cross-continent): 120s recommended
+		// - High-latency networks: 180s
+		ackTimeout := config.Sync.Transport.TCPSender.AckTimeout
+		if ackTimeout == 0 {
+			// Smart default: 90s for production (handles most geo-distributed scenarios)
+			ackTimeout = 90 * time.Second
+		}
+		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: %v)", database, collection, pageNumber, ackTimeout)
 		ackWaitStart := time.Now()
-		if err := tcpSender.WaitForAcks(30 * time.Second); err != nil {
+		if err := tcpSender.WaitForAcks(ackTimeout); err != nil {
 			log.Printf("❌ ACK TIMEOUT: %s.%s page %d - VM-sync did not acknowledge: %v", database, collection, pageNumber, err)
 			// Only fall back to HTTP if TCP is NOT the primary mode and HTTP fallback is enabled
 			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {

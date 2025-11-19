@@ -199,13 +199,16 @@ func initializeTCPTransport() error {
 	receiver.OnBatch(func(stream string, batchSeq uint64, documents [][]byte) error {
 		return handleTCPBatchOptimized(stream, batchSeq, documents)
 	})
+	log.Printf("✅ TCP BATCH HANDLER: Registered handleTCPBatchOptimized")
 
 	// Set up error handler
 	receiver.OnError(func(err error) {
 		log.Printf("🔴 TCP TRANSPORT ERROR: %v", err)
 	})
+	log.Printf("✅ TCP ERROR HANDLER: Registered error handler")
 
 	// Start the TCP receiver
+	log.Printf("🚀 TCP RECEIVER STARTING: listen_addr=%s", receiverConfig.ListenAddr)
 	if err := receiver.Start(); err != nil {
 		return fmt.Errorf("failed to start TCP receiver: %w", err)
 	}
@@ -313,7 +316,10 @@ func mapSourceToTarget(sourceCollection string) (targetDatabase, targetCollectio
 
 // handleTCPBatchOptimized processes a batch of documents received via TCP with billion-document optimizations
 func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte) error {
+	log.Printf("🔹 TCP BATCH HANDLER CALLED: stream=%s seq=%d docs=%d", stream, batchSeq, len(documents))
+	
 	if len(documents) == 0 {
+		log.Printf("⚠️ TCP BATCH EMPTY: stream=%s seq=%d", stream, batchSeq)
 		return nil
 	}
 
@@ -329,6 +335,7 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 	// In the new approach, stream names are in format "database.collection"
 	parts := strings.Split(stream, ".")
 	if len(parts) < 2 {
+		log.Printf("🔴 TCP BATCH INVALID STREAM: stream=%s (expected format: database.collection)", stream)
 		return fmt.Errorf("invalid stream name format: %s", stream)
 	}
 
@@ -383,6 +390,8 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 
 	if processingError != nil {
 		log.Printf("🔴 TCP BATCH ERROR: %s seq=%d failed in %v: %v", stream, batchSeq, processingTime, processingError)
+		log.Printf("🔴 TCP BATCH FAILED DETAILS: stream=%s db=%s coll=%s docs=%d bytes=%d", 
+			stream, targetDatabase, targetCollection, len(documents), totalBytes)
 		return processingError
 	}
 
