@@ -59,7 +59,8 @@ type RootCollectionsMigration struct {
 func NewRootCollectionsMigration(cfg *models.Config, tcpSender transport.Sender) (*RootCollectionsMigration, error) {
 	rootURI := cfg.MongoDB.RootURI
 	if rootURI == "" {
-		return nil, fmt.Errorf("root_uri not configured in mongodb section")
+		log.Println("⚠️  ROOT MIGRATION: root_uri not configured, migration disabled")
+		return nil, nil // Return nil without error - migration is optional
 	}
 
 	tenantName := os.Getenv("TENANT_NAME")
@@ -69,7 +70,8 @@ func NewRootCollectionsMigration(cfg *models.Config, tcpSender transport.Sender)
 
 	communityID := os.Getenv("COMMUNITY_ID")
 	if communityID == "" {
-		return nil, fmt.Errorf("COMMUNITY_ID environment variable not set")
+		log.Println("⚠️  ROOT MIGRATION: COMMUNITY_ID not set, migration disabled")
+		return nil, nil // Return nil without error - migration is optional
 	}
 
 	rootTenantName := os.Getenv("ROOT_TENANT_NAME")

@@ -890,7 +890,9 @@ func main() {
 		}
 	} else if tcpTransportEnabled {
 		log.Println("✅ TCP TRANSPORT: Initialized successfully - ready for initial dump")
-		appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
+		if appLogger != nil {
+			appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
+		}
 
 		// Start TCP transport health monitor even when initially successful
 		if config.Sync.Transport.Mode == "tcp" {
@@ -1235,16 +1237,19 @@ func startPushBasedSync() {
 	initialDumpMutex.Unlock()
 
 	// Initialize and start root collections migration (licenses and service keys)
+	// Migration is OPTIONAL and will be skipped if root_uri or COMMUNITY_ID are not configured
 	if tcpSender != nil {
 		log.Println("🔑 ROOT MIGRATION: Initializing license/servicekey migration...")
 		rootMigration, err := migration.NewRootCollectionsMigration(&config, tcpSender)
 		if err != nil {
 			log.Printf("⚠️  ROOT MIGRATION: Failed to initialize: %v", err)
 			log.Printf("⚠️  Continuing without root collection migration")
-		} else {
+		} else if rootMigration != nil {
 			log.Println("✅ ROOT MIGRATION: Migration initialized, will run after initial dump")
 			// Start migration goroutine that waits for initial dump
 			rootMigration.RunAfterInitialDump(initialDumpCompleted)
+		} else {
+			log.Println("⚠️  ROOT MIGRATION: Migration disabled (missing configuration)")
 		}
 	} else {
 		log.Println("⚠️  ROOT MIGRATION: TCP sender not available, skipping migration")
