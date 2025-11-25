@@ -44,6 +44,7 @@ import (
 	"go-data-sync-http/pkg/resume"
 	"go-data-sync-http/pkg/sequence"
 	"go-data-sync-http/pkg/telemetry"
+	"go-data-sync-http/pkg/tenant"
 	"go-data-sync-http/pkg/tracking"
 	"go-data-sync-http/pkg/transport"
 )
@@ -408,6 +409,25 @@ func main() {
 	// Load configuration
 	if err := loadConfig(*configFile); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Fetch tenant and community information from TENANT_DNS if available
+	log.Println("🔍 TENANT INFO: Fetching tenant and community information...")
+	if _, err := tenant.FetchCommunityInfo(); err != nil {
+		log.Printf("⚠️  WARNING: Failed to fetch tenant info: %v", err)
+		log.Println("⚠️  Continuing with environment variables TENANT_ID and COMMUNITY_ID if set")
+	} else {
+		// Successfully fetched tenant info - environment variables now set
+		tenantID := os.Getenv("TENANT_ID")
+		communityID := os.Getenv("COMMUNITY_ID")
+		rootTenantName := os.Getenv("ROOT_TENANT_NAME")
+		tenantName := os.Getenv("TENANT_NAME")
+
+		log.Println("✅ TENANT INFO: Fetched successfully")
+		log.Printf("   Tenant ID: %s (Name: %s)", tenantID, tenantName)
+		log.Printf("   Community ID: %s (Name: %s)", communityID, os.Getenv("COMMUNITY_NAME"))
+		log.Printf("   ROOT_TENANT_NAME: %s (from global CAAS)", rootTenantName)
+		log.Println("   Environment variables set: TENANT_ID, COMMUNITY_ID, ROOT_TENANT_NAME")
 	}
 
 	// Connect to MongoDB with retry mechanism
@@ -3824,7 +3844,7 @@ func loadConfig(filename string) error {
 }
 
 // expandEnvVars replaces ${VAR_NAME} patterns with environment variable values
-// Example: "authn-${SOURCE_DATABASE}" with SOURCE_DATABASE=prod becomes "authn-prod"
+// Example: "authn-${TENANT_NAME}" with TENANT_NAME=prod becomes "authn-prod"
 func expandEnvVars(data []byte) []byte {
 	// Convert to string for regex processing
 	str := string(data)
@@ -3912,9 +3932,9 @@ func loadCollectionsFromJSON(filename string) error {
 				targetName = collectionsConfig.Databases[i].Name
 			}
 
-			// Replace ${SOURCE_DATABASE} or ${database_name} with hardcoded "1kosmos" for VM-sync routing
-			// Support patterns like ${SOURCE_DATABASE}, ${database_name}, ${database_name:-default}
-			dbNamePattern := regexp.MustCompile(`\$\{(?:SOURCE_DATABASE|database_name)(?::-[^}]*)?\}`)
+			// Replace ${TENANT_NAME} or ${database_name} with hardcoded "1kosmos" for VM-sync routing
+			// Support patterns like ${TENANT_NAME}, ${database_name}, ${database_name:-default}
+			dbNamePattern := regexp.MustCompile(`\$\{(?:TENANT_NAME|database_name)(?::-[^}]*)?\}`)
 			collectionsConfig.Databases[i].TargetDatabaseName = dbNamePattern.ReplaceAllString(targetName, "1kosmos")
 			log.Printf("📦 DB ROUTING AUTO-COMPUTED: Source='%s' -> Target='%s' (auto-generated)",
 				collectionsConfig.Databases[i].Name,

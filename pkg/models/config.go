@@ -262,7 +262,7 @@ func (c *Config) GetTenantCollectionName(baseName string) string {
 
 	// Fallback to environment variables if not set in config
 	if tenantName == "" {
-		tenantName = os.Getenv("SOURCE_DATABASE")
+		tenantName = os.Getenv("TENANT_NAME")
 		if tenantName == "" {
 			tenantName = "default"
 		}
