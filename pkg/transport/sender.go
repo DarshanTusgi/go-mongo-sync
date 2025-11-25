@@ -84,13 +84,17 @@ func newTCPSender(config SenderConfig) (*tcpSender, error) {
 	}
 
 	// Create parallel connections
+	log.Printf("🔌 TCP SENDER: Creating %d parallel connections to %s", config.ParallelConns, config.Address)
 	for i := 0; i < config.ParallelConns; i++ {
+		log.Printf("🔌 TCP SENDER: Creating connection %d/%d to %s", i+1, config.ParallelConns, config.Address)
 		conn, err := sender.createConnection(i)
 		if err != nil {
+			log.Printf("❌ TCP SENDER: Failed to create connection %d: %v", i, err)
 			// Clean up existing connections
 			sender.Close()
 			return nil, fmt.Errorf("failed to create connection %d: %w", i, err)
 		}
+		log.Printf("✅ TCP SENDER: Connection %d created successfully", i+1)
 		sender.connections = append(sender.connections, conn)
 	}
 
@@ -108,6 +112,7 @@ func (s *tcpSender) createConnection(id int) (*senderConnection, error) {
 		KeepAlive: s.config.KeepAlive,
 	}
 
+	log.Printf("🔌 TCP CONNECTION %d: Dialing %s (timeout=%v)", id, s.config.Address, s.config.ConnTimeout)
 	if s.config.TLSConfig != nil {
 		conn, err = tls.DialWithDialer(dialer, "tcp", s.config.Address, s.config.TLSConfig)
 	} else {
@@ -115,8 +120,10 @@ func (s *tcpSender) createConnection(id int) (*senderConnection, error) {
 	}
 
 	if err != nil {
+		log.Printf("❌ TCP CONNECTION %d: Failed to dial %s: %v", id, s.config.Address, err)
 		return nil, fmt.Errorf("failed to connect to %s: %w", s.config.Address, err)
 	}
+	log.Printf("✅ TCP CONNECTION %d: Successfully connected to %s", id, s.config.Address)
 
 	// OPTIMIZED: Set TCP options for billion-document performance
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -155,11 +162,14 @@ func (s *tcpSender) createConnection(id int) (*senderConnection, error) {
 // writeLoopOptimized handles writing frames with billion-document optimizations
 func (sc *senderConnection) writeLoopOptimized() {
 	defer sc.sender.wg.Done()
+	defer log.Printf("🔧 TCP WRITE LOOP EXIT: connection %d", sc.id)
 
 	// OPTIMIZED: Batch multiple frames for better throughput
 	batchBuffer := make([]*Frame, 0, 100)             // Buffer up to 100 frames
 	flushTimer := time.NewTimer(5 * time.Millisecond) // Flush every 5ms
 	defer flushTimer.Stop()
+
+	log.Printf("🚀 TCP WRITE LOOP: connection %d started", sc.id)
 
 	for {
 		select {
@@ -186,6 +196,7 @@ func (sc *senderConnection) writeLoopOptimized() {
 			if len(batchBuffer) > 0 {
 				sc.flushFrameBatch(batchBuffer)
 			}
+			log.Printf("🔧 TCP WRITE LOOP: connection %d shutting down", sc.id)
 			return
 		}
 	}
@@ -219,6 +230,8 @@ func (sc *senderConnection) flushFrameBatch(frames []*Frame) {
 	if err != nil {
 		sc.sender.stats.errorCount.Add(uint64(len(frames)))
 		log.Printf("❌ BATCH WRITE ERROR: Failed to send %d frames: %v", len(frames), err)
+		// Don't crash the goroutine - continue processing
+		sc.sender.handleConnectionError(sc, err)
 	} else {
 		log.Printf("📤 BATCH SENT: %d frames (%s) via connection %d", len(frames), formatBytes(totalSize), sc.id)
 	}
@@ -264,6 +277,14 @@ func (sc *senderConnection) readLoopOptimized() {
 				if readTimeout > 200*time.Second {
 					readTimeout = 200 * time.Second // Cap at 200 seconds
 				}
+			}
+
+			// STABILITY FIX: Don't set immediate read timeout on new connections
+			// VM-sync doesn't send data until it receives data first
+			if time.Since(lastActivity) < 5*time.Second {
+				// New connection - give it time before expecting data
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 
 			// Set read timeout with safety margin
@@ -422,6 +443,7 @@ func (sc *senderConnection) handleAckOptimized(payload []byte) {
 
 // SendBatch sends a batch of BSON documents
 func (s *tcpSender) SendBatch(stream string, batch [][]byte) error {
+	log.Printf("📤 TCP SEND: Sending batch for stream %s (%d documents)", stream, len(batch))
 	return s.sendBatch(stream, batch, false)
 }
 

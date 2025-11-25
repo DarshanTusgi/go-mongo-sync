@@ -226,10 +226,10 @@ func (r *tcpReceiver) handleConnection(conn net.Conn) {
 	}
 
 	connID := conn.RemoteAddr().String()
-	
+
 	// CRITICAL FIX: Log connection immediately after accept
 	log.Printf("🔗 TCP CONNECTION ACCEPTED: %s (new sender connected)", connID)
-	
+
 	ctx, cancel := context.WithCancel(r.ctx)
 
 	receiverConn := &receiverConnection{
@@ -245,7 +245,7 @@ func (r *tcpReceiver) handleConnection(conn net.Conn) {
 	r.connections[connID] = receiverConn
 	connCount := len(r.connections)
 	r.mu.Unlock()
-	
+
 	log.Printf("📊 TCP CONNECTION COUNT: %d active connection(s)", connCount)
 
 	// Start handling this connection

@@ -39,11 +39,13 @@ import (
 	"go-data-sync-http/pkg/filtering"
 	"go-data-sync-http/pkg/logging"
 	"go-data-sync-http/pkg/metrics"
+	"go-data-sync-http/pkg/migration"
 	"go-data-sync-http/pkg/models"
 	"go-data-sync-http/pkg/parallel"
 	"go-data-sync-http/pkg/resume"
 	"go-data-sync-http/pkg/sequence"
 	"go-data-sync-http/pkg/telemetry"
+	"go-data-sync-http/pkg/tenant"
 	"go-data-sync-http/pkg/tracking"
 	"go-data-sync-http/pkg/transport"
 )
@@ -404,6 +406,20 @@ func startTCPHealthMonitor() {
 func main() {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
+
+	// Fetch tenant and community information from API
+	log.Println("🔍 TENANT INFO: Fetching tenant and community information...")
+	tenantInfo, tenantErr := tenant.FetchCommunityInfo()
+	if tenantErr != nil {
+		log.Printf("⚠️  WARNING: Failed to fetch tenant info: %v", tenantErr)
+		log.Printf("⚠️  Continuing with environment variables TENANT_ID and COMMUNITY_ID if set")
+	} else {
+		log.Printf("✅ TENANT INFO: Fetched successfully")
+		log.Printf("   Tenant ID: %s (Name: %s)", tenantInfo.Tenant.ID, tenantInfo.Tenant.Name)
+		log.Printf("   Community ID: %s (Name: %s)", tenantInfo.Community.ID, tenantInfo.Community.Name)
+		log.Printf("   ROOT_TENANT_NAME: %s (from global CAAS)", os.Getenv("ROOT_TENANT_NAME"))
+		log.Printf("   Environment variables set: TENANT_ID, COMMUNITY_ID, ROOT_TENANT_NAME")
+	}
 
 	// Load configuration
 	if err := loadConfig(*configFile); err != nil {
@@ -1217,6 +1233,22 @@ func startPushBasedSync() {
 		log.Println("⚠️ INITIAL DUMP: Already completed, skipping duplicate signal")
 	}
 	initialDumpMutex.Unlock()
+
+	// Initialize and start root collections migration (licenses and service keys)
+	if tcpSender != nil {
+		log.Println("🔑 ROOT MIGRATION: Initializing license/servicekey migration...")
+		rootMigration, err := migration.NewRootCollectionsMigration(&config, tcpSender)
+		if err != nil {
+			log.Printf("⚠️  ROOT MIGRATION: Failed to initialize: %v", err)
+			log.Printf("⚠️  Continuing without root collection migration")
+		} else {
+			log.Println("✅ ROOT MIGRATION: Migration initialized, will run after initial dump")
+			// Start migration goroutine that waits for initial dump
+			rootMigration.RunAfterInitialDump(initialDumpCompleted)
+		}
+	} else {
+		log.Println("⚠️  ROOT MIGRATION: TCP sender not available, skipping migration")
+	}
 
 	// Start real-time synchronization AFTER initial dump completion with enhanced safety
 	log.Println("🚀 SEQUENCED STARTUP: Starting real-time sync goroutine...")
@@ -3824,7 +3856,7 @@ func loadConfig(filename string) error {
 }
 
 // expandEnvVars replaces ${VAR_NAME} patterns with environment variable values
-// Example: "authn-${SOURCE_DATABASE}" with SOURCE_DATABASE=prod becomes "authn-prod"
+// Example: "authn-${TENANT_NAME}" with TENANT_NAME=prod becomes "authn-prod"
 func expandEnvVars(data []byte) []byte {
 	// Convert to string for regex processing
 	str := string(data)
@@ -3912,9 +3944,9 @@ func loadCollectionsFromJSON(filename string) error {
 				targetName = collectionsConfig.Databases[i].Name
 			}
 
-			// Replace ${database_name} with hardcoded "1kosmos" for VM-sync routing
-			// Support both ${database_name} and ${database_name:-default} patterns
-			dbNamePattern := regexp.MustCompile(`\$\{database_name(?::-[^}]*)?\}`)
+			// Replace ${TENANT_NAME} or ${database_name} with hardcoded "1kosmos" for VM-sync routing
+			// Support patterns like ${TENANT_NAME}, ${database_name}, ${database_name:-default}
+			dbNamePattern := regexp.MustCompile(`\$\{(?:TENANT_NAME|database_name)(?::-[^}]*)?\}`)
 			collectionsConfig.Databases[i].TargetDatabaseName = dbNamePattern.ReplaceAllString(targetName, "1kosmos")
 			log.Printf("📦 DB ROUTING AUTO-COMPUTED: Source='%s' -> Target='%s' (auto-generated)",
 				collectionsConfig.Databases[i].Name,
@@ -4148,7 +4180,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// AUTO-REGISTER VM with intelligent distributor (REMOVES MANUAL CONFIG)
+			// VM capabilities for registration
 			capabilities := distribution.VMCapabilities{
 				MaxCollections: 10, // TODO: Extract from client capabilities message
 				SupportsTCP:    true,
@@ -4156,11 +4188,41 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				MaxConcurrency: 4,
 				MemoryLimitMB:  2048,
 			}
-			// Extract TCP endpoint from the HTTP request host
-			tcpEndpoint := extractHostDomain(r)
+			// VM-SYNC DISCOVERY: Try to discover where vm-sync actually is
+			var vmSyncDomain string
+			var tcpPort, httpPort string = "9000", "8081"
+
+			// Method 1: Check if vm-sync told us its domain in headers (BEST - vm-sync knows itself)
+			if headerDomain := r.Header.Get("X-VM-Sync-Domain"); headerDomain != "" {
+				vmSyncDomain = headerDomain
+				if headerTCPPort := r.Header.Get("X-VM-Sync-TCP-Port"); headerTCPPort != "" {
+					tcpPort = headerTCPPort
+				}
+				if headerHTTPPort := r.Header.Get("X-VM-Sync-HTTP-Port"); headerHTTPPort != "" {
+					httpPort = headerHTTPPort
+				}
+				log.Printf("🎯 VM-SYNC DISCOVERY: VM-sync told us its domain via headers: %s (TCP:%s, HTTP:%s)", vmSyncDomain, tcpPort, httpPort)
+			} else {
+				// Method 2: Extract domain from request (vm-sync's actual IP/domain)
+				vmSyncDomain = strings.Split(extractHostDomain(r), ":")[0]
+				log.Printf("🔍 VM-SYNC DISCOVERY: Extracted vm-sync domain from request: %s", vmSyncDomain)
+
+				// Method 3: Fallback to configured VM_SYNC_DOMAIN if extraction fails
+				if vmSyncDomain == "" || vmSyncDomain == "localhost" {
+					envDomain := os.Getenv("VM_SYNC_DOMAIN")
+					if envDomain != "" {
+						vmSyncDomain = envDomain
+						log.Printf("⚠️ VM-SYNC DISCOVERY: Using VM_SYNC_DOMAIN fallback: %s", vmSyncDomain)
+					} else {
+						log.Printf("❌ VM-SYNC DISCOVERY: No domain found, vm-sync unreachable!")
+					}
+				}
+			}
+
+			tcpEndpoint := fmt.Sprintf("%s:%s", vmSyncDomain, tcpPort)
 			endpoints := map[string]string{
-				"tcp":  tcpEndpoint,                                                    // Use automatically detected TCP endpoint
-				"http": fmt.Sprintf("%s:%d", strings.Split(tcpEndpoint, ":")[0], 8081), // HTTP port 8081
+				"tcp":  tcpEndpoint,                                  // Properly discovered TCP endpoint
+				"http": fmt.Sprintf("%s:%s", vmSyncDomain, httpPort), // Properly discovered HTTP endpoint
 			}
 
 			// Store TCP address in Address Manager for global access
@@ -4185,7 +4247,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if err := collectionDistributor.RegisterVM(clientInfo.ClientID, capabilities, endpoints); err != nil {
 				log.Printf("Failed to register VM with distributor: %v", err)
 			} else {
-				log.Printf("🤖 VM AUTO-REGISTERED: %s ready for intelligent collection distribution", clientInfo.ClientID)
+				log.Printf("🔗 VM REGISTERED: %s ready for intelligent collection distribution", clientInfo.ClientID)
 
 				// Trigger automatic collection distribution
 				go func() {
@@ -8010,15 +8072,15 @@ func handleVMClientsDebug(w http.ResponseWriter, r *http.Request) {
 func extractHostDomain(r *http.Request) string {
 	// Get the actual client IP from RemoteAddr (not r.Host which is server address)
 	clientAddr := r.RemoteAddr
-	
+
 	// RemoteAddr format is "IP:port", extract just the IP
 	if colonIndex := strings.LastIndex(clientAddr, ":"); colonIndex != -1 {
 		clientAddr = clientAddr[:colonIndex]
 	}
-	
+
 	// Remove IPv6 brackets if present
 	clientAddr = strings.Trim(clientAddr, "[]")
-	
+
 	log.Printf("🔍 TCP ENDPOINT DETECTION: Client IP=%s (from RemoteAddr=%s)", clientAddr, r.RemoteAddr)
 
 	// Construct TCP endpoint with port 9000

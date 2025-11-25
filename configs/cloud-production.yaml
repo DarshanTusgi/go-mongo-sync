@@ -24,7 +24,7 @@ mongodb:
   uri: "${MONGODB_URI}"
   timeout: 30s
   databases:
-    - name: "${SOURCE_DATABASE}"  # Use environment variable
+    - name: "${TENANT_NAME}"  # Use environment variable
       enabled: true
       priority: 1
       collections:

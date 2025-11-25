@@ -1,0 +1,362 @@
+package migration
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"go-data-sync-http/pkg/models"
+	"go-data-sync-http/pkg/transport"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+// LicenseAuth represents a document from the licenseauths collection
+type LicenseAuth struct {
+	ID            interface{} `bson:"_id"`
+	KeyTag        string      `bson:"keyTag"`
+	CommunityID   string      `bson:"communityId"`
+	CommunityName string      `bson:"communityName"`
+	IsAuthorized  bool        `bson:"isAuthorized"`
+	Expiry        time.Time   `bson:"expiry"`
+}
+
+// ServiceKey represents a document from the servicekeys collection
+type ServiceKey struct {
+	ID         interface{} `bson:"_id"`
+	Tag        string      `bson:"tag"`
+	KeyID      string      `bson:"keyId"`
+	KeySecret  string      `bson:"keySecret"`
+	Type       string      `bson:"type"`
+	Disabled   bool        `bson:"disabled"`
+	Expiry     time.Time   `bson:"expiry"`
+	AuthLevel  string      `bson:"authLevel"`
+	V          int         `bson:"__v"`
+}
+
+// RootCollectionsMigration handles migration of licenses and service keys from root tenant
+type RootCollectionsMigration struct {
+	rootMongoClient *mongo.Client
+	rootURI         string
+	tcpSender       transport.Sender
+	tenantName      string
+	communityID     string
+	rootTenantName  string
+}
+
+// NewRootCollectionsMigration creates a new root collections migration instance
+func NewRootCollectionsMigration(cfg *models.Config, tcpSender transport.Sender) (*RootCollectionsMigration, error) {
+	rootURI := cfg.MongoDB.RootURI
+	if rootURI == "" {
+		return nil, fmt.Errorf("root_uri not configured in mongodb section")
+	}
+
+	tenantName := os.Getenv("TENANT_NAME")
+	if tenantName == "" {
+		tenantName = "default"
+	}
+
+	communityID := os.Getenv("COMMUNITY_ID")
+	if communityID == "" {
+		return nil, fmt.Errorf("COMMUNITY_ID environment variable not set")
+	}
+
+	rootTenantName := os.Getenv("ROOT_TENANT_NAME")
+	if rootTenantName == "" {
+		log.Printf("⚠️  WARNING: ROOT_TENANT_NAME not set, will try to use TENANT_NAME")
+		rootTenantName = tenantName
+	}
+
+	return &RootCollectionsMigration{
+		rootURI:        rootURI,
+		tcpSender:      tcpSender,
+		tenantName:     tenantName,
+		communityID:    communityID,
+		rootTenantName: rootTenantName,
+	}, nil
+}
+
+// Connect establishes connection to root MongoDB
+func (rcm *RootCollectionsMigration) Connect(ctx context.Context) error {
+	clientOptions := options.Client().ApplyURI(rcm.rootURI)
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		return fmt.Errorf("failed to connect to root MongoDB: %w", err)
+	}
+
+	// Ping to verify connection
+	if err := client.Ping(ctx, nil); err != nil {
+		return fmt.Errorf("failed to ping root MongoDB: %w", err)
+	}
+
+	rcm.rootMongoClient = client
+	log.Printf("✅ ROOT MIGRATION: Connected to root MongoDB successfully")
+	return nil
+}
+
+// Close closes the root MongoDB connection
+func (rcm *RootCollectionsMigration) Close(ctx context.Context) error {
+	if rcm.rootMongoClient != nil {
+		return rcm.rootMongoClient.Disconnect(ctx)
+	}
+	return nil
+}
+
+// MigrateServiceKeys performs the complete migration workflow
+func (rcm *RootCollectionsMigration) MigrateServiceKeys(ctx context.Context) error {
+	log.Println("🔄 ROOT MIGRATION: Starting service keys migration...")
+	log.Printf("   Root Tenant: %s, Community ID: %s", rcm.rootTenantName, rcm.communityID)
+
+	// Step 1: Get database name
+	licenseDBName := fmt.Sprintf("licenses-%s", rcm.rootTenantName)
+	log.Printf("📊 ROOT MIGRATION: Querying database '%s'", licenseDBName)
+
+	// Step 2: Query licenseauths collection
+	keyTags, licenseAuths, err := rcm.fetchAuthorizedKeyTags(ctx, licenseDBName)
+	if err != nil {
+		return fmt.Errorf("failed to fetch authorized key tags: %w", err)
+	}
+
+	if len(keyTags) == 0 {
+		log.Printf("⚠️  ROOT MIGRATION: No authorized licenses found for community %s", rcm.communityID)
+		return nil
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Found %d authorized key tags: %v", len(keyTags), keyTags)
+
+	// Step 3: Query serviceskeys collection
+	serviceKeys, err := rcm.fetchServiceKeys(ctx, licenseDBName, keyTags)
+	if err != nil {
+		return fmt.Errorf("failed to fetch service keys: %w", err)
+	}
+
+	if len(serviceKeys) == 0 {
+		log.Printf("⚠️  ROOT MIGRATION: No service keys found for tags: %v", keyTags)
+		log.Printf("⚠️  Checked collection 'serviceskeys' (note: plural form)")
+		return nil
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Found %d service keys to migrate", len(serviceKeys))
+
+	// Step 4: Send licenseauths to VM-sync via TCP
+	if err := rcm.sendLicenseAuthsToVMSync(ctx, licenseAuths); err != nil {
+		return fmt.Errorf("failed to send license auths to VM-sync: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Successfully migrated %d license auths to VM-sync", len(licenseAuths))
+
+	// Step 5: Send service keys to VM-sync via TCP
+	if err := rcm.sendServiceKeysToVMSync(ctx, serviceKeys); err != nil {
+		return fmt.Errorf("failed to send service keys to VM-sync: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Successfully migrated %d service keys to VM-sync", len(serviceKeys))
+	return nil
+}
+
+// fetchAuthorizedKeyTags queries licenseauths and returns both authorized key tags and the licenseauths documents
+func (rcm *RootCollectionsMigration) fetchAuthorizedKeyTags(ctx context.Context, dbName string) ([]string, []LicenseAuth, error) {
+	collection := rcm.rootMongoClient.Database(dbName).Collection("licenseauths")
+
+	filter := bson.M{
+		"communityId":  rcm.communityID,
+		"isAuthorized": true,
+	}
+
+	cursor, err := collection.Find(ctx, filter)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query licenseauths: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var keyTags []string
+	var licenseAuths []LicenseAuth
+	for cursor.Next(ctx) {
+		var auth LicenseAuth
+		if err := cursor.Decode(&auth); err != nil {
+			log.Printf("⚠️  WARNING: Failed to decode license auth document: %v", err)
+			continue
+		}
+		if auth.KeyTag != "" {
+			keyTags = append(keyTags, auth.KeyTag)
+		}
+		licenseAuths = append(licenseAuths, auth) // Store for later migration
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, nil, fmt.Errorf("cursor error: %w", err)
+	}
+
+	return keyTags, licenseAuths, nil
+}
+
+// fetchServiceKeys queries serviceskeys collection (note: plural 'services') for given tags
+func (rcm *RootCollectionsMigration) fetchServiceKeys(ctx context.Context, dbName string, keyTags []string) ([]ServiceKey, error) {
+	collection := rcm.rootMongoClient.Database(dbName).Collection("serviceskeys") // Note: 'serviceskeys' not 'servicekeys'
+
+	filter := bson.M{
+		"tag": bson.M{"$in": keyTags},
+	}
+
+	cursor, err := collection.Find(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query servicekeys: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var serviceKeys []ServiceKey
+	for cursor.Next(ctx) {
+		var key ServiceKey
+		if err := cursor.Decode(&key); err != nil {
+			log.Printf("⚠️  WARNING: Failed to decode service key document: %v", err)
+			continue
+		}
+		serviceKeys = append(serviceKeys, key)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error: %w", err)
+	}
+
+	return serviceKeys, nil
+}
+
+// sendLicenseAuthsToVMSync sends license auths to VM-sync via TCP transport
+func (rcm *RootCollectionsMigration) sendLicenseAuthsToVMSync(ctx context.Context, licenseAuths []LicenseAuth) error {
+	if rcm.tcpSender == nil {
+		return fmt.Errorf("TCP sender not initialized")
+	}
+
+	// Target database on VM side: hardcoded to licenses-1kosmos
+	targetDBName := "licenses-1kosmos"
+	targetCollectionName := "licenseauths"
+
+	// Stream name format: database.collection
+	stream := fmt.Sprintf("%s.%s", targetDBName, targetCollectionName)
+
+	log.Printf("📤 ROOT MIGRATION: Sending %d license auths to VM-sync", len(licenseAuths))
+	log.Printf("   Target: %s (stream: %s)", stream, stream)
+
+	// Convert license auths to BSON byte arrays
+	var batchBytes [][]byte
+	for _, auth := range licenseAuths {
+		doc := bson.M{
+			"_id":           auth.ID,
+			"keyTag":        auth.KeyTag,
+			"communityId":   auth.CommunityID,
+			"communityName": auth.CommunityName,
+			"isAuthorized":  auth.IsAuthorized,
+			"expiry":        auth.Expiry,
+		}
+
+		// Marshal to BSON bytes
+		bsonBytes, err := bson.Marshal(doc)
+		if err != nil {
+			log.Printf("⚠️  WARNING: Failed to marshal license auth %s: %v", auth.KeyTag, err)
+			continue
+		}
+		batchBytes = append(batchBytes, bsonBytes)
+	}
+
+	if len(batchBytes) == 0 {
+		return fmt.Errorf("no valid license auths to send")
+	}
+
+	// Send via TCP using the stream name
+	if err := rcm.tcpSender.SendBatch(stream, batchBytes); err != nil {
+		return fmt.Errorf("failed to send batch via TCP: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: TCP batch sent successfully (%d documents)", len(batchBytes))
+	return nil
+}
+
+// sendServiceKeysToVMSync sends service keys to VM-sync via TCP transport
+func (rcm *RootCollectionsMigration) sendServiceKeysToVMSync(ctx context.Context, serviceKeys []ServiceKey) error {
+	if rcm.tcpSender == nil {
+		return fmt.Errorf("TCP sender not initialized")
+	}
+
+	// Target database on VM side: hardcoded to licenses-1kosmos
+	targetDBName := "licenses-1kosmos"
+	targetCollectionName := "serviceskeys" // Note: plural 'serviceskeys'
+
+	// Stream name format: database.collection
+	stream := fmt.Sprintf("%s.%s", targetDBName, targetCollectionName)
+
+	log.Printf("📤 ROOT MIGRATION: Sending %d service keys to VM-sync", len(serviceKeys))
+	log.Printf("   Target: %s (stream: %s)", stream, stream)
+
+	// Convert service keys to BSON byte arrays
+	var batchBytes [][]byte
+	for _, key := range serviceKeys {
+		doc := bson.M{
+			"_id":       key.ID,
+			"tag":       key.Tag,
+			"keyId":     key.KeyID,
+			"keySecret": key.KeySecret,
+			"type":      key.Type,
+			"disabled":  key.Disabled,
+			"expiry":    key.Expiry,
+			"authLevel": key.AuthLevel,
+			"__v":       key.V,
+		}
+
+		// Marshal to BSON bytes
+		bsonBytes, err := bson.Marshal(doc)
+		if err != nil {
+			log.Printf("⚠️  WARNING: Failed to marshal service key %s: %v", key.Tag, err)
+			continue
+		}
+		batchBytes = append(batchBytes, bsonBytes)
+	}
+
+	if len(batchBytes) == 0 {
+		return fmt.Errorf("no valid service keys to send")
+	}
+
+	// Send via TCP using the stream name
+	if err := rcm.tcpSender.SendBatch(stream, batchBytes); err != nil {
+		return fmt.Errorf("failed to send batch via TCP: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: TCP batch sent successfully (%d documents)", len(batchBytes))
+	return nil
+}
+
+// RunAfterInitialDump waits for initial dump completion and triggers migration
+func (rcm *RootCollectionsMigration) RunAfterInitialDump(initialDumpCompleted <-chan bool) {
+	go func() {
+		log.Println("⏳ ROOT MIGRATION: Waiting for initial dump to complete...")
+
+		// Wait for initial dump signal
+		<-initialDumpCompleted
+
+		log.Println("🚀 ROOT MIGRATION: Initial dump completed, starting migration...")
+
+		// Give a small delay to ensure TCP connections are stable
+		time.Sleep(2 * time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		// Connect to root MongoDB
+		if err := rcm.Connect(ctx); err != nil {
+			log.Printf("❌ ROOT MIGRATION: Failed to connect to root MongoDB: %v", err)
+			return
+		}
+		defer rcm.Close(ctx)
+
+		// Perform migration
+		if err := rcm.MigrateServiceKeys(ctx); err != nil {
+			log.Printf("❌ ROOT MIGRATION: Migration failed: %v", err)
+			return
+		}
+
+		log.Println("✅ ROOT MIGRATION: Migration workflow completed successfully")
+	}()
+}

@@ -2,7 +2,7 @@
 {
   "databases": [
     {
-      "name": "authn-${SOURCE_DATABASE}",
+      "name": "authn-${TENANT_NAME}",
       "enabled": true,
       "priority": 1,
       "collections": [
@@ -147,7 +147,7 @@
       ]
     },
     {
-      "name": "users-mgmt-${SOURCE_DATABASE}",
+      "name": "users-mgmt-${TENANT_NAME}",
       "enabled": true,
       "priority": 2,
       "collections": [
@@ -319,7 +319,7 @@
       ]
     },
     {
-      "name": "adminconsole-${SOURCE_DATABASE}",
+      "name": "adminconsole-${TENANT_NAME}",
       "enabled": true,
       "priority": 3,
       "collections": [
@@ -443,7 +443,7 @@
       ]
     },
     {
-      "name": "rules-engine-${SOURCE_DATABASE}",
+      "name": "rules-engine-${TENANT_NAME}",
       "enabled": true,
       "priority": 4,
       "collections": [
@@ -480,7 +480,7 @@
       ]
     },
     {
-        "name" : "caas-${SOURCE_DATABASE}",
+        "name" : "caas-${TENANT_NAME}",
         "enabled" : true,
         "priority" : 5,
         "collections" : [        
@@ -514,7 +514,7 @@
         ]
     },
     {
-        "name" : "caas-${SOURCE_DATABASE}",
+        "name" : "caas-${TENANT_NAME}",
         "enabled" : true,
         "priority" : 6,
         "collections" : [

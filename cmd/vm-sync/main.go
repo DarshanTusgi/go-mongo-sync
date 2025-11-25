@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -317,7 +318,7 @@ func mapSourceToTarget(sourceCollection string) (targetDatabase, targetCollectio
 // handleTCPBatchOptimized processes a batch of documents received via TCP with billion-document optimizations
 func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte) error {
 	log.Printf("🔹 TCP BATCH HANDLER CALLED: stream=%s seq=%d docs=%d", stream, batchSeq, len(documents))
-	
+
 	if len(documents) == 0 {
 		log.Printf("⚠️ TCP BATCH EMPTY: stream=%s seq=%d", stream, batchSeq)
 		return nil
@@ -390,7 +391,7 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 
 	if processingError != nil {
 		log.Printf("🔴 TCP BATCH ERROR: %s seq=%d failed in %v: %v", stream, batchSeq, processingTime, processingError)
-		log.Printf("🔴 TCP BATCH FAILED DETAILS: stream=%s db=%s coll=%s docs=%d bytes=%d", 
+		log.Printf("🔴 TCP BATCH FAILED DETAILS: stream=%s db=%s coll=%s docs=%d bytes=%d",
 			stream, targetDatabase, targetCollection, len(documents), totalBytes)
 		return processingError
 	}
@@ -680,10 +681,40 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 
 		if len(indexModels) > 0 {
 			coll := mongoClient.Database(targetDatabase).Collection(targetCollection)
-			if _, err := coll.Indexes().CreateMany(context.Background(), indexModels); err != nil {
-				return fmt.Errorf("failed to create indexes: %v", err)
+			ctx := context.Background()
+			if _, err := coll.Indexes().CreateMany(ctx, indexModels); err != nil {
+				// Check if it's an index conflict error
+				if mongo.IsDuplicateKeyError(err) || strings.Contains(err.Error(), "IndexKeySpecsConflict") {
+					log.Printf("⚠️ INDEX CONFLICT: Attempting to drop and recreate indexes for %s.%s", targetDatabase, targetCollection)
+
+					// Drop conflicting indexes and retry
+					for _, model := range indexModels {
+						if model.Options != nil && model.Options.Name != nil {
+							indexName := *model.Options.Name
+							log.Printf("🗑️ Dropping index: %s", indexName)
+							if _, dropErr := coll.Indexes().DropOne(ctx, indexName); dropErr != nil {
+								if !strings.Contains(dropErr.Error(), "index not found") {
+									log.Printf("⚠️ Failed to drop index %s: %v", indexName, dropErr)
+								}
+							}
+						}
+					}
+
+					// Retry creating indexes
+					log.Printf("🔄 Retrying index creation for %s.%s...", targetDatabase, targetCollection)
+					if _, retryErr := coll.Indexes().CreateMany(ctx, indexModels); retryErr != nil {
+						log.Printf("⚠️ Index creation still failed: %v - continuing anyway", retryErr)
+						// Don't return error - let data sync continue
+					} else {
+						log.Printf("✅ VM INDEXES: Successfully created %d indexes after resolving conflicts", len(indexModels))
+					}
+				} else {
+					log.Printf("⚠️ Index creation failed: %v - continuing anyway", err)
+					// Don't return error - let data sync continue
+				}
+			} else {
+				log.Printf("✅ VM INDEXES: Created %d indexes", len(indexModels))
 			}
-			log.Printf("✅ VM INDEXES: Created %d indexes", len(indexModels))
 		} else {
 			log.Printf("⚠️ VM INDEXES: No index models to create for %s.%s", targetDatabase, targetCollection)
 		}
@@ -2140,9 +2171,28 @@ func connectWebSocket() error {
 		return err
 	}
 
-	// Set headers to identify this as a vm-sync client
+	// Set headers to identify this as a vm-sync client and provide self-discovery info
 	headers := http.Header{}
 	headers.Set("User-Agent", "vm-sync-client/1.0")
+
+	// SELF-DISCOVERY: Tell cloud-sync where to reach vm-sync back via TCP
+	vmSyncDomain := os.Getenv("VM_SYNC_DOMAIN")
+	if vmSyncDomain == "" {
+		// Auto-discover external IP by asking a public service
+		log.Printf("🔍 VM_SYNC_DOMAIN not set, auto-discovering external IP...")
+		if externalIP, err := getExternalIP(); err == nil && externalIP != "" {
+			vmSyncDomain = externalIP
+			log.Printf("✅ AUTO-DISCOVERY: Found external IP: %s", vmSyncDomain)
+		} else {
+			vmSyncDomain = "localhost"
+			log.Printf("⚠️ AUTO-DISCOVERY failed (%v), using fallback: %s", err, vmSyncDomain)
+		}
+	}
+
+	headers.Set("X-VM-Sync-Domain", vmSyncDomain)
+	headers.Set("X-VM-Sync-TCP-Port", "9000")
+	headers.Set("X-VM-Sync-HTTP-Port", "8081")
+	log.Printf("📡 SELF-DISCOVERY: Sending domain info to cloud-sync: %s (TCP:9000, HTTP:8081)", vmSyncDomain)
 
 	log.Printf("Connecting to WebSocket: %s", u.String())
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), headers)
@@ -2723,10 +2773,39 @@ func recreateIndexes(ctx context.Context, coll *mongo.Collection, indexes []mode
 		return nil
 	}
 
-	// Create indexes
+	// Create indexes with conflict handling
 	_, err := indexView.CreateMany(ctx, indexModels)
 	if err != nil {
-		return fmt.Errorf("failed to create indexes: %w", err)
+		// Check if it's an index conflict error
+		if mongo.IsDuplicateKeyError(err) || strings.Contains(err.Error(), "IndexKeySpecsConflict") {
+			log.Printf("⚠️ Index conflict detected, attempting to drop and recreate indexes")
+
+			// Drop conflicting indexes and retry
+			for _, model := range indexModels {
+				indexName := *model.Options.Name
+				log.Printf("🗑️ Dropping conflicting index: %s", indexName)
+				if _, dropErr := indexView.DropOne(ctx, indexName); dropErr != nil {
+					// Ignore error if index doesn't exist
+					if !strings.Contains(dropErr.Error(), "index not found") {
+						log.Printf("⚠️ Warning: Failed to drop index %s: %v", indexName, dropErr)
+					}
+				}
+			}
+
+			// Retry creating indexes after dropping conflicts
+			log.Printf("🔄 Retrying index creation after dropping conflicts...")
+			if _, retryErr := indexView.CreateMany(ctx, indexModels); retryErr != nil {
+				log.Printf("⚠️ Warning: Index creation failed even after dropping conflicts: %v", retryErr)
+				// Continue anyway - indexes are not critical for data sync
+				return nil
+			}
+			log.Printf("✅ Successfully created indexes after resolving conflicts")
+		} else {
+			// For other errors, just log and continue
+			log.Printf("⚠️ Warning: Failed to create indexes: %v", err)
+			// Continue anyway - indexes are not critical for data sync
+			return nil
+		}
 	}
 
 	return nil
@@ -2985,4 +3064,38 @@ func handleInitialSyncTrigger(jsonMsg map[string]interface{}, conn *websocket.Co
 	}
 
 	return nil
+}
+
+// getExternalIP discovers the external IP address of this vm-sync instance
+func getExternalIP() (string, error) {
+	// Try multiple services in case one is down
+	services := []string{
+		"https://checkip.amazonaws.com",
+		"https://ipinfo.io/ip",
+		"https://api.ipify.org",
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for _, service := range services {
+		resp, err := client.Get(service)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 200 {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				continue
+			}
+			ip := strings.TrimSpace(string(body))
+			// Basic IP validation
+			if net.ParseIP(ip) != nil {
+				return ip, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("failed to discover external IP from any service")
 }

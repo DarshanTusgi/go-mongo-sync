@@ -22,6 +22,8 @@ server:
 mongodb:
   # Real test database connection
   uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
+  # Root tenant MongoDB connection (for license/servicekey migration)
+  root_uri: "mongodb+srv://admin:IdZcKnNvmWqea13k@proptuity-dev.mgzig.mongodb.net"
   timeout: 30s
   databases:
     - name: "real_transfer_test"
