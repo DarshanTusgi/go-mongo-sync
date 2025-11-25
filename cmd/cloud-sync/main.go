@@ -406,12 +406,8 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
 
-	// Load configuration
-	if err := loadConfig(*configFile); err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
-
-	// Fetch tenant and community information from TENANT_DNS if available
+	// Fetch tenant and community information from TENANT_DNS BEFORE loading config
+	// This ensures environment variables are set before config expansion
 	log.Println("🔍 TENANT INFO: Fetching tenant and community information...")
 	if _, err := tenant.FetchCommunityInfo(); err != nil {
 		log.Printf("⚠️  WARNING: Failed to fetch tenant info: %v", err)
@@ -428,6 +424,12 @@ func main() {
 		log.Printf("   Community ID: %s (Name: %s)", communityID, os.Getenv("COMMUNITY_NAME"))
 		log.Printf("   ROOT_TENANT_NAME: %s (from global CAAS)", rootTenantName)
 		log.Println("   Environment variables set: TENANT_ID, COMMUNITY_ID, ROOT_TENANT_NAME")
+	}
+
+	// Load configuration AFTER tenant info is fetched
+	// This ensures ${TENANT_NAME}, ${TENANT_ID}, etc. are expanded correctly
+	if err := loadConfig(*configFile); err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
 	// Connect to MongoDB with retry mechanism
@@ -4209,8 +4211,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			tcpEndpoint := fmt.Sprintf("%s:%s", vmSyncDomain, tcpPort)
 			endpoints := map[string]string{
-				"tcp":  tcpEndpoint,                                    // Properly discovered TCP endpoint
-				"http": fmt.Sprintf("%s:%s", vmSyncDomain, httpPort),   // Properly discovered HTTP endpoint
+				"tcp":  tcpEndpoint,                                  // Properly discovered TCP endpoint
+				"http": fmt.Sprintf("%s:%s", vmSyncDomain, httpPort), // Properly discovered HTTP endpoint
 			}
 
 			// Store TCP address in Address Manager for global access
@@ -8060,15 +8062,15 @@ func handleVMClientsDebug(w http.ResponseWriter, r *http.Request) {
 func extractHostDomain(r *http.Request) string {
 	// Get the actual client IP from RemoteAddr (not r.Host which is server address)
 	clientAddr := r.RemoteAddr
-	
+
 	// RemoteAddr format is "IP:port", extract just the IP
 	if colonIndex := strings.LastIndex(clientAddr, ":"); colonIndex != -1 {
 		clientAddr = clientAddr[:colonIndex]
 	}
-	
+
 	// Remove IPv6 brackets if present
 	clientAddr = strings.Trim(clientAddr, "[]")
-	
+
 	log.Printf("🔍 TCP ENDPOINT DETECTION: Client IP=%s (from RemoteAddr=%s)", clientAddr, r.RemoteAddr)
 
 	// Construct TCP endpoint with port 9000

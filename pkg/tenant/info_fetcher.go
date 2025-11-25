@@ -97,8 +97,9 @@ func FetchCommunityInfo() (*CommunityInfoResponse, error) {
 		return nil, fmt.Errorf("failed to fetch community info from TENANT_DNS: %w", err)
 	}
 
-	// Set TENANT_ID and COMMUNITY_ID from first call
+	// Set TENANT_ID, TENANT_NAME, and COMMUNITY_ID from first call
 	os.Setenv("TENANT_ID", response.Tenant.ID)
+	os.Setenv("TENANT_NAME", response.Tenant.Name)
 	os.Setenv("COMMUNITY_ID", response.Community.ID)
 
 	// STEP 2: Call service discovery endpoint on TENANT_DNS
