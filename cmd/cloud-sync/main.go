@@ -39,13 +39,11 @@ import (
 	"go-data-sync-http/pkg/filtering"
 	"go-data-sync-http/pkg/logging"
 	"go-data-sync-http/pkg/metrics"
-	"go-data-sync-http/pkg/migration"
 	"go-data-sync-http/pkg/models"
 	"go-data-sync-http/pkg/parallel"
 	"go-data-sync-http/pkg/resume"
 	"go-data-sync-http/pkg/sequence"
 	"go-data-sync-http/pkg/telemetry"
-	"go-data-sync-http/pkg/tenant"
 	"go-data-sync-http/pkg/tracking"
 	"go-data-sync-http/pkg/transport"
 )
@@ -406,20 +404,6 @@ func startTCPHealthMonitor() {
 func main() {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
-
-	// Fetch tenant and community information from API
-	log.Println("🔍 TENANT INFO: Fetching tenant and community information...")
-	tenantInfo, tenantErr := tenant.FetchCommunityInfo()
-	if tenantErr != nil {
-		log.Printf("⚠️  WARNING: Failed to fetch tenant info: %v", tenantErr)
-		log.Printf("⚠️  Continuing with environment variables TENANT_ID and COMMUNITY_ID if set")
-	} else {
-		log.Printf("✅ TENANT INFO: Fetched successfully")
-		log.Printf("   Tenant ID: %s (Name: %s)", tenantInfo.Tenant.ID, tenantInfo.Tenant.Name)
-		log.Printf("   Community ID: %s (Name: %s)", tenantInfo.Community.ID, tenantInfo.Community.Name)
-		log.Printf("   ROOT_TENANT_NAME: %s (from global CAAS)", os.Getenv("ROOT_TENANT_NAME"))
-		log.Printf("   Environment variables set: TENANT_ID, COMMUNITY_ID, ROOT_TENANT_NAME")
-	}
 
 	// Load configuration
 	if err := loadConfig(*configFile); err != nil {
@@ -890,9 +874,7 @@ func main() {
 		}
 	} else if tcpTransportEnabled {
 		log.Println("✅ TCP TRANSPORT: Initialized successfully - ready for initial dump")
-		if appLogger != nil {
-			appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
-		}
+		appLogger.Info("cloud-sync", "startup", "TCP transport enabled for high-performance data transfer", nil)
 
 		// Start TCP transport health monitor even when initially successful
 		if config.Sync.Transport.Mode == "tcp" {
@@ -1235,25 +1217,6 @@ func startPushBasedSync() {
 		log.Println("⚠️ INITIAL DUMP: Already completed, skipping duplicate signal")
 	}
 	initialDumpMutex.Unlock()
-
-	// Initialize and start root collections migration (licenses and service keys)
-	// Migration is OPTIONAL and will be skipped if root_uri or COMMUNITY_ID are not configured
-	if tcpSender != nil {
-		log.Println("🔑 ROOT MIGRATION: Initializing license/servicekey migration...")
-		rootMigration, err := migration.NewRootCollectionsMigration(&config, tcpSender)
-		if err != nil {
-			log.Printf("⚠️  ROOT MIGRATION: Failed to initialize: %v", err)
-			log.Printf("⚠️  Continuing without root collection migration")
-		} else if rootMigration != nil {
-			log.Println("✅ ROOT MIGRATION: Migration initialized, will run after initial dump")
-			// Start migration goroutine that waits for initial dump
-			rootMigration.RunAfterInitialDump(initialDumpCompleted)
-		} else {
-			log.Println("⚠️  ROOT MIGRATION: Migration disabled (missing configuration)")
-		}
-	} else {
-		log.Println("⚠️  ROOT MIGRATION: TCP sender not available, skipping migration")
-	}
 
 	// Start real-time synchronization AFTER initial dump completion with enhanced safety
 	log.Println("🚀 SEQUENCED STARTUP: Starting real-time sync goroutine...")
@@ -3861,7 +3824,7 @@ func loadConfig(filename string) error {
 }
 
 // expandEnvVars replaces ${VAR_NAME} patterns with environment variable values
-// Example: "authn-${TENANT_NAME}" with TENANT_NAME=prod becomes "authn-prod"
+// Example: "authn-${SOURCE_DATABASE}" with SOURCE_DATABASE=prod becomes "authn-prod"
 func expandEnvVars(data []byte) []byte {
 	// Convert to string for regex processing
 	str := string(data)
@@ -3949,9 +3912,9 @@ func loadCollectionsFromJSON(filename string) error {
 				targetName = collectionsConfig.Databases[i].Name
 			}
 
-			// Replace ${TENANT_NAME} or ${database_name} with hardcoded "1kosmos" for VM-sync routing
-			// Support patterns like ${TENANT_NAME}, ${database_name}, ${database_name:-default}
-			dbNamePattern := regexp.MustCompile(`\$\{(?:TENANT_NAME|database_name)(?::-[^}]*)?\}`)
+			// Replace ${SOURCE_DATABASE} or ${database_name} with hardcoded "1kosmos" for VM-sync routing
+			// Support patterns like ${SOURCE_DATABASE}, ${database_name}, ${database_name:-default}
+			dbNamePattern := regexp.MustCompile(`\$\{(?:SOURCE_DATABASE|database_name)(?::-[^}]*)?\}`)
 			collectionsConfig.Databases[i].TargetDatabaseName = dbNamePattern.ReplaceAllString(targetName, "1kosmos")
 			log.Printf("📦 DB ROUTING AUTO-COMPUTED: Source='%s' -> Target='%s' (auto-generated)",
 				collectionsConfig.Databases[i].Name,
@@ -4226,8 +4189,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			tcpEndpoint := fmt.Sprintf("%s:%s", vmSyncDomain, tcpPort)
 			endpoints := map[string]string{
-				"tcp":  tcpEndpoint,                                  // Properly discovered TCP endpoint
-				"http": fmt.Sprintf("%s:%s", vmSyncDomain, httpPort), // Properly discovered HTTP endpoint
+				"tcp":  tcpEndpoint,                                    // Properly discovered TCP endpoint
+				"http": fmt.Sprintf("%s:%s", vmSyncDomain, httpPort),   // Properly discovered HTTP endpoint
 			}
 
 			// Store TCP address in Address Manager for global access
@@ -8077,15 +8040,15 @@ func handleVMClientsDebug(w http.ResponseWriter, r *http.Request) {
 func extractHostDomain(r *http.Request) string {
 	// Get the actual client IP from RemoteAddr (not r.Host which is server address)
 	clientAddr := r.RemoteAddr
-
+	
 	// RemoteAddr format is "IP:port", extract just the IP
 	if colonIndex := strings.LastIndex(clientAddr, ":"); colonIndex != -1 {
 		clientAddr = clientAddr[:colonIndex]
 	}
-
+	
 	// Remove IPv6 brackets if present
 	clientAddr = strings.Trim(clientAddr, "[]")
-
+	
 	log.Printf("🔍 TCP ENDPOINT DETECTION: Client IP=%s (from RemoteAddr=%s)", clientAddr, r.RemoteAddr)
 
 	// Construct TCP endpoint with port 9000

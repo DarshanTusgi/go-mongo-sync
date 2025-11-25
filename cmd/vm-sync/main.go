@@ -318,7 +318,7 @@ func mapSourceToTarget(sourceCollection string) (targetDatabase, targetCollectio
 // handleTCPBatchOptimized processes a batch of documents received via TCP with billion-document optimizations
 func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte) error {
 	log.Printf("🔹 TCP BATCH HANDLER CALLED: stream=%s seq=%d docs=%d", stream, batchSeq, len(documents))
-
+	
 	if len(documents) == 0 {
 		log.Printf("⚠️ TCP BATCH EMPTY: stream=%s seq=%d", stream, batchSeq)
 		return nil
@@ -391,7 +391,7 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 
 	if processingError != nil {
 		log.Printf("🔴 TCP BATCH ERROR: %s seq=%d failed in %v: %v", stream, batchSeq, processingTime, processingError)
-		log.Printf("🔴 TCP BATCH FAILED DETAILS: stream=%s db=%s coll=%s docs=%d bytes=%d",
+		log.Printf("🔴 TCP BATCH FAILED DETAILS: stream=%s db=%s coll=%s docs=%d bytes=%d", 
 			stream, targetDatabase, targetCollection, len(documents), totalBytes)
 		return processingError
 	}

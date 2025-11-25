@@ -36,7 +36,6 @@ type CloudSyncConfig struct {
 // MongoDBConfig represents MongoDB connection settings
 type MongoDBConfig struct {
 	URI       string           `yaml:"uri"`
-	RootURI   string           `yaml:"root_uri"` // Root tenant MongoDB URI for license/servicekey migration
 	Timeout   time.Duration    `yaml:"timeout"`
 	Databases []DatabaseConfig `yaml:"databases"`
 }
@@ -263,7 +262,7 @@ func (c *Config) GetTenantCollectionName(baseName string) string {
 
 	// Fallback to environment variables if not set in config
 	if tenantName == "" {
-		tenantName = os.Getenv("TENANT_NAME")
+		tenantName = os.Getenv("SOURCE_DATABASE")
 		if tenantName == "" {
 			tenantName = "default"
 		}
