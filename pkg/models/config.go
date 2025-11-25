@@ -36,7 +36,7 @@ type CloudSyncConfig struct {
 // MongoDBConfig represents MongoDB connection settings
 type MongoDBConfig struct {
 	URI       string           `yaml:"uri"`
-	RootURI   string           `yaml:"root_uri"`   // Root tenant MongoDB URI for license/servicekey migration
+	RootURI   string           `yaml:"root_uri"` // Root tenant MongoDB URI for license/servicekey migration
 	Timeout   time.Duration    `yaml:"timeout"`
 	Databases []DatabaseConfig `yaml:"databases"`
 }

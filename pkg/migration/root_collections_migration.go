@@ -27,15 +27,22 @@ type LicenseAuth struct {
 
 // ServiceKey represents a document from the servicekeys collection
 type ServiceKey struct {
-	ID         interface{} `bson:"_id"`
-	Tag        string      `bson:"tag"`
-	KeyID      string      `bson:"keyId"`
-	KeySecret  string      `bson:"keySecret"`
-	Type       string      `bson:"type"`
-	Disabled   bool        `bson:"disabled"`
-	Expiry     time.Time   `bson:"expiry"`
-	AuthLevel  string      `bson:"authLevel"`
-	V          int         `bson:"__v"`
+	ID        interface{} `bson:"_id"`
+	Tag       string      `bson:"tag"`
+	KeyID     string      `bson:"keyId"`
+	KeySecret string      `bson:"keySecret"`
+	Type      string      `bson:"type"`
+	Disabled  bool        `bson:"disabled"`
+	Expiry    time.Time   `bson:"expiry"`
+	AuthLevel string      `bson:"authLevel"`
+	V         int         `bson:"__v"`
+}
+
+// ConfigStore represents a document from the configstores collection
+type ConfigStore struct {
+	ID    interface{}            `bson:"_id"`
+	Key   string                 `bson:"key"`
+	Value map[string]interface{} `bson:"value"`
 }
 
 // RootCollectionsMigration handles migration of licenses and service keys from root tenant
@@ -155,6 +162,122 @@ func (rcm *RootCollectionsMigration) MigrateServiceKeys(ctx context.Context) err
 	}
 
 	log.Printf("✅ ROOT MIGRATION: Successfully migrated %d service keys to VM-sync", len(serviceKeys))
+	return nil
+}
+
+// MigrateConfigStores migrates specific config documents from root tenant
+func (rcm *RootCollectionsMigration) MigrateConfigStores(ctx context.Context) error {
+	log.Println("🔄 ROOT MIGRATION: Starting config stores migration...")
+	log.Printf("   Root Tenant: %s", rcm.rootTenantName)
+
+	// Step 1: Get database name
+	caasDBName := fmt.Sprintf("caas-%s", rcm.rootTenantName)
+	log.Printf("📊 ROOT MIGRATION: Querying database '%s'", caasDBName)
+
+	// Step 2: Query configstores collection for specific keys
+	configStores, err := rcm.fetchConfigStores(ctx, caasDBName)
+	if err != nil {
+		return fmt.Errorf("failed to fetch config stores: %w", err)
+	}
+
+	if len(configStores) == 0 {
+		log.Printf("⚠️  ROOT MIGRATION: No config stores found")
+		return nil
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Found %d config stores to migrate", len(configStores))
+
+	// Step 3: Send config stores to VM-sync via TCP
+	if err := rcm.sendConfigStoresToVMSync(ctx, configStores); err != nil {
+		return fmt.Errorf("failed to send config stores to VM-sync: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Successfully migrated %d config stores to VM-sync", len(configStores))
+	return nil
+}
+
+// fetchConfigStores queries configstores collection for specific config keys
+func (rcm *RootCollectionsMigration) fetchConfigStores(ctx context.Context, dbName string) ([]ConfigStore, error) {
+	collection := rcm.rootMongoClient.Database(dbName).Collection("configstores")
+
+	// Query for specific config keys
+	filter := bson.M{
+		"key": bson.M{
+			"$in": []string{
+				"appId-adminconsole.global",
+				"appId-platform_internal-true",
+			},
+		},
+	}
+
+	cursor, err := collection.Find(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query configstores: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var configStores []ConfigStore
+	for cursor.Next(ctx) {
+		var config ConfigStore
+		if err := cursor.Decode(&config); err != nil {
+			log.Printf("⚠️  WARNING: Failed to decode config store document: %v", err)
+			continue
+		}
+		configStores = append(configStores, config)
+		log.Printf("   Found config key: %s", config.Key)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error: %w", err)
+	}
+
+	return configStores, nil
+}
+
+// sendConfigStoresToVMSync sends config stores to VM-sync via TCP transport
+func (rcm *RootCollectionsMigration) sendConfigStoresToVMSync(ctx context.Context, configStores []ConfigStore) error {
+	if rcm.tcpSender == nil {
+		return fmt.Errorf("TCP sender not initialized")
+	}
+
+	// Target database on VM side: hardcoded to caas-1kosmos
+	targetDBName := "caas-1kosmos"
+	targetCollectionName := "configstores"
+
+	// Stream name format: database.collection
+	stream := fmt.Sprintf("%s.%s", targetDBName, targetCollectionName)
+
+	log.Printf("📤 ROOT MIGRATION: Sending %d config stores to VM-sync", len(configStores))
+	log.Printf("   Target: %s (stream: %s)", stream, stream)
+
+	// Convert config stores to BSON byte arrays
+	var batchBytes [][]byte
+	for _, config := range configStores {
+		doc := bson.M{
+			"_id":   config.ID,
+			"key":   config.Key,
+			"value": config.Value,
+		}
+
+		// Marshal to BSON bytes
+		bsonBytes, err := bson.Marshal(doc)
+		if err != nil {
+			log.Printf("⚠️  WARNING: Failed to marshal config store %s: %v", config.Key, err)
+			continue
+		}
+		batchBytes = append(batchBytes, bsonBytes)
+	}
+
+	if len(batchBytes) == 0 {
+		return fmt.Errorf("no valid config stores to send")
+	}
+
+	// Send via TCP using the stream name
+	if err := rcm.tcpSender.SendBatch(stream, batchBytes); err != nil {
+		return fmt.Errorf("failed to send batch via TCP: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: TCP batch sent successfully (%d documents)", len(batchBytes))
 	return nil
 }
 
@@ -351,9 +474,15 @@ func (rcm *RootCollectionsMigration) RunAfterInitialDump(initialDumpCompleted <-
 		}
 		defer rcm.Close(ctx)
 
-		// Perform migration
+		// Perform license/service keys migration
 		if err := rcm.MigrateServiceKeys(ctx); err != nil {
-			log.Printf("❌ ROOT MIGRATION: Migration failed: %v", err)
+			log.Printf("❌ ROOT MIGRATION: License/ServiceKeys migration failed: %v", err)
+			// Continue to config migration even if this fails
+		}
+
+		// Perform config stores migration
+		if err := rcm.MigrateConfigStores(ctx); err != nil {
+			log.Printf("❌ ROOT MIGRATION: ConfigStores migration failed: %v", err)
 			return
 		}
 
