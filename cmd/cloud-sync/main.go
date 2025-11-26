@@ -97,6 +97,10 @@ var (
 	appLogger   *logging.Logger                // Application logger for dashboard
 	authService *auth.ClientCredentialsService // OAuth2 authentication service
 
+	// Service readiness flag
+	serviceReady      bool
+	serviceReadyMutex sync.RWMutex
+
 	// Sync control state
 	syncPaused      bool
 	syncPausedMutex sync.RWMutex
@@ -743,6 +747,12 @@ func main() {
 		"collection": oauth2Coll,
 		"issuer":     "cloud-sync",
 	})
+	
+	// Mark service as ready for WebSocket authentication
+	serviceReadyMutex.Lock()
+	serviceReady = true
+	serviceReadyMutex.Unlock()
+	log.Println("🎯 SERVICE READY: Cloud-sync ready to accept vm-sync connections")
 
 	// Initialize buffer-free resume token manager (ELIMINATES MEMORY BUFFERS)
 	log.Println("🚀 BUFFER-FREE: Initializing resume token manager (no memory buffers)...")
@@ -4218,11 +4228,24 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Only support OAuth2 authentication
 			if msgType == "oauth2_auth" {
 				// OAuth2 JWT token authentication
-				if authService == nil {
-					log.Printf("OAuth2 authentication not available")
-					conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"OAuth2 authentication not available"}`))
-					return
+				// Wait for authService to be ready (with timeout)
+				readyTimeout := time.After(30 * time.Second)
+				readyTicker := time.NewTicker(500 * time.Millisecond)
+				defer readyTicker.Stop()
+							
+				for authService == nil {
+					select {
+					case <-readyTimeout:
+						log.Printf("❌ WS AUTH TIMEOUT: authService not ready after 30 seconds")
+						conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"Cloud-sync initialization timeout"}`))
+						return
+					case <-readyTicker.C:
+						log.Printf("⏳ WS AUTH WAIT: Waiting for authService initialization...")
+						// Continue waiting
+					}
 				}
+							
+				log.Printf("✅ WS AUTH READY: authService is now available")
 
 				token, tokenOk := authMsg["token"].(string)
 				if !tokenOk {
