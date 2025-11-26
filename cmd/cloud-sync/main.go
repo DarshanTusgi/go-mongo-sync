@@ -413,152 +413,7 @@ func main() {
 	log.Printf("   COMMUNITY_ID: %s", os.Getenv("COMMUNITY_ID"))
 	log.Printf("   COMMUNITY_NAME: %s", os.Getenv("COMMUNITY_NAME"))
 
-	// Fetch tenant and community information if not provided as env vars
-	// This is BLOCKING and REQUIRED - we cannot start without these values
-	// NOTE: HTTP logic is INLINE here to isolate any potential issues
-	if os.Getenv("TENANT_ID") == "" || os.Getenv("COMMUNITY_ID") == "" {
-		tenantDNS := os.Getenv("TENANT_DNS")
-		communityName := os.Getenv("COMMUNITY_NAME")
-		
-		if tenantDNS == "" {
-			log.Fatal("FATAL: TENANT_DNS must be set to fetch tenant info, or provide TENANT_ID and COMMUNITY_ID directly")
-		}
-		if communityName == "" {
-			log.Fatal("FATAL: COMMUNITY_NAME must be set")
-		}
-		
-		log.Println("🔍 TENANT INFO: Fetching tenant and community information (INLINE HTTP)...")
-		
-		// STEP 1: Fetch tenant/community info from TENANT_DNS
-		type TenantInfo struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		type CommunityInfo struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		type CommunityInfoResponse struct {
-			Tenant    TenantInfo    `json:"tenant"`
-			Community CommunityInfo `json:"community"`
-		}
-		
-		apiURL := fmt.Sprintf("https://%s/api/r1/system/community_info/fetch", tenantDNS)
-		requestBody := map[string]string{"communityName": communityName}
-		jsonData, _ := json.Marshal(requestBody)
-		
-		log.Printf("📡 HTTP CALL 1/3: POST %s", apiURL)
-		httpClient := &http.Client{Timeout: 30 * time.Second}
-		resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			log.Fatalf("FATAL: HTTP request failed: %v", err)
-		}
-		defer resp.Body.Close()
-		
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
-			log.Fatalf("FATAL: API returned status %d: %s", resp.StatusCode, string(body))
-		}
-		
-		var response CommunityInfoResponse
-		if err := json.Unmarshal(body, &response); err != nil {
-			log.Fatalf("FATAL: Failed to parse response: %v", err)
-		}
-		
-		// Set TENANT_ID, TENANT_NAME, COMMUNITY_ID
-		os.Setenv("TENANT_ID", response.Tenant.ID)
-		if os.Getenv("TENANT_NAME") == "" {
-			os.Setenv("TENANT_NAME", response.Tenant.Name)
-		}
-		os.Setenv("COMMUNITY_ID", response.Community.ID)
-		log.Printf("✅ HTTP CALL 1/3 SUCCESS: Got TENANT_ID=%s, COMMUNITY_ID=%s", response.Tenant.ID, response.Community.ID)
-		
-		// STEP 2: Fetch service discovery to get global CAAS URL
-		type ServiceDiscoveryResponse struct {
-			GlobalCaas string `json:"global_caas"`
-		}
-		
-		sdURL := fmt.Sprintf("https://%s/caas/sd", tenantDNS)
-		log.Printf("📡 HTTP CALL 2/3: GET %s", sdURL)
-		sdResp, err := httpClient.Get(sdURL)
-		if err != nil {
-			log.Fatalf("FATAL: Service discovery failed: %v", err)
-		}
-		defer sdResp.Body.Close()
-		
-		sdBody, _ := io.ReadAll(sdResp.Body)
-		if sdResp.StatusCode != 200 {
-			log.Fatalf("FATAL: Service discovery returned %d: %s", sdResp.StatusCode, string(sdBody))
-		}
-		
-		var sdResponse ServiceDiscoveryResponse
-		if err := json.Unmarshal(sdBody, &sdResponse); err != nil {
-			log.Fatalf("FATAL: Failed to parse service discovery: %v", err)
-		}
-		log.Printf("✅ HTTP CALL 2/3 SUCCESS: Got global_caas=%s", sdResponse.GlobalCaas)
-		
-		// STEP 3: Extract domain from global_caas URL and fetch root tenant
-		var globalCaasDomain string
-		if strings.HasPrefix(sdResponse.GlobalCaas, "https://") {
-			globalCaasDomain = strings.TrimPrefix(sdResponse.GlobalCaas, "https://")
-		} else if strings.HasPrefix(sdResponse.GlobalCaas, "http://") {
-			globalCaasDomain = strings.TrimPrefix(sdResponse.GlobalCaas, "http://")
-		} else {
-			globalCaasDomain = sdResponse.GlobalCaas
-		}
-		if idx := strings.Index(globalCaasDomain, "/"); idx != -1 {
-			globalCaasDomain = globalCaasDomain[:idx]
-		}
-		
-		rootAPIURL := fmt.Sprintf("https://%s/api/r1/system/community_info/fetch", globalCaasDomain)
-		rootRequestBody := map[string]string{"communityName": "default"}
-		rootJsonData, _ := json.Marshal(rootRequestBody)
-		
-		log.Printf("📡 HTTP CALL 3/3: POST %s", rootAPIURL)
-		rootResp, err := httpClient.Post(rootAPIURL, "application/json", bytes.NewBuffer(rootJsonData))
-		if err != nil {
-			log.Fatalf("FATAL: Root tenant fetch failed: %v", err)
-		}
-		defer rootResp.Body.Close()
-		
-		rootBody, _ := io.ReadAll(rootResp.Body)
-		if rootResp.StatusCode != 200 {
-			log.Fatalf("FATAL: Root tenant API returned %d: %s", rootResp.StatusCode, string(rootBody))
-		}
-		
-		var rootResponse CommunityInfoResponse
-		if err := json.Unmarshal(rootBody, &rootResponse); err != nil {
-			log.Fatalf("FATAL: Failed to parse root tenant response: %v", err)
-		}
-		
-		os.Setenv("ROOT_TENANT_NAME", rootResponse.Tenant.Name)
-		log.Printf("✅ HTTP CALL 3/3 SUCCESS: Got ROOT_TENANT_NAME=%s", rootResponse.Tenant.Name)
-		
-		// Final verification
-		tenantID := os.Getenv("TENANT_ID")
-		communityID := os.Getenv("COMMUNITY_ID")
-		rootTenantName := os.Getenv("ROOT_TENANT_NAME")
-		
-		if tenantID == "" || communityID == "" || rootTenantName == "" {
-			log.Fatal("FATAL: Tenant fetch succeeded but required env vars not set properly")
-		}
-		
-		log.Println("✅ TENANT INFO: All 3 HTTP calls completed successfully")
-		log.Printf("   TENANT_ID: %s", tenantID)
-		log.Printf("   TENANT_NAME: %s", os.Getenv("TENANT_NAME"))
-		log.Printf("   COMMUNITY_ID: %s", communityID)
-		log.Printf("   COMMUNITY_NAME: %s", communityName)
-		log.Printf("   ROOT_TENANT_NAME: %s", rootTenantName)
-		
-		// Explicitly close HTTP client connections
-		httpClient.CloseIdleConnections()
-		log.Println("🔌 HTTP connections closed")
-		
-	} else {
-		log.Println("✅ TENANT INFO: Using provided environment variables (no API fetch needed)")
-	}
-
-	// Load configuration (requires TENANT_ID, COMMUNITY_ID, TENANT_NAME to be set)
+	// Load configuration first (will use defaults if tenant info not available yet)
 	if err := loadConfig(*configFile); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
@@ -594,6 +449,126 @@ func main() {
 		log.Println("Connected to MongoDB successfully")
 		mongoConnected = true
 		break
+	}
+	
+	// NOW fetch tenant info AFTER MongoDB is connected but BEFORE OAuth2 init
+	// This ensures tenant-aware database names are correct from the start
+	if os.Getenv("TENANT_ID") == "" || os.Getenv("COMMUNITY_ID") == "" {
+		tenantDNS := os.Getenv("TENANT_DNS")
+		communityName := os.Getenv("COMMUNITY_NAME")
+		
+		if tenantDNS == "" {
+			log.Fatal("FATAL: TENANT_DNS must be set to fetch tenant info, or provide TENANT_ID and COMMUNITY_ID directly")
+		}
+		if communityName == "" {
+			log.Fatal("FATAL: COMMUNITY_NAME must be set")
+		}
+		
+		log.Println("🔍 TENANT INFO: Fetching from API (MongoDB connected, before OAuth2 init)...")
+		
+		// Define types locally
+		type TenantInfo struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		type CommunityInfo struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		type CommunityInfoResponse struct {
+			Tenant    TenantInfo    `json:"tenant"`
+			Community CommunityInfo `json:"community"`
+		}
+		type ServiceDiscoveryResponse struct {
+			GlobalCaas string `json:"global_caas"`
+		}
+		
+		httpClient := &http.Client{Timeout: 30 * time.Second}
+		
+		// STEP 1: Fetch tenant/community info
+		apiURL := fmt.Sprintf("https://%s/api/r1/system/community_info/fetch", tenantDNS)
+		requestBody := map[string]string{"dns": tenantDNS, "communityName": communityName}
+		jsonData, _ := json.Marshal(requestBody)
+		
+		log.Printf("📡 HTTP CALL 1/3: POST %s", apiURL)
+		resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Fatalf("FATAL: HTTP request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			log.Fatalf("FATAL: API returned status %d: %s", resp.StatusCode, string(body))
+		}
+		
+		var response CommunityInfoResponse
+		if err := json.Unmarshal(body, &response); err != nil {
+			log.Fatalf("FATAL: Failed to parse response: %v", err)
+		}
+		
+		os.Setenv("TENANT_ID", response.Tenant.ID)
+		if os.Getenv("TENANT_NAME") == "" {
+			os.Setenv("TENANT_NAME", response.Tenant.Name)
+		}
+		os.Setenv("COMMUNITY_ID", response.Community.ID)
+		log.Printf("✅ HTTP CALL 1/3: TENANT_ID=%s, COMMUNITY_ID=%s", response.Tenant.ID, response.Community.ID)
+		
+		// STEP 2: Fetch service discovery
+		sdURL := fmt.Sprintf("https://%s/caas/sd", tenantDNS)
+		log.Printf("📡 HTTP CALL 2/3: GET %s", sdURL)
+		sdResp, err := httpClient.Get(sdURL)
+		if err != nil {
+			log.Fatalf("FATAL: Service discovery failed: %v", err)
+		}
+		defer sdResp.Body.Close()
+		
+		sdBody, _ := io.ReadAll(sdResp.Body)
+		if sdResp.StatusCode != 200 {
+			log.Fatalf("FATAL: Service discovery returned %d: %s", sdResp.StatusCode, string(sdBody))
+		}
+		
+		var sdResponse ServiceDiscoveryResponse
+		if err := json.Unmarshal(sdBody, &sdResponse); err != nil {
+			log.Fatalf("FATAL: Failed to parse service discovery: %v", err)
+		}
+		log.Printf("✅ HTTP CALL 2/3: global_caas=%s", sdResponse.GlobalCaas)
+		
+		// STEP 3: Fetch root tenant
+		globalCaasDomain := strings.TrimPrefix(sdResponse.GlobalCaas, "https://")
+		globalCaasDomain = strings.TrimPrefix(globalCaasDomain, "http://")
+		if idx := strings.Index(globalCaasDomain, "/"); idx != -1 {
+			globalCaasDomain = globalCaasDomain[:idx]
+		}
+		
+		rootAPIURL := fmt.Sprintf("https://%s/api/r1/system/community_info/fetch", globalCaasDomain)
+		rootRequestBody := map[string]string{"dns": globalCaasDomain, "communityName": "default"}
+		rootJsonData, _ := json.Marshal(rootRequestBody)
+		
+		log.Printf("📡 HTTP CALL 3/3: POST %s", rootAPIURL)
+		rootResp, err := httpClient.Post(rootAPIURL, "application/json", bytes.NewBuffer(rootJsonData))
+		if err != nil {
+			log.Fatalf("FATAL: Root tenant fetch failed: %v", err)
+		}
+		defer rootResp.Body.Close()
+		
+		rootBody, _ := io.ReadAll(rootResp.Body)
+		if rootResp.StatusCode != 200 {
+			log.Fatalf("FATAL: Root tenant API returned %d: %s", rootResp.StatusCode, string(rootBody))
+		}
+		
+		var rootResponse CommunityInfoResponse
+		if err := json.Unmarshal(rootBody, &rootResponse); err != nil {
+			log.Fatalf("FATAL: Failed to parse root tenant response: %v", err)
+		}
+		
+		os.Setenv("ROOT_TENANT_NAME", rootResponse.Tenant.Name)
+		log.Printf("✅ HTTP CALL 3/3: ROOT_TENANT_NAME=%s", rootResponse.Tenant.Name)
+		
+		httpClient.CloseIdleConnections()
+		log.Println("✅ TENANT INFO: All fetched, connections closed")
+	} else {
+		log.Println("✅ TENANT INFO: Using provided environment variables")
 	}
 
 	// Initialize application logger early so we can use it
