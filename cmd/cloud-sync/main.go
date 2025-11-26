@@ -4156,11 +4156,19 @@ func convertTrackingConfig(modelConfig models.TrackingConfig) *tracking.Transfer
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Log incoming WebSocket connection attempt with full details
+	log.Printf("🔌 WS CONNECTION ATTEMPT: Method=%s, URL=%s, RemoteAddr=%s", r.Method, r.URL.Path, r.RemoteAddr)
+	log.Printf("🔌 WS HEADERS: Origin=%s, User-Agent=%s, Upgrade=%s, Connection=%s", 
+		r.Header.Get("Origin"), r.Header.Get("User-Agent"), 
+		r.Header.Get("Upgrade"), r.Header.Get("Connection"))
+	
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
+		log.Printf("❌ WebSocket upgrade failed: %v", err)
+		log.Printf("❌ Request details: Method=%s, URL=%s, Proto=%s", r.Method, r.URL, r.Proto)
 		return
 	}
+	log.Printf("✅ WebSocket upgrade succeeded for %s", r.RemoteAddr)
 
 	// STABILITY FIX: Ensure connection is always closed and removed from clients map
 	defer func() {
