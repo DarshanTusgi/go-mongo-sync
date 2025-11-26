@@ -406,28 +406,45 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
 
-	// Fetch tenant and community information from TENANT_DNS BEFORE loading config
-	// This ensures environment variables are set before config expansion
-	log.Println("🔍 TENANT INFO: Fetching tenant and community information...")
-	if _, err := tenant.FetchCommunityInfo(); err != nil {
-		log.Printf("⚠️  WARNING: Failed to fetch tenant info: %v", err)
-		log.Println("⚠️  Continuing with environment variables TENANT_ID and COMMUNITY_ID if set")
-	} else {
-		// Successfully fetched tenant info - environment variables now set
+	// Log startup environment variables for debugging
+	log.Println("🚀 STARTUP: Cloud-sync starting...")
+	log.Printf("   TENANT_DNS: %s", os.Getenv("TENANT_DNS"))
+	log.Printf("   TENANT_ID: %s", os.Getenv("TENANT_ID"))
+	log.Printf("   TENANT_NAME: %s", os.Getenv("TENANT_NAME"))
+	log.Printf("   COMMUNITY_ID: %s", os.Getenv("COMMUNITY_ID"))
+	log.Printf("   COMMUNITY_NAME: %s", os.Getenv("COMMUNITY_NAME"))
+
+	// Fetch tenant and community information if not provided as env vars
+	// This is BLOCKING and REQUIRED - we cannot start without these values
+	if os.Getenv("TENANT_ID") == "" || os.Getenv("COMMUNITY_ID") == "" {
+		if os.Getenv("TENANT_DNS") == "" {
+			log.Fatal("FATAL: TENANT_DNS must be set to fetch tenant info, or provide TENANT_ID and COMMUNITY_ID directly")
+		}
+		
+		log.Println("🔍 TENANT INFO: Fetching tenant and community information...")
+		response, err := tenant.FetchCommunityInfo()
+		if err != nil {
+			log.Fatalf("FATAL: Failed to fetch tenant info and no TENANT_ID/COMMUNITY_ID provided: %v", err)
+		}
+		
+		// Verify required variables are now set
 		tenantID := os.Getenv("TENANT_ID")
 		communityID := os.Getenv("COMMUNITY_ID")
-		rootTenantName := os.Getenv("ROOT_TENANT_NAME")
-		tenantName := os.Getenv("TENANT_NAME")
-
+		if tenantID == "" || communityID == "" {
+			log.Fatal("FATAL: Tenant fetch succeeded but TENANT_ID or COMMUNITY_ID not set")
+		}
+		
 		log.Println("✅ TENANT INFO: Fetched successfully")
-		log.Printf("   Tenant ID: %s (Name: %s)", tenantID, tenantName)
-		log.Printf("   Community ID: %s (Name: %s)", communityID, os.Getenv("COMMUNITY_NAME"))
-		log.Printf("   ROOT_TENANT_NAME: %s (from global CAAS)", rootTenantName)
-		log.Println("   Environment variables set: TENANT_ID, COMMUNITY_ID, ROOT_TENANT_NAME")
+		log.Printf("   TENANT_ID: %s", tenantID)
+		log.Printf("   TENANT_NAME: %s", response.Tenant.Name)
+		log.Printf("   COMMUNITY_ID: %s", communityID)
+		log.Printf("   COMMUNITY_NAME: %s", os.Getenv("COMMUNITY_NAME"))
+		log.Printf("   ROOT_TENANT_NAME: %s", os.Getenv("ROOT_TENANT_NAME"))
+	} else {
+		log.Println("✅ TENANT INFO: Using provided environment variables (no API fetch needed)")
 	}
 
-	// Load configuration AFTER tenant info is fetched
-	// This ensures ${TENANT_NAME}, ${TENANT_ID}, etc. are expanded correctly
+	// Load configuration (requires TENANT_ID, COMMUNITY_ID, TENANT_NAME to be set)
 	if err := loadConfig(*configFile); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}

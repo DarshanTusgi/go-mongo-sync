@@ -98,8 +98,11 @@ func FetchCommunityInfo() (*CommunityInfoResponse, error) {
 	}
 
 	// Set TENANT_ID, TENANT_NAME, and COMMUNITY_ID from first call
+	// Only set TENANT_NAME if not already set (preserve user-provided value)
 	os.Setenv("TENANT_ID", response.Tenant.ID)
-	os.Setenv("TENANT_NAME", response.Tenant.Name)
+	if os.Getenv("TENANT_NAME") == "" {
+		os.Setenv("TENANT_NAME", response.Tenant.Name)
+	}
 	os.Setenv("COMMUNITY_ID", response.Community.ID)
 
 	// STEP 2: Call service discovery endpoint on TENANT_DNS
