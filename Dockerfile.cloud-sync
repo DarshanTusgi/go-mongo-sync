@@ -25,8 +25,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # Final stage - minimal runtime image
 FROM alpine:3.20
 
-# Install runtime dependencies (added bash and python3 for wrapper script)
-RUN apk --no-cache add ca-certificates wget curl bash python3
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates wget curl
 
 # Create non-root user for security
 RUN addgroup -g 1001 -S cloudsync && \
@@ -38,10 +38,6 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/cloud-sync .
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-
-# Copy wrapper script for tenant info fetching
-COPY --chown=cloudsync:cloudsync scripts/fetch-and-start.sh ./scripts/
-RUN chmod +x ./scripts/fetch-and-start.sh
 
 # Copy configuration files
 COPY --chown=cloudsync:cloudsync configs/ ./configs/
@@ -66,6 +62,6 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
-# Default command - use wrapper script to fetch tenant info before starting
-ENTRYPOINT ["./scripts/fetch-and-start.sh"]
+# Default command
+ENTRYPOINT ["./cloud-sync"]
 CMD ["-config", "/app/configs/cloud-example.yaml"]
