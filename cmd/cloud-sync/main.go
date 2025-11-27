@@ -39,11 +39,13 @@ import (
 	"go-data-sync-http/pkg/filtering"
 	"go-data-sync-http/pkg/logging"
 	"go-data-sync-http/pkg/metrics"
+	"go-data-sync-http/pkg/migration"
 	"go-data-sync-http/pkg/models"
 	"go-data-sync-http/pkg/parallel"
 	"go-data-sync-http/pkg/resume"
 	"go-data-sync-http/pkg/sequence"
 	"go-data-sync-http/pkg/telemetry"
+	"go-data-sync-http/pkg/tenantinfo"
 	"go-data-sync-http/pkg/tracking"
 	"go-data-sync-http/pkg/transport"
 )
@@ -409,6 +411,11 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
 
+	// Fetch tenant information if not provided
+	if err := tenantinfo.FetchTenantInfoIfNeeded(); err != nil {
+		log.Fatalf("Failed to fetch tenant information: %v", err)
+	}
+
 	// Log startup environment variables for debugging
 	log.Println("🚀 STARTUP: Cloud-sync starting...")
 	log.Printf("   TENANT_DNS: %s", os.Getenv("TENANT_DNS"))
@@ -453,126 +460,6 @@ func main() {
 		log.Println("Connected to MongoDB successfully")
 		mongoConnected = true
 		break
-	}
-	
-	// NOW fetch tenant info AFTER MongoDB is connected but BEFORE OAuth2 init
-	// This ensures tenant-aware database names are correct from the start
-	if os.Getenv("TENANT_ID") == "" || os.Getenv("COMMUNITY_ID") == "" {
-		tenantDNS := os.Getenv("TENANT_DNS")
-		communityName := os.Getenv("COMMUNITY_NAME")
-		
-		if tenantDNS == "" {
-			log.Fatal("FATAL: TENANT_DNS must be set to fetch tenant info, or provide TENANT_ID and COMMUNITY_ID directly")
-		}
-		if communityName == "" {
-			log.Fatal("FATAL: COMMUNITY_NAME must be set")
-		}
-		
-		log.Println("🔍 TENANT INFO: Fetching from API (MongoDB connected, before OAuth2 init)...")
-		
-		// Define types locally
-		type TenantInfo struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		type CommunityInfo struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		type CommunityInfoResponse struct {
-			Tenant    TenantInfo    `json:"tenant"`
-			Community CommunityInfo `json:"community"`
-		}
-		type ServiceDiscoveryResponse struct {
-			GlobalCaas string `json:"global_caas"`
-		}
-		
-		httpClient := &http.Client{Timeout: 30 * time.Second}
-		
-		// STEP 1: Fetch tenant/community info
-		apiURL := fmt.Sprintf("https://%s/api/r1/system/community_info/fetch", tenantDNS)
-		requestBody := map[string]string{"dns": tenantDNS, "communityName": communityName}
-		jsonData, _ := json.Marshal(requestBody)
-		
-		log.Printf("📡 HTTP CALL 1/3: POST %s", apiURL)
-		resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			log.Fatalf("FATAL: HTTP request failed: %v", err)
-		}
-		defer resp.Body.Close()
-		
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
-			log.Fatalf("FATAL: API returned status %d: %s", resp.StatusCode, string(body))
-		}
-		
-		var response CommunityInfoResponse
-		if err := json.Unmarshal(body, &response); err != nil {
-			log.Fatalf("FATAL: Failed to parse response: %v", err)
-		}
-		
-		os.Setenv("TENANT_ID", response.Tenant.ID)
-		if os.Getenv("TENANT_NAME") == "" {
-			os.Setenv("TENANT_NAME", response.Tenant.Name)
-		}
-		os.Setenv("COMMUNITY_ID", response.Community.ID)
-		log.Printf("✅ HTTP CALL 1/3: TENANT_ID=%s, COMMUNITY_ID=%s", response.Tenant.ID, response.Community.ID)
-		
-		// STEP 2: Fetch service discovery
-		sdURL := fmt.Sprintf("https://%s/caas/sd", tenantDNS)
-		log.Printf("📡 HTTP CALL 2/3: GET %s", sdURL)
-		sdResp, err := httpClient.Get(sdURL)
-		if err != nil {
-			log.Fatalf("FATAL: Service discovery failed: %v", err)
-		}
-		defer sdResp.Body.Close()
-		
-		sdBody, _ := io.ReadAll(sdResp.Body)
-		if sdResp.StatusCode != 200 {
-			log.Fatalf("FATAL: Service discovery returned %d: %s", sdResp.StatusCode, string(sdBody))
-		}
-		
-		var sdResponse ServiceDiscoveryResponse
-		if err := json.Unmarshal(sdBody, &sdResponse); err != nil {
-			log.Fatalf("FATAL: Failed to parse service discovery: %v", err)
-		}
-		log.Printf("✅ HTTP CALL 2/3: global_caas=%s", sdResponse.GlobalCaas)
-		
-		// STEP 3: Fetch root tenant
-		globalCaasDomain := strings.TrimPrefix(sdResponse.GlobalCaas, "https://")
-		globalCaasDomain = strings.TrimPrefix(globalCaasDomain, "http://")
-		if idx := strings.Index(globalCaasDomain, "/"); idx != -1 {
-			globalCaasDomain = globalCaasDomain[:idx]
-		}
-		
-		rootAPIURL := fmt.Sprintf("https://%s/api/r1/system/community_info/fetch", globalCaasDomain)
-		rootRequestBody := map[string]string{"dns": globalCaasDomain, "communityName": "default"}
-		rootJsonData, _ := json.Marshal(rootRequestBody)
-		
-		log.Printf("📡 HTTP CALL 3/3: POST %s", rootAPIURL)
-		rootResp, err := httpClient.Post(rootAPIURL, "application/json", bytes.NewBuffer(rootJsonData))
-		if err != nil {
-			log.Fatalf("FATAL: Root tenant fetch failed: %v", err)
-		}
-		defer rootResp.Body.Close()
-		
-		rootBody, _ := io.ReadAll(rootResp.Body)
-		if rootResp.StatusCode != 200 {
-			log.Fatalf("FATAL: Root tenant API returned %d: %s", rootResp.StatusCode, string(rootBody))
-		}
-		
-		var rootResponse CommunityInfoResponse
-		if err := json.Unmarshal(rootBody, &rootResponse); err != nil {
-			log.Fatalf("FATAL: Failed to parse root tenant response: %v", err)
-		}
-		
-		os.Setenv("ROOT_TENANT_NAME", rootResponse.Tenant.Name)
-		log.Printf("✅ HTTP CALL 3/3: ROOT_TENANT_NAME=%s", rootResponse.Tenant.Name)
-		
-		httpClient.CloseIdleConnections()
-		log.Println("✅ TENANT INFO: All fetched, connections closed")
-	} else {
-		log.Println("✅ TENANT INFO: Using provided environment variables")
 	}
 
 	// Initialize application logger early so we can use it
@@ -747,7 +634,7 @@ func main() {
 		"collection": oauth2Coll,
 		"issuer":     "cloud-sync",
 	})
-	
+
 	// Mark service as ready for WebSocket authentication
 	serviceReadyMutex.Lock()
 	serviceReady = true
@@ -1231,18 +1118,15 @@ func cleanupExpiredBlocklist() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			now := time.Now()
-			blocklistMutex.Lock()
-			for ip, expiry := range blocklistIPs {
-				if now.After(expiry) {
-					delete(blocklistIPs, ip)
-				}
+	for range ticker.C {
+		now := time.Now()
+		blocklistMutex.Lock()
+		for ip, expiry := range blocklistIPs {
+			if now.After(expiry) {
+				delete(blocklistIPs, ip)
 			}
-			blocklistMutex.Unlock()
 		}
+		blocklistMutex.Unlock()
 	}
 }
 
@@ -1355,6 +1239,33 @@ func startPushBasedSync() {
 		log.Println("⚠️ INITIAL DUMP: Already completed, skipping duplicate signal")
 	}
 	initialDumpMutex.Unlock()
+
+	// Run root collections migration after initial dump
+	log.Println("📦 ROOT MIGRATION: Starting migration after initial dump...")
+	if migrator, err := migration.NewRootCollectionsMigration(&config, tcpSender); err != nil {
+		log.Printf("❌ ROOT MIGRATION: Failed to create migrator: %v", err)
+	} else if migrator != nil {
+		ctx := context.Background()
+		if err := migrator.Connect(ctx); err != nil {
+			log.Printf("❌ ROOT MIGRATION: Failed to connect: %v", err)
+		} else {
+			defer migrator.Close(ctx)
+
+			// Migrate service keys
+			if err := migrator.MigrateServiceKeys(ctx); err != nil {
+				log.Printf("❌ ROOT MIGRATION: Service keys migration failed: %v", err)
+			}
+
+			// Migrate config stores
+			if err := migrator.MigrateConfigStores(ctx); err != nil {
+				log.Printf("❌ ROOT MIGRATION: Config stores migration failed: %v", err)
+			}
+
+			log.Println("✅ ROOT MIGRATION: Migration completed")
+		}
+	} else {
+		log.Println("⏭️ ROOT MIGRATION: Skipped (not configured or not needed)")
+	}
 
 	// Start real-time synchronization AFTER initial dump completion with enhanced safety
 	log.Println("🚀 SEQUENCED STARTUP: Starting real-time sync goroutine...")
@@ -2635,17 +2546,17 @@ func startSyncProcess() {
 // getBasePath constructs the API base path from environment variables
 func getBasePath() string {
 	basePath := os.Getenv("BASE_PATH")
-	tenantID := os.Getenv("TENANT_ID")
-	communityID := os.Getenv("COMMUNITY_ID")
+	tenantDns := os.Getenv("TENANT_DNS")
+	communityName := os.Getenv("COMMUNITY_NAME")
 
 	// If any required environment variable is missing, return empty string (no base path)
-	if basePath == "" || tenantID == "" || communityID == "" {
-		log.Println("Base path environment variables not fully configured (BASE_PATH, TENANT_ID, COMMUNITY_ID)")
+	if basePath == "" || tenantDns == "" || communityName == "" {
+		log.Println("Base path environment variables not fully configured (BASE_PATH, TENANT_DNS, COMMUNITY_NAME)")
 		return ""
 	}
 
-	// Construct base path: /basePath-tenantID-communityID
-	fullBasePath := fmt.Sprintf("/%s-%s-%s", basePath, tenantID, communityID)
+	// Construct base path: /basePath-tenantName-communityName
+	fullBasePath := fmt.Sprintf("/%s-%s-%s", basePath, tenantDns, communityName)
 	log.Printf("Constructed base path: %s", fullBasePath)
 	return fullBasePath
 }
@@ -4158,10 +4069,10 @@ func convertTrackingConfig(modelConfig models.TrackingConfig) *tracking.Transfer
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Log incoming WebSocket connection attempt with full details
 	log.Printf("🔌 WS CONNECTION ATTEMPT: Method=%s, URL=%s, RemoteAddr=%s", r.Method, r.URL.Path, r.RemoteAddr)
-	log.Printf("🔌 WS HEADERS: Origin=%s, User-Agent=%s, Upgrade=%s, Connection=%s", 
-		r.Header.Get("Origin"), r.Header.Get("User-Agent"), 
+	log.Printf("🔌 WS HEADERS: Origin=%s, User-Agent=%s, Upgrade=%s, Connection=%s",
+		r.Header.Get("Origin"), r.Header.Get("User-Agent"),
 		r.Header.Get("Upgrade"), r.Header.Get("Connection"))
-	
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("❌ WebSocket upgrade failed: %v", err)
@@ -4240,7 +4151,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				readyTimeout := time.After(30 * time.Second)
 				readyTicker := time.NewTicker(500 * time.Millisecond)
 				defer readyTicker.Stop()
-							
+
 				for authService == nil {
 					select {
 					case <-readyTimeout:
@@ -4252,7 +4163,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						// Continue waiting
 					}
 				}
-							
+
 				log.Printf("✅ WS AUTH READY: authService is now available")
 
 				token, tokenOk := authMsg["token"].(string)
