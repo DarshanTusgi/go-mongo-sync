@@ -42,6 +42,7 @@ type Checkpoint struct {
 
 // CheckpointConfig holds configuration for checkpoint management
 type CheckpointConfig struct {
+	MongoClient     *mongo.Client // Reuse existing MongoDB client
 	MongoURI        string        `yaml:"mongo_uri" json:"mongo_uri"`
 	Database        string        `yaml:"database" json:"database"`
 	Collection      string        `yaml:"collection" json:"collection"`
@@ -69,9 +70,18 @@ func NewCheckpointManager(config *CheckpointConfig) (*CheckpointManager, error) 
 		return &CheckpointManager{checkpoints: make(map[string]*Checkpoint)}, nil
 	}
 
-	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(config.MongoURI))
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to MongoDB for checkpoints: %w", err)
+	// Reuse existing MongoDB client if provided, otherwise create new connection
+	var client *mongo.Client
+	var err error
+	if config.MongoClient != nil {
+		client = config.MongoClient
+	} else if config.MongoURI != "" {
+		client, err = mongo.Connect(context.Background(), options.Client().ApplyURI(config.MongoURI))
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to MongoDB for checkpoints: %w", err)
+		}
+	} else {
+		return nil, fmt.Errorf("either MongoClient or MongoURI must be provided")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

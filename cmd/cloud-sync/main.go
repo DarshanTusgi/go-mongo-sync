@@ -491,6 +491,7 @@ func main() {
 		checkpointColl := config.GetTenantCollectionName(config.Checkpoint.Collection)
 
 		checkpointConfig := &resume.CheckpointConfig{
+			MongoClient:     mongoClient, // Reuse existing MongoDB client
 			MongoURI:        config.MongoDB.URI,
 			Database:        checkpointDB,
 			Collection:      checkpointColl,
@@ -522,7 +523,8 @@ func main() {
 	// Initialize transfer tracker with graceful fallback
 	if mongoConnected {
 		trackingConfig := convertTrackingConfig(config.Tracking)
-		// Use the same MongoDB URI as the main service
+		// Reuse the same MongoDB client as the main service
+		trackingConfig.MongoClient = mongoClient
 		trackingConfig.MongoURI = config.MongoDB.URI
 		// Apply tenant-aware naming
 		trackingConfig.Database = config.GetTenantDatabaseName(config.Tracking.Database)
@@ -3334,10 +3336,30 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 	// Collect documents as BSON documents for TCP transport
 	var documents [][]byte
 	totalBytes := 0
+	tenantDNS := os.Getenv("TENANT_DNS") // For URL transformation
 	for cursor.Next(ctx) {
 		// cursor.Current is already bson.Raw, convert to []byte
 		docBytes := make([]byte, len(cursor.Current))
 		copy(docBytes, cursor.Current)
+
+		// SPECIAL HANDLING: Transform URLs in servicedirectory collection
+		if collection == "servicedirectory" && tenantDNS != "" {
+			var doc bson.M
+			if err := bson.Unmarshal(docBytes, &doc); err == nil {
+				if urlStr, ok := doc["url"].(string); ok && urlStr != "" {
+					transformedURL := transformServiceDirectoryURL(urlStr, tenantDNS)
+					if transformedURL != urlStr {
+						log.Printf("🔄 URL TRANSFORMED: %s -> %s", urlStr, transformedURL)
+						doc["url"] = transformedURL
+						// Re-marshal modified document
+						if modifiedBytes, err := bson.Marshal(doc); err == nil {
+							docBytes = modifiedBytes
+						}
+					}
+				}
+			}
+		}
+
 		documents = append(documents, docBytes)
 		totalBytes += len(docBytes)
 	}
@@ -3472,6 +3494,37 @@ func getTargetDatabaseForVMSync(sourceDatabase string) string {
 	}
 	// Fallback: return source database name if no mapping found
 	return sourceDatabase
+}
+
+// transformServiceDirectoryURL transforms URLs by replacing the domain with TENANT_DNS
+// Example: "https://1k-dev.1kosmos.net/vcs" -> "https://blockid-dev.1kosmos.net/vcs"
+func transformServiceDirectoryURL(originalURL, tenantDNS string) string {
+	if originalURL == "" || tenantDNS == "" {
+		return originalURL
+	}
+
+	// Regular expression to match domain in URL
+	// Pattern: protocol://domain/path -> replace domain with tenantDNS
+	domainRegex := regexp.MustCompile(`^(https?://)[^/]+(/.*)?$`)
+
+	if domainRegex.MatchString(originalURL) {
+		// Extract protocol and path
+		matches := domainRegex.FindStringSubmatch(originalURL)
+		if len(matches) >= 2 {
+			protocol := matches[1] // "https://" or "http://"
+			path := ""
+			if len(matches) >= 3 {
+				path = matches[2] // "/vcs" or empty
+			}
+
+			// Construct new URL with TENANT_DNS
+			newURL := fmt.Sprintf("%s%s%s", protocol, tenantDNS, path)
+			return newURL
+		}
+	}
+
+	// If no match, return original
+	return originalURL
 }
 
 // getTCPReceiverFromSender returns a receiver reference from the sender (for checkpoint coordination)
@@ -3705,8 +3758,29 @@ func pushSinglePageHTTP(ctx context.Context, vmSyncEndpoint, database, collectio
 
 	// Collect documents
 	var documents []bson.Raw
+	tenantDNS := os.Getenv("TENANT_DNS") // For URL transformation
 	for cursor.Next(ctx) {
-		documents = append(documents, cursor.Current)
+		docBytes := cursor.Current
+
+		// SPECIAL HANDLING: Transform URLs in servicedirectory collection
+		if collection == "servicedirectory" && tenantDNS != "" {
+			var doc bson.M
+			if err := bson.Unmarshal(docBytes, &doc); err == nil {
+				if urlStr, ok := doc["url"].(string); ok && urlStr != "" {
+					transformedURL := transformServiceDirectoryURL(urlStr, tenantDNS)
+					if transformedURL != urlStr {
+						log.Printf("🔄 URL TRANSFORMED (HTTP): %s -> %s", urlStr, transformedURL)
+						doc["url"] = transformedURL
+						// Re-marshal modified document
+						if modifiedBytes, err := bson.Marshal(doc); err == nil {
+							docBytes = bson.Raw(modifiedBytes)
+						}
+					}
+				}
+			}
+		}
+
+		documents = append(documents, docBytes)
 	}
 
 	if err := cursor.Err(); err != nil {

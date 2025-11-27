@@ -26,15 +26,24 @@ func NewTransferTracker(config *TransferConfig) (*TransferTracker, error) {
 		return &TransferTracker{config: config}, nil
 	}
 
-	clientOptions := options.Client().ApplyURI(config.MongoURI)
-	client, err := mongo.Connect(context.Background(), clientOptions)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to MongoDB for tracking: %v", err)
-	}
+	// Reuse existing MongoDB client if provided, otherwise create new connection
+	var client *mongo.Client
+	var err error
+	if config.MongoClient != nil {
+		client = config.MongoClient
+	} else if config.MongoURI != "" {
+		clientOptions := options.Client().ApplyURI(config.MongoURI)
+		client, err = mongo.Connect(context.Background(), clientOptions)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to MongoDB for tracking: %v", err)
+		}
 
-	// Test the connection
-	if err = client.Ping(context.Background(), nil); err != nil {
-		return nil, fmt.Errorf("failed to ping MongoDB for tracking: %v", err)
+		// Test the connection
+		if err = client.Ping(context.Background(), nil); err != nil {
+			return nil, fmt.Errorf("failed to ping MongoDB for tracking: %v", err)
+		}
+	} else {
+		return nil, fmt.Errorf("either MongoClient or MongoURI must be provided")
 	}
 
 	db := client.Database(config.Database)

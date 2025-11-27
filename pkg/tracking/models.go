@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 // TransferRecord struct removed - replaced by watermark-based tracking
@@ -71,11 +72,12 @@ type TransferBatch struct {
 
 // TransferConfig holds configuration for the watermark-based tracking system
 type TransferConfig struct {
-	MongoURI        string `yaml:"mongo_uri"`
-	Database        string `yaml:"database"`
-	StateCollection string `yaml:"state_collection"`
-	BatchCollection string `yaml:"batch_collection"`
-	Enabled         bool   `yaml:"enabled"`
+	MongoClient     *mongo.Client // Reuse existing MongoDB client
+	MongoURI        string        `yaml:"mongo_uri"`
+	Database        string        `yaml:"database"`
+	StateCollection string        `yaml:"state_collection"`
+	BatchCollection string        `yaml:"batch_collection"`
+	Enabled         bool          `yaml:"enabled"`
 }
 
 // Constants for transfer status

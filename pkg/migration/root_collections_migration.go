@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"time"
 
 	"go-data-sync-http/pkg/models"
@@ -43,6 +44,15 @@ type ConfigStore struct {
 	ID    interface{}            `bson:"_id"`
 	Key   string                 `bson:"key"`
 	Value map[string]interface{} `bson:"value"`
+}
+
+// ServiceDirectory represents a document from the servicedirectory collection
+type ServiceDirectory struct {
+	ID   interface{} `bson:"_id"`
+	URL  string      `bson:"url"`
+	Name string      `bson:"name"`
+	// Include other fields as map to preserve unknown fields
+	OtherFields map[string]interface{} `bson:",inline"`
 }
 
 // RootCollectionsMigration handles migration of licenses and service keys from root tenant
@@ -195,6 +205,12 @@ func (rcm *RootCollectionsMigration) MigrateConfigStores(ctx context.Context) er
 	}
 
 	log.Printf("✅ ROOT MIGRATION: Successfully migrated %d config stores to VM-sync", len(configStores))
+
+	// Step 4: Migrate servicedirectory collection with URL transformation
+	if err := rcm.MigrateServiceDirectory(ctx); err != nil {
+		return fmt.Errorf("failed to migrate servicedirectory: %w", err)
+	}
+
 	return nil
 }
 
@@ -275,6 +291,119 @@ func (rcm *RootCollectionsMigration) sendConfigStoresToVMSync(ctx context.Contex
 	}
 
 	// Send via TCP using the stream name
+	if err := rcm.tcpSender.SendBatch(stream, batchBytes); err != nil {
+		return fmt.Errorf("failed to send batch via TCP: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: TCP batch sent successfully (%d documents)", len(batchBytes))
+	return nil
+}
+
+// MigrateServiceDirectory migrates servicedirectory collection with URL domain transformation
+func (rcm *RootCollectionsMigration) MigrateServiceDirectory(ctx context.Context) error {
+	log.Println("🔄 ROOT MIGRATION: Starting servicedirectory migration with URL transformation...")
+	log.Printf("   Root Tenant: %s, Target Tenant: %s", rcm.rootTenantName, rcm.tenantName)
+
+	// Step 1: Get source database name
+	caasDBName := fmt.Sprintf("caas-%s", rcm.rootTenantName)
+	log.Printf("📊 ROOT MIGRATION: Querying database '%s'", caasDBName)
+
+	// Step 2: Fetch servicedirectory documents
+	serviceDirectories, err := rcm.fetchServiceDirectories(ctx, caasDBName)
+	if err != nil {
+		return fmt.Errorf("failed to fetch servicedirectory: %w", err)
+	}
+
+	if len(serviceDirectories) == 0 {
+		log.Printf("⚠️  ROOT MIGRATION: No servicedirectory documents found")
+		return nil
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Found %d servicedirectory documents to migrate", len(serviceDirectories))
+
+	// Step 3: Transform URLs and send to VM-sync
+	if err := rcm.sendServiceDirectoriesToVMSync(ctx, serviceDirectories); err != nil {
+		return fmt.Errorf("failed to send servicedirectory to VM-sync: %w", err)
+	}
+
+	log.Printf("✅ ROOT MIGRATION: Successfully migrated %d servicedirectory documents with URL transformation", len(serviceDirectories))
+	return nil
+}
+
+// fetchServiceDirectories queries servicedirectory collection
+func (rcm *RootCollectionsMigration) fetchServiceDirectories(ctx context.Context, dbName string) ([]bson.M, error) {
+	collection := rcm.rootMongoClient.Database(dbName).Collection("servicedirectory")
+
+	cursor, err := collection.Find(ctx, bson.M{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query servicedirectory: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var docs []bson.M
+	for cursor.Next(ctx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			log.Printf("⚠️  WARNING: Failed to decode servicedirectory document: %v", err)
+			continue
+		}
+		docs = append(docs, doc)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error: %w", err)
+	}
+
+	return docs, nil
+}
+
+// sendServiceDirectoriesToVMSync sends servicedirectory documents with URL transformation
+func (rcm *RootCollectionsMigration) sendServiceDirectoriesToVMSync(ctx context.Context, serviceDirectories []bson.M) error {
+	if rcm.tcpSender == nil {
+		return fmt.Errorf("TCP sender not initialized")
+	}
+
+	// Target database: caas-{TENANT_NAME}
+	targetDBName := fmt.Sprintf("caas-%s", rcm.tenantName)
+	targetCollectionName := "servicedirectory"
+	stream := fmt.Sprintf("%s.%s", targetDBName, targetCollectionName)
+
+	log.Printf("📤 ROOT MIGRATION: Transforming and sending %d servicedirectory documents", len(serviceDirectories))
+	log.Printf("   Target: %s (stream: %s)", stream, stream)
+
+	// Get TENANT_DNS for URL transformation
+	tenantDNS := os.Getenv("TENANT_DNS")
+	if tenantDNS == "" {
+		log.Printf("⚠️  WARNING: TENANT_DNS not set, URL transformation will be skipped")
+	}
+
+	var batchBytes [][]byte
+	for _, doc := range serviceDirectories {
+		// Transform URL field if present
+		if tenantDNS != "" && doc["url"] != nil {
+			if urlStr, ok := doc["url"].(string); ok {
+				transformedURL := transformServiceDirectoryURL(urlStr, tenantDNS)
+				if transformedURL != urlStr {
+					log.Printf("🔄 URL TRANSFORMED: %s -> %s", urlStr, transformedURL)
+					doc["url"] = transformedURL
+				}
+			}
+		}
+
+		// Marshal to BSON bytes
+		bsonBytes, err := bson.Marshal(doc)
+		if err != nil {
+			log.Printf("⚠️  WARNING: Failed to marshal servicedirectory document: %v", err)
+			continue
+		}
+		batchBytes = append(batchBytes, bsonBytes)
+	}
+
+	if len(batchBytes) == 0 {
+		return fmt.Errorf("no valid servicedirectory documents to send")
+	}
+
+	// Send via TCP
 	if err := rcm.tcpSender.SendBatch(stream, batchBytes); err != nil {
 		return fmt.Errorf("failed to send batch via TCP: %w", err)
 	}
@@ -490,4 +619,35 @@ func (rcm *RootCollectionsMigration) RunAfterInitialDump(initialDumpCompleted <-
 
 		log.Println("✅ ROOT MIGRATION: Migration workflow completed successfully")
 	}()
+}
+
+// transformServiceDirectoryURL transforms URLs by replacing the domain with TENANT_DNS
+// Example: "https://1k-dev.1kosmos.net/vcs" -> "https://blockid-dev.1kosmos.net/vcs"
+func transformServiceDirectoryURL(originalURL, tenantDNS string) string {
+	if originalURL == "" || tenantDNS == "" {
+		return originalURL
+	}
+
+	// Regular expression to match domain in URL
+	// Pattern: protocol://domain/path -> replace domain with tenantDNS
+	domainRegex := regexp.MustCompile(`^(https?://)[^/]+(/.*)?$`)
+
+	if domainRegex.MatchString(originalURL) {
+		// Extract protocol and path
+		matches := domainRegex.FindStringSubmatch(originalURL)
+		if len(matches) >= 2 {
+			protocol := matches[1] // "https://" or "http://"
+			path := ""
+			if len(matches) >= 3 {
+				path = matches[2] // "/vcs" or empty
+			}
+
+			// Construct new URL with TENANT_DNS
+			newURL := fmt.Sprintf("%s%s%s", protocol, tenantDNS, path)
+			return newURL
+		}
+	}
+
+	// If no match, return original
+	return originalURL
 }
