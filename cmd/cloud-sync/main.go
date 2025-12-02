@@ -1335,8 +1335,13 @@ func startSchedulerBasedSync() {
 		for {
 			select {
 			case <-ticker.C:
-				log.Printf("📅 SCHEDULER: Running scheduled incremental sync (interval: %v)", config.Sync.SchedulerInterval)
+				log.Println("═══════════════════════════════════════════════════════════")
+				log.Printf("📅 SCHEDULER TICK: Time=%s, Interval=%v", time.Now().Format(time.RFC3339), config.Sync.SchedulerInterval)
+				log.Printf("🔍 SCHEDULER: scheduler_sync=%v, realtime_sync=%v", config.Sync.SchedulerSync, config.Sync.RealtimeSync)
+				log.Println("🚀 SCHEDULER: Starting incremental sync run...")
 				runIncrementalSyncSafe()
+				log.Printf("✅ SCHEDULER COMPLETE: Next run at %s", time.Now().Add(config.Sync.SchedulerInterval).Format(time.RFC3339))
+				log.Println("═══════════════════════════════════════════════════════════")
 			case <-context.Background().Done():
 				log.Println("📅 SCHEDULER: Stopping scheduler due to context cancellation")
 				return
@@ -1471,16 +1476,23 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 	if err != nil {
 		// Handle resume token invalidation gracefully (industry best practice)
 		if isInvalidateResumeTokenError(err) && len(startFromToken) > 0 {
-			log.Printf("🔄 RESUME TOKEN INVALID: Starting fresh stream for %s.%s", database, collection)
+			log.Printf("🔄 OPLOG EXPIRED: Resume token for %s.%s is no longer in oplog", database, collection)
+			log.Printf("⚠️  ERROR DETAIL: %v", err)
+			log.Printf("🆕 RECOVERY: Clearing stale checkpoint and starting fresh stream")
 			if checkpointMgr != nil {
 				// Clear invalid resume token
 				if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
 					log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+				} else {
+					log.Printf("✅ CHECKPOINT CLEARED: Stale resume token removed")
 				}
 			}
 			// Retry with fresh stream
 			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
 			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
+			if err == nil {
+				log.Printf("✅ RECOVERY SUCCESS: Fresh change stream created for %s.%s", database, collection)
+			}
 		}
 
 		if err != nil {
@@ -1499,6 +1511,7 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 	}
 
 	// Process ALL change events in real-time
+	log.Printf("🔍 CHANGE STREAM: Listening for changes on %s.%s (timeout: 25s)...", database, collection)
 	for changeStream.Next(ctx) {
 		var changeEvent bson.M
 		if err := changeStream.Decode(&changeEvent); err != nil {
@@ -1558,6 +1571,13 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 		} else {
 			log.Printf("⚠️  STREAM ERROR: %s.%s - %v", database, collection, streamErr)
 		}
+	}
+
+	// Log summary of changes detected
+	if changeCount == 0 {
+		log.Printf("✅ NO CHANGES: %s.%s is up-to-date", database, collection)
+	} else {
+		log.Printf("📦 CHANGES DETECTED: %s.%s - Total:%d, Operations:%v", database, collection, changeCount, operationCounts)
 	}
 
 	// CRITICAL FIX: Get resume token even if no changes occurred
@@ -2280,6 +2300,26 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 	return nil
 }
 
+// Shared HTTP client for incremental sync with connection pooling and keepalive
+var incrementalSyncHTTPClient = &http.Client{
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,             // Connection pool
+		MaxIdleConnsPerHost: 10,              // Reuse connections to same host
+		IdleConnTimeout:     90 * time.Second, // Keep connections alive
+		DisableKeepAlives:   false,            // Enable HTTP keepalive
+		DisableCompression:  false,            // Enable compression
+		ForceAttemptHTTP2:   true,             // Try HTTP/2
+		// Network timeouts for cross-region reliability
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second, // Connection timeout
+			KeepAlive: 30 * time.Second, // TCP keepalive
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
 // sendIncrementalChangesViaHTTPWithRetry sends incremental changes with retry mechanism (FIX GAP #2)
 func sendIncrementalChangesViaHTTPWithRetry(database, collection string, documents [][]byte) error {
 	const maxRetries = 5
@@ -2361,8 +2401,8 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 	req.Header.Set("X-Sync-Type", "incremental")
 	req.Header.Set("X-Client-ID", "cloud-sync-incremental")
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	// Use shared HTTP client with connection pooling for reliability
+	resp, err := incrementalSyncHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("HTTP request failed: %v", err)
 	}
@@ -4929,7 +4969,10 @@ func isInvalidateResumeTokenError(err error) bool {
 	errorStr := err.Error()
 	return (strings.Contains(errorStr, "InvalidResumeToken") && strings.Contains(errorStr, "invalidate notification")) ||
 		strings.Contains(errorStr, "cannot resume stream; the resume token was not found") ||
-		strings.Contains(errorStr, "ChangeStreamFatalError")
+		strings.Contains(errorStr, "ChangeStreamFatalError") ||
+		strings.Contains(errorStr, "ChangeStreamHistoryLost") || // Resume point no longer in oplog
+		strings.Contains(errorStr, "Resume of change stream was not possible") || // Common resume failure message
+		strings.Contains(errorStr, "resume point may no longer be in the oplog") // Explicit oplog expiry
 }
 
 // Adaptive parallelism control

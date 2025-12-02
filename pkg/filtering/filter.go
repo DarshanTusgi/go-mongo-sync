@@ -8,6 +8,7 @@ import (
 
 	"go-data-sync-http/pkg/models"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // FilterEngine handles field-level and document-level filtering
@@ -92,17 +93,53 @@ func (fe *FilterEngine) buildDocumentFilterPipelineWithPrefix(filter *models.Doc
 
 	for _, criteria := range filter.Criteria {
 		fieldName := fieldPrefix + criteria.Field
+		
+		// AUTO-CONVERT: Convert string hex values to ObjectID for _id fields
+		// This allows using "_id": "6841829a5c25193219583f91" in JSON filters
+		convertedValue := criteria.Value
+		if criteria.Field == "_id" || strings.HasSuffix(criteria.Field, "._id") {
+			if strVal, ok := criteria.Value.(string); ok {
+				if oid, err := primitive.ObjectIDFromHex(strVal); err == nil {
+					convertedValue = oid
+				}
+			}
+		}
+		
 		switch strings.ToLower(criteria.Operator) {
 		case "eq":
-			matchConditions[fieldName] = criteria.Value
+			matchConditions[fieldName] = convertedValue
 		case "ne":
-			matchConditions[fieldName] = bson.M{"$ne": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$ne": convertedValue}
 		case "in":
 			// Validate that criteria.Value is a slice/array for $in operator
 			if reflect.TypeOf(criteria.Value).Kind() == reflect.Slice {
 				v := reflect.ValueOf(criteria.Value)
 				if v.Len() > 0 {
-					matchConditions[fieldName] = bson.M{"$in": criteria.Value}
+					// AUTO-CONVERT: Convert string hex values to ObjectIDs for _id fields in arrays
+					inValues := criteria.Value
+					if criteria.Field == "_id" || strings.HasSuffix(criteria.Field, "._id") {
+						if strSlice, ok := criteria.Value.([]interface{}); ok {
+							var oidSlice []primitive.ObjectID
+							allConverted := true
+							for _, item := range strSlice {
+								if strVal, ok := item.(string); ok {
+									if oid, err := primitive.ObjectIDFromHex(strVal); err == nil {
+										oidSlice = append(oidSlice, oid)
+									} else {
+										allConverted = false
+										break
+									}
+								} else {
+									allConverted = false
+									break
+								}
+							}
+							if allConverted && len(oidSlice) > 0 {
+								inValues = oidSlice
+							}
+						}
+					}
+					matchConditions[fieldName] = bson.M{"$in": inValues}
 				}
 				// If empty slice, skip this condition to avoid MongoDB error
 			}
@@ -111,23 +148,47 @@ func (fe *FilterEngine) buildDocumentFilterPipelineWithPrefix(filter *models.Doc
 			if reflect.TypeOf(criteria.Value).Kind() == reflect.Slice {
 				v := reflect.ValueOf(criteria.Value)
 				if v.Len() > 0 {
-					matchConditions[fieldName] = bson.M{"$nin": criteria.Value}
+					// AUTO-CONVERT: Convert string hex values to ObjectIDs for _id fields in arrays
+					ninValues := criteria.Value
+					if criteria.Field == "_id" || strings.HasSuffix(criteria.Field, "._id") {
+						if strSlice, ok := criteria.Value.([]interface{}); ok {
+							var oidSlice []primitive.ObjectID
+							allConverted := true
+							for _, item := range strSlice {
+								if strVal, ok := item.(string); ok {
+									if oid, err := primitive.ObjectIDFromHex(strVal); err == nil {
+										oidSlice = append(oidSlice, oid)
+									} else {
+										allConverted = false
+										break
+									}
+								} else {
+									allConverted = false
+									break
+								}
+							}
+							if allConverted && len(oidSlice) > 0 {
+								ninValues = oidSlice
+							}
+						}
+					}
+					matchConditions[fieldName] = bson.M{"$nin": ninValues}
 				}
 				// If empty slice, skip this condition to avoid MongoDB error
 			}
 		case "gt":
-			matchConditions[fieldName] = bson.M{"$gt": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$gt": convertedValue}
 		case "gte":
-			matchConditions[fieldName] = bson.M{"$gte": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$gte": convertedValue}
 		case "lt":
-			matchConditions[fieldName] = bson.M{"$lt": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$lt": convertedValue}
 		case "lte":
-			matchConditions[fieldName] = bson.M{"$lte": criteria.Value}
+			matchConditions[fieldName] = bson.M{"$lte": convertedValue}
 		case "regex":
 			matchConditions[fieldName] = bson.M{"$regex": criteria.Value}
 		default:
 			// Default to equality if operator is not recognized
-			matchConditions[fieldName] = criteria.Value
+			matchConditions[fieldName] = convertedValue
 		}
 	}
 

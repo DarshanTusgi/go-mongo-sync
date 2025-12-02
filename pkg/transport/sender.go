@@ -671,6 +671,7 @@ func (s *tcpSender) waitForWindow(state *streamState) error {
 // WaitForAcks waits for all pending batches to be acknowledged
 func (s *tcpSender) WaitForAcks(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	startTime := time.Now()
 
 	for time.Now().Before(deadline) {
 		allAcked := true
@@ -689,10 +690,31 @@ func (s *tcpSender) WaitForAcks(timeout time.Duration) error {
 		s.mu.RUnlock()
 
 		if allAcked {
+			log.Printf("✅ WAIT FOR ACKS: All batches acknowledged in %v", time.Since(startTime))
 			return nil
 		}
 
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	// ENHANCED DIAGNOSTICS: Log which streams still have pending batches
+	s.mu.RLock()
+	var pendingStreams []string
+	var totalPending int
+	for streamName, state := range s.streamStates {
+		state.mu.RLock()
+		pendingCount := len(state.pendingBatches)
+		if pendingCount > 0 {
+			pendingStreams = append(pendingStreams, fmt.Sprintf("%s(%d)", streamName, pendingCount))
+			totalPending += pendingCount
+		}
+		state.mu.RUnlock()
+	}
+	s.mu.RUnlock()
+
+	if len(pendingStreams) > 0 {
+		log.Printf("❌ ACK TIMEOUT DIAGNOSTICS: %d streams with %d pending batches after %v: %v",
+			len(pendingStreams), totalPending, timeout, pendingStreams)
 	}
 
 	return fmt.Errorf("timeout waiting for acknowledgments")
