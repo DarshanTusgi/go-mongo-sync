@@ -3899,7 +3899,16 @@ func sendMetadataTCP(ctx context.Context, database, collection string) error {
 	} else {
 		log.Printf("🔍 CLOUD METADATA: Collected %d indexes for %s.%s", len(indexes), database, collection)
 		for i, idx := range indexes {
-			log.Printf("🔍 CLOUD INDEX %d: name=%s, unique=%v, keys=%v", i, idx.Name, idx.Unique, string(idx.Keys))
+			log.Printf("🔍 CLOUD INDEX %d: name=%s, unique=%v, sparse=%v, keys=%v", i, idx.Name, idx.Unique, idx.Sparse, string(idx.Keys))
+			if idx.TTL != nil {
+				log.Printf("  ⏱️  TTL: %d seconds", *idx.TTL)
+			}
+			if len(idx.PartialFilterExpression) > 0 {
+				log.Printf("  🎯 PARTIAL FILTER: %s", string(idx.PartialFilterExpression))
+			}
+			if len(idx.Collation) > 0 {
+				log.Printf("  🌐 COLLATION: %s", string(idx.Collation))
+			}
 		}
 	}
 

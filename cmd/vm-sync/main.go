@@ -662,6 +662,54 @@ func handleTCPMetadata(database, collection string, documents [][]byte) error {
 				}
 			}
 
+			// Extract sparse
+			if sparseRaw, ok := idxMap["sparse"]; ok {
+				if sparse, ok := sparseRaw.(bool); ok {
+					options.SetSparse(sparse)
+					log.Printf("🔍 VM INDEX %d: Found sparse: %v", i, sparse)
+				}
+			}
+
+			// Extract TTL (expireAfterSeconds)
+			if ttlRaw, ok := idxMap["expireAfterSeconds"]; ok {
+				if ttl, ok := ttlRaw.(int32); ok {
+					options.SetExpireAfterSeconds(ttl)
+					log.Printf("🔍 VM INDEX %d: Found TTL: %d seconds", i, ttl)
+				} else if ttl64, ok := ttlRaw.(int64); ok {
+					options.SetExpireAfterSeconds(int32(ttl64))
+					log.Printf("🔍 VM INDEX %d: Found TTL: %d seconds", i, ttl64)
+				}
+			}
+
+			// Extract partial filter expression (CRITICAL FIX)
+			if partialFilterRaw, ok := idxMap["partialFilterExpression"]; ok {
+				if partialFilterMap, ok := partialFilterRaw.(map[string]interface{}); ok {
+					options.SetPartialFilterExpression(partialFilterMap)
+					log.Printf("🔍 VM INDEX %d: Found partialFilterExpression: %v", i, partialFilterMap)
+				} else if partialFilterBson, ok := partialFilterRaw.(bson.M); ok {
+					options.SetPartialFilterExpression(partialFilterBson)
+					log.Printf("🔍 VM INDEX %d: Found partialFilterExpression (bson.M): %v", i, partialFilterBson)
+				} else if partialFilterDoc, ok := partialFilterRaw.(bson.D); ok {
+					// Convert bson.D to bson.M for SetPartialFilterExpression
+					partialFilterM := bson.M{}
+					for _, elem := range partialFilterDoc {
+						partialFilterM[elem.Key] = elem.Value
+					}
+					options.SetPartialFilterExpression(partialFilterM)
+					log.Printf("🔍 VM INDEX %d: Found partialFilterExpression (bson.D): %v", i, partialFilterM)
+				} else {
+					log.Printf("⚠️ VM INDEX %d: partialFilterExpression has unexpected type: %T", i, partialFilterRaw)
+				}
+			}
+
+			// Extract collation
+			// Note: Collation handling is complex due to type conversions
+			// For now, skip collation in TCP metadata flow (works fine in HTTP flow via recreateIndexes)
+			if collationRaw, ok := idxMap["collation"]; ok {
+				log.Printf("⚠️ VM INDEX %d: Collation found but skipped in TCP flow (type: %T)", i, collationRaw)
+				// TODO: Implement collation extraction if needed
+			}
+
 			// Skip default _id_ index
 			if indexName == "_id_" {
 				log.Printf("⏭️ VM INDEX %d: Skipping default _id_ index", i)
