@@ -2304,8 +2304,8 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 var incrementalSyncHTTPClient = &http.Client{
 	Timeout: 60 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        100,             // Connection pool
-		MaxIdleConnsPerHost: 10,              // Reuse connections to same host
+		MaxIdleConns:        100,              // Connection pool
+		MaxIdleConnsPerHost: 10,               // Reuse connections to same host
 		IdleConnTimeout:     90 * time.Second, // Keep connections alive
 		DisableKeepAlives:   false,            // Enable HTTP keepalive
 		DisableCompression:  false,            // Enable compression
@@ -2320,6 +2320,7 @@ var incrementalSyncHTTPClient = &http.Client{
 		ExpectContinueTimeout: 1 * time.Second,
 	},
 }
+
 // sendIncrementalChangesViaHTTPWithRetry sends incremental changes with retry mechanism (FIX GAP #2)
 func sendIncrementalChangesViaHTTPWithRetry(database, collection string, documents [][]byte) error {
 	const maxRetries = 5
@@ -2452,6 +2453,55 @@ func startSyncProcess() {
 	}
 
 	log.Printf("📊 Total collections to sync: %d", totalCollections)
+
+	// ✅ PHASE 1: Send ALL metadata FIRST via TCP (indexes, options) for ALL collections
+	// This ensures indexes are created BEFORE data arrives, optimizing insert performance
+	// IMPORTANT: Only send metadata if TCP transport is enabled
+	if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled {
+		log.Printf("🎯 PHASE 1: Sending metadata (indexes) via TCP for ALL %d collections...", totalCollections)
+		metadataStartTime := time.Now()
+		metadataCount := 0
+		metadataErrors := 0
+
+		for _, dbConfig := range config.MongoDB.Databases {
+			if !dbConfig.Enabled {
+				continue
+			}
+
+			for _, collConfig := range dbConfig.Collections {
+				if !collConfig.Enabled {
+					continue
+				}
+
+				metadataCount++
+				dbName := dbConfig.Name
+				collName := collConfig.Name
+
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+
+				// Send metadata via TCP (no ACK wait needed)
+				if err := sendMetadataTCP(ctx, dbName, collName); err != nil {
+					log.Printf("⚠️  [%d/%d] Failed to send metadata for %s.%s: %v", metadataCount, totalCollections, dbName, collName, err)
+					metadataErrors++
+				} else {
+					log.Printf("✅ [%d/%d] Metadata sent via TCP for %s.%s", metadataCount, totalCollections, dbName, collName)
+				}
+
+				cancel()
+			}
+		}
+
+		metadataDuration := time.Since(metadataStartTime)
+		if metadataErrors == 0 {
+			log.Printf("✅ PHASE 1 COMPLETE: All %d metadata batches sent via TCP in %v", metadataCount, metadataDuration)
+		} else {
+			log.Printf("⚠️  PHASE 1 COMPLETE: %d/%d metadata batches sent (%d errors) in %v", metadataCount-metadataErrors, metadataCount, metadataErrors, metadataDuration)
+		}
+	} else {
+		log.Printf("⏭️  PHASE 1 SKIPPED: TCP transport not enabled, metadata will be sent with page 1 data via HTTP")
+	}
+
+	log.Printf("🎯 PHASE 2: Starting data transfer for ALL %d collections...", totalCollections)
 
 	// Initialize automatic sync progress tracking
 	now := time.Now()
@@ -3382,8 +3432,8 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 		docBytes := make([]byte, len(cursor.Current))
 		copy(docBytes, cursor.Current)
 
-		// SPECIAL HANDLING: Transform URLs in servicedirectory collection
-		if collection == "servicedirectory" && tenantDNS != "" {
+		// SPECIAL HANDLING: Transform URLs in servicecomponents collection
+		if collection == "servicecomponents" && tenantDNS != "" {
 			var doc bson.M
 			if err := bson.Unmarshal(docBytes, &doc); err == nil {
 				if urlStr, ok := doc["url"].(string); ok && urlStr != "" {
@@ -3497,14 +3547,9 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 		log.Printf("⚠️  TCP SKIP: %s.%s page %d - No documents to transfer", database, collection, pageNumber)
 	}
 
-	// Handle metadata on first page (indexes, collection options, etc.)
-	if pageNumber == 1 {
-		log.Printf("📊 TCP METADATA: Sending collection metadata for %s.%s", database, collection)
-		if err := sendMetadataTCP(ctx, database, collection); err != nil {
-			log.Printf("Warning: Failed to send metadata via TCP for %s.%s: %v", database, collection, err)
-			// Metadata failure is not critical, continue
-		}
-	}
+	// ✅ METADATA OPTIMIZATION: Metadata is now sent BEFORE data transfer in Phase 1
+	// No need to send metadata on page 1 anymore - this eliminates ACK dependency issues
+	// Indexes are already created when data arrives, optimizing insert performance
 
 	return nil
 }
@@ -3803,7 +3848,7 @@ func pushSinglePageHTTP(ctx context.Context, vmSyncEndpoint, database, collectio
 		docBytes := cursor.Current
 
 		// SPECIAL HANDLING: Transform URLs in servicedirectory collection
-		if collection == "servicedirectory" && tenantDNS != "" {
+		if collection == "servicecomponents" && tenantDNS != "" {
 			var doc bson.M
 			if err := bson.Unmarshal(docBytes, &doc); err == nil {
 				if urlStr, ok := doc["url"].(string); ok && urlStr != "" {
@@ -3899,16 +3944,7 @@ func sendMetadataTCP(ctx context.Context, database, collection string) error {
 	} else {
 		log.Printf("🔍 CLOUD METADATA: Collected %d indexes for %s.%s", len(indexes), database, collection)
 		for i, idx := range indexes {
-			log.Printf("🔍 CLOUD INDEX %d: name=%s, unique=%v, sparse=%v, keys=%v", i, idx.Name, idx.Unique, idx.Sparse, string(idx.Keys))
-			if idx.TTL != nil {
-				log.Printf("  ⏱️  TTL: %d seconds", *idx.TTL)
-			}
-			if len(idx.PartialFilterExpression) > 0 {
-				log.Printf("  🎯 PARTIAL FILTER: %s", string(idx.PartialFilterExpression))
-			}
-			if len(idx.Collation) > 0 {
-				log.Printf("  🌐 COLLATION: %s", string(idx.Collation))
-			}
+			log.Printf("🔍 CLOUD INDEX %d: name=%s, unique=%v, keys=%v", i, idx.Name, idx.Unique, string(idx.Keys))
 		}
 	}
 
