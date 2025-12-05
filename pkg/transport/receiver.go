@@ -17,6 +17,7 @@ import (
 )
 
 // tcpReceiver implements the Receiver interface using TCP connections
+// KAFKA-STYLE ARCHITECTURE: Fast ACK + Buffered Queue + Async MongoDB Writer
 type tcpReceiver struct {
 	config       ReceiverConfig
 	listener     net.Listener
@@ -27,6 +28,11 @@ type tcpReceiver struct {
 	compressors  map[int]Compressor
 	stats        receiverStats
 	checkpoints  map[string]uint64
+	
+	// KAFKA-STYLE: Buffered queue for decoupling TCP from MongoDB
+	batchQueue   *BufferedBatchQueue
+	workerCount  int
+	
 	mu           sync.RWMutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -78,12 +84,37 @@ func newTCPReceiver(config ReceiverConfig) (*tcpReceiver, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// KAFKA-STYLE: Create buffered queue (100K batches default)
+	bufferCapacity := 100000
+	if config.BufferSize > 0 {
+		// Use BufferSize as batch count hint (not bytes)
+		bufferCapacity = config.BufferSize / 1000 // Assume ~1KB per batch
+		if bufferCapacity < 10000 {
+			bufferCapacity = 10000 // Minimum 10K batches
+		}
+	}
+	batchQueue := NewBufferedBatchQueue(bufferCapacity)
+	
+	// KAFKA-STYLE: Determine worker count for async processing
+	workerCount := 4 // Default: 4 MongoDB writer workers
+	if config.MaxConnections > 0 {
+		workerCount = config.MaxConnections / 5 // Scale with connections
+		if workerCount < 2 {
+			workerCount = 2
+		}
+		if workerCount > 16 {
+			workerCount = 16 // Cap at 16 workers
+		}
+	}
+
 	receiver := &tcpReceiver{
 		config:       config,
 		connections:  make(map[string]*receiverConnection),
 		streamStates: make(map[uint64]*receiverStreamState),
 		compressors:  compressors,
 		checkpoints:  make(map[string]uint64),
+		batchQueue:   batchQueue,
+		workerCount:  workerCount,
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -135,8 +166,14 @@ func (r *tcpReceiver) Start() error {
 	// Start heartbeat goroutine
 	r.wg.Add(1)
 	go r.heartbeatLoop()
+	
+	// KAFKA-STYLE: Start MongoDB writer workers (async batch processing)
+	for i := 0; i < r.workerCount; i++ {
+		r.wg.Add(1)
+		go r.batchWorker(i)
+	}
 
-	log.Printf("🚀 TCP RECEIVER STARTED: acceptLoop and heartbeat running")
+	log.Printf("🚀 TCP RECEIVER STARTED: acceptLoop, heartbeat, and %d MongoDB workers running", r.workerCount)
 	return nil
 }
 
@@ -164,6 +201,12 @@ func (r *tcpReceiver) Stop() error {
 
 	// Wait for goroutines to finish
 	r.wg.Wait()
+	
+	// KAFKA-STYLE: Close buffer queue
+	if r.batchQueue != nil {
+		log.Printf("📦 CLOSING BUFFER QUEUE: %d batches remaining", r.batchQueue.Size())
+		r.batchQueue.Close()
+	}
 
 	// Save checkpoints if disk-based checkpointing is enabled
 	if r.config.DiskCheckpoint {
@@ -285,6 +328,53 @@ func (r *tcpReceiver) sendHeartbeats() {
 	for _, conn := range connections {
 		conn.conn.SetWriteDeadline(time.Now().Add(r.config.WriteTimeout))
 		conn.conn.Write(data)
+	}
+}
+
+// batchWorker processes batches from the queue and writes to MongoDB
+// KAFKA-STYLE: Async worker that decouples TCP from database writes
+func (r *tcpReceiver) batchWorker(workerID int) {
+	defer r.wg.Done()
+	log.Printf("👷 BATCH WORKER %d: Started", workerID)
+	
+	for {
+		select {
+		case <-r.ctx.Done():
+			log.Printf("📋 BATCH WORKER %d: Shutting down", workerID)
+			return
+		default:
+			// Dequeue batch with timeout
+			item, err := r.batchQueue.Dequeue(1 * time.Second)
+			if err != nil {
+				// Timeout or empty queue, retry
+				continue
+			}
+			
+			// Process batch (call MongoDB handler)
+			if r.batchHandler != nil {
+				queueLatency := time.Since(item.ReceivedAt)
+				log.Printf("👷 WORKER %d PROCESSING: stream=%s seq=%d docs=%d latency=%v", 
+					workerID, item.StreamName, item.BatchSeq, len(item.Documents), queueLatency)
+				
+				processStart := time.Now()
+				if err := r.batchHandler(item.StreamName, item.BatchSeq, item.Documents); err != nil {
+					// MongoDB write failed - log error (batch already ACKed to sender)
+					log.Printf("🔴 WORKER %d FAILED: stream=%s seq=%d error=%v", 
+						workerID, item.StreamName, item.BatchSeq, err)
+					r.handleError(fmt.Errorf("worker %d: batch handler error for stream %s seq %d: %w", 
+						workerID, item.StreamName, item.BatchSeq, err))
+					r.stats.errorCount.Add(1)
+					// Continue processing (don't stop worker)
+				} else {
+					processTime := time.Since(processStart)
+					log.Printf("✅ WORKER %d SUCCESS: stream=%s seq=%d docs=%d time=%v", 
+						workerID, item.StreamName, item.BatchSeq, len(item.Documents), processTime)
+					
+					// Update checkpoint after successful write
+					r.SetCheckpoint(item.StreamName, item.BatchSeq)
+				}
+			}
+		}
 	}
 }
 
@@ -575,27 +665,31 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 	rc.receiver.stats.batchesReceived.Add(1)
 	rc.receiver.stats.documentsReceived.Add(uint64(len(docs)))
 
-	// CRITICAL FIX: Call batch handler and handle errors properly
-	if rc.receiver.batchHandler != nil {
-		log.Printf("🔎 CALLING BATCH HANDLER: stream=%s seq=%d docs=%d", actualStreamName, frame.Header.BatchSeq, len(docs))
-		if err := rc.receiver.batchHandler(actualStreamName, frame.Header.BatchSeq, docs); err != nil {
-			// CRITICAL BUG FIX: Log the error and DO NOT send ACK
-			log.Printf("🔴 BATCH HANDLER FAILED: stream=%s seq=%d error=%v", actualStreamName, frame.Header.BatchSeq, err)
-			rc.receiver.handleError(fmt.Errorf("batch handler error for stream %s seq %d: %w", actualStreamName, frame.Header.BatchSeq, err))
-			rc.receiver.stats.errorCount.Add(1)
-			// DO NOT send ACK - sender will retry
-			return
-		}
-		log.Printf("✅ BATCH HANDLER SUCCESS: stream=%s seq=%d docs=%d", actualStreamName, frame.Header.BatchSeq, len(docs))
-	} else {
-		log.Printf("⚠️ NO BATCH HANDLER: stream=%s seq=%d (handler not registered)", actualStreamName, frame.Header.BatchSeq)
+	// KAFKA-STYLE: Enqueue batch to buffer (fast, non-blocking)
+	queueItem := &BatchQueueItem{
+		StreamName: actualStreamName,
+		BatchSeq:   frame.Header.BatchSeq,
+		Documents:  docs,
+		ReceivedAt: time.Now(),
 	}
+	
+	enqueueStart := time.Now()
+	if err := rc.receiver.batchQueue.Enqueue(queueItem, 5*time.Second); err != nil {
+		// Buffer full or timeout - this is a critical error
+		log.Printf("🔴 ENQUEUE FAILED: stream=%s seq=%d error=%v", actualStreamName, frame.Header.BatchSeq, err)
+		rc.receiver.handleError(fmt.Errorf("failed to enqueue batch for stream %s seq %d: %w", actualStreamName, frame.Header.BatchSeq, err))
+		rc.receiver.stats.errorCount.Add(1)
+		// DO NOT send ACK - sender will retry
+		return
+	}
+	enqueueTime := time.Since(enqueueStart)
+	log.Printf("📦 ENQUEUED: stream=%s seq=%d docs=%d time=%v buffer_usage=%.1f%%", 
+		actualStreamName, frame.Header.BatchSeq, len(docs), enqueueTime, rc.receiver.batchQueue.Usage()*100)
 
-	// Update checkpoint with actual stream name
-	rc.receiver.SetCheckpoint(actualStreamName, frame.Header.BatchSeq)
-
-	// Send ACK only after successful processing
-	log.Printf("📤 SENDING ACK: stream=%s StreamID=%d BatchSeq=%d", actualStreamName, frame.Header.StreamID, frame.Header.BatchSeq)
+	// KAFKA-STYLE: Send FAST ACK immediately after successful enqueue (not after MongoDB write)
+	// This decouples TCP layer from database performance
+	log.Printf("📤 FAST ACK: stream=%s StreamID=%d BatchSeq=%d (queued, not yet written to DB)", 
+		actualStreamName, frame.Header.StreamID, frame.Header.BatchSeq)
 	rc.sendAck(frame.Header.StreamID, frame.Header.BatchSeq)
 }
 
