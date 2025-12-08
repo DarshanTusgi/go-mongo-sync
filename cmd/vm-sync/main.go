@@ -357,6 +357,11 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 	// Check if this is an incremental stream
 	isIncremental := len(parts) > 2 && parts[2] == "incremental"
 
+	if isIncremental {
+		log.Printf("🔄 TCP INCREMENTAL DETECTED: stream=%s, database=%s, collection=%s, documents=%d", stream, targetDatabase, targetCollection, len(documents))
+		log.Printf("📋 TCP INCREMENTAL MODE: Will use UPSERT for insert/update, DELETE for removals (CRUD supported)")
+	}
+
 	// OPTIMIZED: Convert BSON documents with streaming to prevent memory spikes
 	bsonDocuments := make([]bson.Raw, 0, len(documents))
 	for i, docBytes := range documents {
@@ -2237,9 +2242,9 @@ func connectWebSocket() error {
 	}
 
 	headers.Set("X-VM-Sync-Domain", vmSyncDomain)
-	headers.Set("X-VM-Sync-TCP-Port", "9000")
-	headers.Set("X-VM-Sync-HTTP-Port", "8081")
-	log.Printf("📡 SELF-DISCOVERY: Sending domain info to cloud-sync: %s (TCP:9000, HTTP:8081)", vmSyncDomain)
+	headers.Set("X-VM-Sync-TCP-Port", fmt.Sprintf("%d", 9000)) // TCP port
+	headers.Set("X-VM-Sync-HTTP-Port", fmt.Sprintf("%d", config.Server.Port)) // FIX: Use configured port
+	log.Printf("📡 SELF-DISCOVERY: Sending domain info to cloud-sync: %s (TCP:9000, HTTP:%d)", vmSyncDomain, config.Server.Port)
 
 	log.Printf("Connecting to WebSocket: %s", u.String())
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), headers)

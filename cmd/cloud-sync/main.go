@@ -2354,17 +2354,42 @@ func sendIncrementalChangesViaHTTPWithRetry(database, collection string, documen
 	return fmt.Errorf("failed after %d retry attempts: %w", maxRetries, lastErr)
 }
 
-// sendIncrementalChangesViaHTTP sends incremental changes using HTTP protocol
+// sendIncrementalChangesViaHTTP sends incremental changes using TCP or HTTP protocol
+// NOTE: Despite the function name, this now uses TCP primarily with HTTP fallback
 func sendIncrementalChangesViaHTTP(database, collection string, documents [][]byte) error {
 	if len(documents) == 0 {
 		return nil
 	}
 
-	// Get vm-sync endpoint
-	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
-	if vmSyncEndpoint == "" {
-		vmSyncEndpoint = "http://localhost:8081"
+	// REQUIREMENT 2: Ensure initial dump is complete before sending incremental changes
+	// This prevents data duplication and ensures proper sequencing
+	if !initialDumpCompletedOnce {
+		log.Printf("⚠️  INCREMENTAL SYNC BLOCKED: Initial dump not yet completed for %s.%s - Skipping incremental changes", database, collection)
+		return fmt.Errorf("initial dump not completed yet")
 	}
+
+	// REQUIREMENT 1: Try TCP first for CRUD operations (insert/update/delete via upsert)
+	// REQUIREMENT 3: Self-recovering via TCP reconnection (handled by transport layer)
+	if tcpTransportEnabled && tcpSender != nil {
+		// Use TCP for incremental sync (better performance, reuses connection)
+		streamName := fmt.Sprintf("%s.%s.incremental", database, collection)
+		
+		log.Printf("🚀 TCP INCREMENTAL: Sending %d documents for %s via TCP", len(documents), streamName)
+		
+		if err := tcpSender.SendBatch(streamName, documents); err != nil {
+			log.Printf("⚠️  TCP INCREMENTAL FAILED: %v - Falling back to HTTP", err)
+			// Fall through to HTTP fallback
+		} else {
+			log.Printf("✅ TCP INCREMENTAL SUCCESS: Sent %d documents for %s.%s", len(documents), database, collection)
+			return nil
+		}
+	}
+
+	// HTTP FALLBACK: Use HTTP if TCP not available or failed
+	log.Printf("🌐 HTTP FALLBACK: Using HTTP for incremental sync %s.%s", database, collection)
+	
+	// Get vm-sync HTTP endpoint (uses dynamically discovered endpoint from VM auth)
+	vmSyncEndpoint := getVMSyncHTTPEndpoint()
 
 	// CRITICAL FIX: Apply database name transformation for VM-sync routing
 	// This ensures incremental sync uses the same target database as initial dump
@@ -2431,11 +2456,8 @@ func startCatchUpSync() {
 
 // startSyncProcess contains the common sync logic used by both initial and catch-up sync
 func startSyncProcess() {
-	// Get vm-sync endpoint from environment or use default
-	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
-	if vmSyncEndpoint == "" {
-		vmSyncEndpoint = "http://localhost:8081" // Default vm-sync endpoint
-	}
+	// Get vm-sync HTTP endpoint (uses dynamically discovered endpoint from VM auth)
+	vmSyncEndpoint := getVMSyncHTTPEndpoint()
 
 	log.Printf("📊 INITIATING BULK DATA TRANSFER to vm-sync at: %s", vmSyncEndpoint)
 
@@ -3259,24 +3281,9 @@ func pushIncrementalPageTCP(ctx context.Context, cursor *mongo.Cursor, database,
 			return 0, fmt.Errorf("TCP transport failed (primary mode, no fallback): %v", err)
 		}
 
-		// CRITICAL FIX: Wait for ACK from VM-sync before marking as success (incremental sync)
-		// Use configurable timeout with intelligent defaults (same as initial dump)
-		ackTimeout := config.Sync.Transport.TCPSender.AckTimeout
-		if ackTimeout == 0 {
-			// Smart default: 90s for production (handles most geo-distributed scenarios)
-			ackTimeout = 90 * time.Second
-		}
-		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: %v)", database, collection, pageNumber+1, ackTimeout)
-		ackWaitStart := time.Now()
-		if err := tcpSender.WaitForAcks(ackTimeout); err != nil {
-			log.Printf("❌ ACK TIMEOUT: %s.%s page %d - VM-sync did not acknowledge: %v", database, collection, pageNumber+1, err)
-			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {
-				return 0, fmt.Errorf("TCP transport failed and cursor cannot be rewound for HTTP fallback: %v", err)
-			}
-			return 0, fmt.Errorf("TCP ACK timeout (VM-sync unreachable, data not delivered): %w", err)
-		}
-		ackWaitTime := time.Since(ackWaitStart)
-		log.Printf("✅ ACK RECEIVED: %s.%s page %d in %v", database, collection, pageNumber+1, ackWaitTime)
+		// FIRE-AND-FORGET: No ACK wait - send and continue immediately
+		// VM-sync will process via Kafka-style queue, but we don't wait for confirmation
+		log.Printf("🚀 FIRE-AND-FORGET: %s.%s page %d - Data sent, continuing without ACK wait", database, collection, pageNumber+1)
 
 		// Calculate incremental TCP metrics
 		tcpSendTime := time.Since(tcpSendStart)
@@ -3502,31 +3509,9 @@ func pushSinglePageTCP(ctx context.Context, database, collection string, pageNum
 			return fmt.Errorf("TCP transport failed (primary mode, no fallback): %v", err)
 		}
 
-		// CRITICAL FIX: Wait for ACK from VM-sync before marking as success
-		// This prevents false "transferred" counts when VM-sync is unreachable
-		// Use configurable timeout with intelligent defaults:
-		// - Same region/datacenter: 30s (default)
-		// - Geo-distributed (cross-continent): 120s recommended
-		// - High-latency networks: 180s
-		ackTimeout := config.Sync.Transport.TCPSender.AckTimeout
-		if ackTimeout == 0 {
-			// Smart default: 90s for production (handles most geo-distributed scenarios)
-			ackTimeout = 90 * time.Second
-		}
-		log.Printf("⏳ WAITING FOR ACK: %s.%s page %d (timeout: %v)", database, collection, pageNumber, ackTimeout)
-		ackWaitStart := time.Now()
-		if err := tcpSender.WaitForAcks(ackTimeout); err != nil {
-			log.Printf("❌ ACK TIMEOUT: %s.%s page %d - VM-sync did not acknowledge: %v", database, collection, pageNumber, err)
-			// Only fall back to HTTP if TCP is NOT the primary mode and HTTP fallback is enabled
-			if config.Sync.Transport.Mode != "tcp" && config.Sync.Transport.HTTPFallback {
-				log.Printf("🔄 ACK FAILED -> HTTP FALLBACK: %s.%s page %d", database, collection, pageNumber)
-				return pushSinglePageHTTP(ctx, getVMSyncHTTPEndpoint(), database, collection, pageNumber, pageSize, totalPages)
-			}
-			// TCP is primary mode - return error (data was NOT received by VM-sync)
-			return fmt.Errorf("TCP ACK timeout (VM-sync unreachable, data not delivered): %w", err)
-		}
-		ackWaitTime := time.Since(ackWaitStart)
-		log.Printf("✅ ACK RECEIVED: %s.%s page %d in %v", database, collection, pageNumber, ackWaitTime)
+		// FIRE-AND-FORGET: No ACK wait - send and continue immediately
+		// VM-sync will process via Kafka-style queue, but we don't wait for confirmation
+		log.Printf("🚀 FIRE-AND-FORGET: %s.%s page %d - Data sent, continuing without ACK wait", database, collection, pageNumber)
 
 		// Calculate TCP transfer metrics
 		tcpSendTime := time.Since(tcpSendStart)
@@ -3997,6 +3982,11 @@ func getVMSyncHTTPEndpoint() string {
 	addressMgr := transport.GetAddressManager()
 	httpEndpoint, err := addressMgr.GetAnyHTTPAddress()
 	if err == nil && httpEndpoint != "" {
+		// FIX: Ensure http:// prefix exists
+		if !strings.HasPrefix(httpEndpoint, "http://") && !strings.HasPrefix(httpEndpoint, "https://") {
+			httpEndpoint = "http://" + httpEndpoint
+			log.Printf("🔧 HTTP ENDPOINT: Added http:// prefix to endpoint: %s", httpEndpoint)
+		}
 		log.Printf("🎯 HTTP ENDPOINT: Using dynamically discovered endpoint: %s", httpEndpoint)
 		return httpEndpoint
 	}
@@ -4430,10 +4420,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 
 			tcpEndpoint := fmt.Sprintf("%s:%s", vmSyncDomain, tcpPort)
-			httpEndpoint := fmt.Sprintf("%s:%s", vmSyncDomain, httpPort)
+			httpEndpoint := fmt.Sprintf("http://%s:%s", vmSyncDomain, httpPort) // FIX: Add http:// prefix
 			endpoints := map[string]string{
 				"tcp":  tcpEndpoint,  // Properly discovered TCP endpoint
-				"http": httpEndpoint, // Properly discovered HTTP endpoint
+				"http": httpEndpoint, // Properly discovered HTTP endpoint with http:// prefix
 			}
 
 			// Store both TCP and HTTP addresses in Address Manager for global access
@@ -7193,11 +7183,8 @@ func handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 
 // performManualSync performs the actual sync work for manual trigger
 func performManualSync(req TriggerSyncRequest) error {
-	// Get vm-sync endpoint
-	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
-	if vmSyncEndpoint == "" {
-		vmSyncEndpoint = "http://localhost:8081"
-	}
+	// Get vm-sync HTTP endpoint (uses dynamically discovered endpoint from VM auth)
+	vmSyncEndpoint := getVMSyncHTTPEndpoint()
 
 	// NEW: Set force initial sync flag if requested
 	if req.ForceInitialSync {
@@ -8160,11 +8147,8 @@ func handleInitialSync(w http.ResponseWriter, r *http.Request) {
 	// Trigger CLOUD-SYNC to push data (force initial sync mode)
 	log.Printf("🚀 INITIAL SYNC API: Triggering cloud-sync to PUSH data to vm-sync")
 
-	// Get vm-sync endpoint for clearing collections
-	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
-	if vmSyncEndpoint == "" {
-		vmSyncEndpoint = "http://localhost:8081"
-	}
+	// Get vm-sync HTTP endpoint for clearing collections (uses dynamically discovered endpoint)
+	vmSyncEndpoint := getVMSyncHTTPEndpoint()
 
 	// CRITICAL: If force mode, clear ALL vm-sync collections BEFORE pushing
 	if req.Force {
