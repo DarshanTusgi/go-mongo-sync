@@ -3991,10 +3991,23 @@ func sendMetadataTCP(ctx context.Context, database, collection string) error {
 }
 
 // getVMSyncHTTPEndpoint returns the HTTP endpoint for vm-sync fallback
+// Uses dynamically discovered endpoint from VM auth, falls back to env var
 func getVMSyncHTTPEndpoint() string {
+	// Try to get HTTP endpoint from Address Manager (dynamically discovered during auth)
+	addressMgr := transport.GetAddressManager()
+	httpEndpoint, err := addressMgr.GetAnyHTTPAddress()
+	if err == nil && httpEndpoint != "" {
+		log.Printf("🎯 HTTP ENDPOINT: Using dynamically discovered endpoint: %s", httpEndpoint)
+		return httpEndpoint
+	}
+
+	// Fallback to environment variable (legacy compatibility)
 	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
 	if vmSyncEndpoint == "" {
 		vmSyncEndpoint = "http://localhost:8081" // Default vm-sync endpoint
+		log.Printf("⚠️  HTTP ENDPOINT: Using localhost fallback: %s (no VM discovered)", vmSyncEndpoint)
+	} else {
+		log.Printf("🔧 HTTP ENDPOINT: Using environment variable: %s", vmSyncEndpoint)
 	}
 	return vmSyncEndpoint
 }
@@ -4417,15 +4430,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 
 			tcpEndpoint := fmt.Sprintf("%s:%s", vmSyncDomain, tcpPort)
+			httpEndpoint := fmt.Sprintf("%s:%s", vmSyncDomain, httpPort)
 			endpoints := map[string]string{
-				"tcp":  tcpEndpoint,                                  // Properly discovered TCP endpoint
-				"http": fmt.Sprintf("%s:%s", vmSyncDomain, httpPort), // Properly discovered HTTP endpoint
+				"tcp":  tcpEndpoint,  // Properly discovered TCP endpoint
+				"http": httpEndpoint, // Properly discovered HTTP endpoint
 			}
 
-			// Store TCP address in Address Manager for global access
+			// Store both TCP and HTTP addresses in Address Manager for global access
 			addressMgr := transport.GetAddressManager()
-			addressMgr.SetAddress(clientInfo.ClientID, tcpEndpoint)
-			log.Printf("✅ TCP ADDRESS STORED: %s -> %s", clientInfo.ClientID, tcpEndpoint)
+			addressMgr.SetEndpoints(clientInfo.ClientID, tcpEndpoint, httpEndpoint)
+			log.Printf("✅ ENDPOINTS STORED: %s -> TCP:%s, HTTP:%s", clientInfo.ClientID, tcpEndpoint, httpEndpoint)
 
 			// Initialize TCP transport with the detected address if it's not already enabled
 			log.Printf("🔍 TCP STATUS CHECK: tcpTransportEnabled=%v, tcpSender=%v", tcpTransportEnabled, tcpSender != nil)
