@@ -333,6 +333,7 @@ func testTCPConnection(address string) error {
 }
 
 // startTCPHealthMonitor monitors TCP transport health and attempts reconnection
+// AUTO-RECONNECTION: Works during AND after initial dump (incremental sync phase)
 func startTCPHealthMonitor() {
 	// Use configured interval or default to 30 seconds
 	interval := config.Sync.Transport.HealthMonitor
@@ -343,64 +344,82 @@ func startTCPHealthMonitor() {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("🐆 TCP HEALTH MONITOR: Started (check interval: %v)", interval)
+	log.Printf("🐆 TCP HEALTH MONITOR: Started (check interval: %v, auto-reconnect enabled)", interval)
 
 	for {
 		select {
 		case <-ticker.C:
-			// FIX PROBLEM #2: Only monitor TCP if we're NOT in incremental sync phase
-			// During incremental sync, HTTP is used (TCP port closed is NORMAL)
-			initialDumpMutex.RLock()
-			dumpCompleted := initialDumpCompletedOnce
-			initialDumpMutex.RUnlock()
+			// Skip health check if TCP mode is not configured
+			if config.Sync.Transport.Mode != "tcp" {
+				continue
+			}
 
-			// Only try to reconnect if TCP is configured as primary but not currently enabled
-			// AND we haven't completed initial dump yet (still need TCP)
-			if config.Sync.Transport.Mode == "tcp" && !tcpTransportEnabled && !dumpCompleted {
-				log.Printf("🔍 TCP HEALTH CHECK: Attempting to reconnect to %s (initial dump phase)", config.Sync.Transport.TCPSender.Address)
+			// CASE 1: TCP is configured but not currently enabled -> Try to reconnect
+			if !tcpTransportEnabled {
+				log.Printf("🔍 TCP HEALTH CHECK: TCP not enabled, attempting auto-reconnect...")
 
-				if err := testTCPConnection(config.Sync.Transport.TCPSender.Address); err == nil {
-					log.Printf("✨ TCP AVAILABLE: VM-sync detected! Reinitializing TCP transport...")
-
-					// Attempt to reinitialize TCP transport
-					if err := initializeTCPTransport(); err != nil {
-						log.Printf("❌ TCP REINIT FAILED: %v", err)
-					} else {
-						log.Printf("✅ TCP RECONNECTED: TCP transport reinitialized successfully!")
-						log.Printf("🚀 TCP TRANSPORT RESTORED: Ready for high-performance data transfer")
-					}
+				// Try to get fresh address from Address Manager (in case vm-sync restarted)
+				addressMgr := transport.GetAddressManager()
+				address, err := addressMgr.GetAnyAddress()
+				if err != nil {
+					// No address in Address Manager, use config address
+					address = config.Sync.Transport.TCPSender.Address
+					log.Printf("📋 TCP RECONNECT: Using config address: %s", address)
 				} else {
-					log.Printf("🔶 TCP UNAVAILABLE: VM-sync still not reachable (%v)", err)
+					log.Printf("✅ TCP RECONNECT: Using Address Manager address: %s", address)
 				}
-			} else if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled && !dumpCompleted {
-				// TCP is working fine during initial dump, reduce monitoring frequency to avoid interference
-				log.Printf("✅ TCP HEALTHY: TCP transport is operational during initial dump, reducing health check frequency")
 
-				// Switch to much less frequent monitoring when TCP is working
-				ticker.Reset(5 * time.Minute) // Check every 5 minutes instead of 30 seconds
+				// Test if vm-sync TCP port is reachable
+				if err := testTCPConnection(address); err == nil {
+					log.Printf("✨ TCP AVAILABLE: VM-sync detected at %s! Reinitializing TCP transport...", address)
 
-				// Optional: Skip actual connection test when TCP is working to avoid interference
-				// The main data transfer will detect if TCP fails anyway
-				continue
-			} else if dumpCompleted {
-				// FIX: After initial dump completes, switch to incremental sync mode (HTTP-based)
-				// TCP port will be closed - this is NORMAL, not a failure condition
-				log.Printf("📝 INCREMENTAL SYNC MODE: Initial dump completed, TCP monitoring paused (HTTP used for incremental sync)")
-				// Reduce monitoring to very infrequent checks (just for logging visibility)
-				ticker.Reset(30 * time.Minute)
-				continue
-			} else if config.Sync.Transport.Mode == "tcp" && !dumpCompleted {
-				// TCP is enabled during initial dump, verify it's still working
-				if err := testTCPConnection(config.Sync.Transport.TCPSender.Address); err != nil {
-					log.Printf("⚠️ TCP CONNECTION LOST: %v", err)
-					tcpTransportEnabled = false
+					// Clean up old sender if exists
 					if tcpSender != nil {
+						log.Printf("🔧 TCP CLEANUP: Closing old TCP sender before reconnect...")
 						if closeErr := tcpSender.Close(); closeErr != nil {
-							log.Printf("Error closing TCP sender: %v", closeErr)
+							log.Printf("⚠️  TCP CLEANUP WARNING: %v", closeErr)
 						}
 						tcpSender = nil
 					}
-					log.Printf("📴 TCP DEGRADED: Switched to HTTP transport mode")
+
+					// Reinitialize TCP transport with fresh address
+					if err := initializeTCPTransportWithAddress(address); err != nil {
+						log.Printf("❌ TCP REINIT FAILED: %v (will retry on next health check)", err)
+					} else {
+						log.Printf("✅ TCP RECONNECTED: TCP transport reinitialized successfully!")
+						log.Printf("🚀 TCP TRANSPORT RESTORED: Ready for data transfer (incremental sync will use TCP)")
+					}
+				} else {
+					log.Printf("🔶 TCP UNAVAILABLE: VM-sync not reachable at %s (%v)", address, err)
+				}
+				continue
+			}
+
+			// CASE 2: TCP is enabled -> Verify it's still healthy
+			if tcpTransportEnabled && tcpSender != nil {
+				// Get current address
+				addressMgr := transport.GetAddressManager()
+				address, err := addressMgr.GetAnyAddress()
+				if err != nil {
+					address = config.Sync.Transport.TCPSender.Address
+				}
+
+				// Test connection health
+				if err := testTCPConnection(address); err != nil {
+					log.Printf("⚠️  TCP CONNECTION LOST: %v", err)
+					log.Printf("🔧 TCP CLEANUP: Closing broken TCP connection...")
+
+					// Clean up broken connection
+					tcpTransportEnabled = false
+					if closeErr := tcpSender.Close(); closeErr != nil {
+						log.Printf("⚠️  TCP CLOSE WARNING: %v", closeErr)
+					}
+					tcpSender = nil
+
+					log.Printf("📴 TCP DEGRADED: Connection lost, will auto-reconnect on next health check")
+				} else {
+					// Connection is healthy
+					log.Printf("✅ TCP HEALTHY: Connection to %s is operational", address)
 				}
 			}
 		}
