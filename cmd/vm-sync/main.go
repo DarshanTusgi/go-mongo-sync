@@ -30,6 +30,7 @@ import (
 	"go-data-sync-http/pkg/sequence"
 	"go-data-sync-http/pkg/telemetry"
 	"go-data-sync-http/pkg/transport"
+	"go-data-sync-http/pkg/wal"
 	"go-data-sync-http/pkg/watermarks"
 
 	"github.com/gorilla/mux"
@@ -130,6 +131,11 @@ var (
 	tcpReceiver         transport.Receiver
 	tcpTransportEnabled bool
 	tcpTransportConfig  models.TransportConfig
+	
+	// WAL for incremental sync durability (enterprise-grade)
+	walInstance    *wal.WAL
+	walApplier     *wal.Applier
+	walEnabled     bool
 )
 
 // initializeTCPTransport initializes the TCP transport receiver for high-performance data transfer
@@ -221,6 +227,51 @@ func initializeTCPTransport() error {
 		receiverConfig.ListenAddr, receiverConfig.MaxConnections,
 		formatBytes(receiverConfig.BufferSize), formatBytes(receiverConfig.MaxBatchSize),
 		receiverConfig.CheckpointDir, tcpTransportConfig.CompressionType)
+	return nil
+}
+
+// initializeWAL initializes the Write-Ahead Log for incremental sync durability
+func initializeWAL() error {
+	// WAL directory (hardcoded, use temp directory for development)
+	walDir := "/tmp/vm-sync-wal"
+	
+	// Create WAL instance
+	walInst, err := wal.New(walDir)
+	if err != nil {
+		return fmt.Errorf("failed to initialize WAL: %w", err)
+	}
+	
+	walInstance = walInst
+	walEnabled = true
+	
+	// Create apply function that writes to MongoDB
+	applyFunc := func(ctx context.Context, database, collection string, documents []byte) error {
+		// Deserialize BSON array
+		var docs []bson.Raw
+		if err := bson.Unmarshal(documents, &docs); err != nil {
+			return fmt.Errorf("unmarshal documents: %w", err)
+		}
+		
+		// Convert to PageResult for compatibility with existing code
+		pageResult := &PageResult{
+			Documents: docs,
+		}
+		
+		// Use existing incremental processing logic
+		return processIncrementalPageOptimized(database, collection, pageResult)
+	}
+	
+	// Create applier with async workers
+	walApplier = wal.NewApplier(walInstance, applyFunc)
+	
+	// Recover pending entries from previous run
+	if err := walApplier.RecoverPendingEntries(); err != nil {
+		log.Printf("⚠️  WAL RECOVERY WARNING: %v", err)
+		// Don't fail startup if recovery has issues - continue anyway
+	}
+	
+	log.Printf("✅ WAL INITIALIZED: directory=%s, workers=%d", walDir, wal.ApplyWorkerCount)
+	
 	return nil
 }
 
@@ -360,6 +411,56 @@ func handleTCPBatchOptimized(stream string, batchSeq uint64, documents [][]byte)
 	if isIncremental {
 		log.Printf("🔄 TCP INCREMENTAL DETECTED: stream=%s, database=%s, collection=%s, documents=%d", stream, targetDatabase, targetCollection, len(documents))
 		log.Printf("📋 TCP INCREMENTAL MODE: Will use UPSERT for insert/update, DELETE for removals (CRUD supported)")
+		
+		// ❗ CRITICAL PATH: WAL-based durability for incremental sync
+		if walEnabled && walInstance != nil {
+			// Serialize documents to BSON array for WAL storage
+			bsonArray := make([]bson.Raw, len(documents))
+			for i, doc := range documents {
+				bsonArray[i] = bson.Raw(doc)
+			}
+			
+			// Marshal to BSON bytes
+			docsBytes, err := bson.Marshal(bsonArray)
+			if err != nil {
+				log.Printf("🔴 WAL MARSHAL ERROR: %v", err)
+				return fmt.Errorf("marshal documents for WAL: %w", err)
+			}
+			
+			// Write to WAL with fsync BEFORE returning (durability guarantee)
+			walStartTime := time.Now()
+			entryID, err := walInstance.Append(targetDatabase, targetCollection, docsBytes)
+			walDuration := time.Since(walStartTime)
+			
+			if err != nil {
+				log.Printf("🔴 WAL WRITE FAILED: %v", err)
+				return fmt.Errorf("write to WAL: %w", err)
+			}
+			
+			log.Printf("🔥 WAL DURABLE: entry %d written and fsynced in %dms (%d docs, %s) - ACK SAFE!", 
+				entryID, walDuration.Milliseconds(), len(documents), formatBytes(len(docsBytes)))
+			
+			// Submit to async applier (will be applied to MongoDB in background)
+			entry := &wal.Entry{
+				EntryID:    entryID,
+				Database:   targetDatabase,
+				Collection: targetCollection,
+				Documents:  docsBytes,
+			}
+			
+			if err := walApplier.Submit(entry); err != nil {
+				log.Printf("⚠️  WAL SUBMIT WARNING: %v (data is safe in WAL, will be retried)", err)
+			}
+			
+			log.Printf("✅ TCP INCREMENTAL WAL: %s seq=%d, %d docs written to WAL (async MongoDB apply in progress)",
+				stream, batchSeq, len(documents))
+			
+			// Return immediately - data is durable, ACK is safe to send!
+			return nil
+		} else {
+			log.Printf("⚠️  WAL DISABLED: Using direct MongoDB write (no durability guarantee)")
+			// Fall through to old sync path
+		}
 	}
 
 	// OPTIMIZED: Convert BSON documents with streaming to prevent memory spikes
@@ -987,6 +1088,19 @@ func main() {
 	} else if tcpTransportEnabled {
 		log.Println("TCP transport receiver initialized successfully")
 	}
+	
+	// ✅ Initialize WAL for incremental sync durability (ONLY if TCP is enabled)
+	if tcpTransportEnabled {
+		if err := initializeWAL(); err != nil {
+			log.Printf("⚠️  WARNING: Failed to initialize WAL: %v", err)
+			log.Printf("💔 DEGRADED MODE: Incremental sync will use direct MongoDB writes (no durability guarantee)")
+			walEnabled = false
+		} else {
+			log.Println("🔥 WAL initialized - Incremental sync has enterprise-grade durability!")
+		}
+	} else {
+		log.Println("🚫 WAL DISABLED: TCP transport not enabled (WAL requires TCP mode)")
+	}
 
 	// Start HTTP server to receive data from cloud-sync
 	log.Println("Starting HTTP server for push-based synchronization...")
@@ -1022,6 +1136,27 @@ func main() {
 			log.Printf("Error stopping TCP receiver: %v", err)
 		} else {
 			log.Println("TCP transport stopped gracefully")
+		}
+	}
+	
+	// 🔥 Shutdown WAL gracefully (flush pending writes, close workers)
+	if walEnabled && walApplier != nil {
+		log.Println("🛠️  Shutting down WAL applier...")
+		if err := walApplier.Close(); err != nil {
+			log.Printf("⚠️  Error stopping WAL applier: %v", err)
+		} else {
+			log.Println("✅ WAL applier stopped gracefully")
+		}
+	}
+	
+	if walEnabled && walInstance != nil {
+		log.Println("🛠️  Shutting down WAL instance...")
+		if err := walInstance.Close(); err != nil {
+			log.Printf("⚠️  Error closing WAL: %v", err)
+		} else {
+			stats := walInstance.Stats()
+			log.Printf("✅ WAL closed gracefully: %d total entries, %d pending", 
+				stats.TotalEntries, stats.PendingEntries)
 		}
 	}
 

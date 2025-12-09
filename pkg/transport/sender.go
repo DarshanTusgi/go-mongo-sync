@@ -444,12 +444,87 @@ func (sc *senderConnection) handleAckOptimized(payload []byte) {
 // SendBatch sends a batch of BSON documents
 func (s *tcpSender) SendBatch(stream string, batch [][]byte) error {
 	log.Printf("📤 TCP SEND: Sending batch for stream %s (%d documents)", stream, len(batch))
-	return s.sendBatch(stream, batch, false)
+	
+	// ❗ CRITICAL: Check if this is an incremental stream (needs ACK for durability)
+	isIncremental := len(stream) > 12 && stream[len(stream)-12:] == ".incremental"
+	
+	if isIncremental {
+		// Incremental sync: Wait for ACK before returning (at-least-once delivery)
+		log.Printf("🔥 INCREMENTAL SYNC: Will wait for ACK before returning (durability guarantee)")
+		return s.sendBatchWithAck(stream, batch)
+	} else {
+		// Initial dump: Fire-and-forget (high performance)
+		log.Printf("⚡ INITIAL SYNC: Fire-and-forget mode (high performance)")
+		return s.sendBatch(stream, batch, false)
+	}
 }
 
 // SendBatchAsync sends a batch asynchronously
 func (s *tcpSender) SendBatchAsync(stream string, batch [][]byte) error {
 	return s.sendBatch(stream, batch, true)
+}
+
+// sendBatchWithAck sends a batch and waits for ACK (for incremental sync durability)
+func (s *tcpSender) sendBatchWithAck(stream string, batch [][]byte) error {
+	if s.closed.Load() {
+		return fmt.Errorf("sender is closed")
+	}
+	
+	if len(batch) == 0 {
+		return fmt.Errorf("empty batch")
+	}
+	
+	// Get or create stream state
+	state := s.getOrCreateStreamState(stream)
+	
+	// Send the batch (fire-and-forget style initially)
+	if err := s.sendBatch(stream, batch, false); err != nil {
+		return fmt.Errorf("failed to send batch: %w", err)
+	}
+	
+	// Get the sequence number we just sent
+	state.mu.RLock()
+	sentSeq := state.nextSeq - 1 // We just incremented nextSeq in sendBatch
+	state.mu.RUnlock()
+	
+	// Wait for ACK with timeout (30 seconds for incremental)
+	ackTimeout := 30 * time.Second
+	ackDeadline := time.Now().Add(ackTimeout)
+	
+	log.Printf("⏳ WAITING FOR ACK: stream=%s, seq=%d, timeout=%v", stream, sentSeq, ackTimeout)
+	
+	for time.Now().Before(ackDeadline) {
+		// Check if this sequence has been acknowledged
+		state.mu.RLock()
+		_, stillPending := state.pendingBatches[sentSeq]
+		state.mu.RUnlock()
+		
+		if !stillPending {
+			// ACK received!
+			log.Printf("✅ ACK RECEIVED: stream=%s, seq=%d", stream, sentSeq)
+			return nil
+		}
+		
+		// Wait for ACK notification or timeout
+		select {
+		case ackedUpTo := <-state.ackCh:
+			if ackedUpTo >= sentSeq {
+				log.Printf("✅ ACK RECEIVED: stream=%s, seq=%d (acked_up_to=%d)", stream, sentSeq, ackedUpTo)
+				return nil
+			}
+			// Continue waiting if ACK is for an older batch
+			
+		case <-time.After(100 * time.Millisecond):
+			// Check again
+			
+		case <-s.ctx.Done():
+			return fmt.Errorf("sender is shutting down")
+		}
+	}
+	
+	// Timeout - no ACK received
+	log.Printf("🔴 ACK TIMEOUT: stream=%s, seq=%d after %v", stream, sentSeq, ackTimeout)
+	return fmt.Errorf("ACK timeout after %v for stream %s seq %d", ackTimeout, stream, sentSeq)
 }
 
 // sendBatch implements the core batch sending logic with streaming optimization
