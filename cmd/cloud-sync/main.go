@@ -2371,16 +2371,19 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 	// REQUIREMENT 1: Try TCP first for CRUD operations (insert/update/delete via upsert)
 	// REQUIREMENT 3: Self-recovering via TCP reconnection (handled by transport layer)
 	if tcpTransportEnabled && tcpSender != nil {
-		// Use TCP for incremental sync (better performance, reuses connection)
-		streamName := fmt.Sprintf("%s.%s.incremental", database, collection)
+		// CRITICAL FIX: Apply database name transformation for TCP stream routing
+		// This ensures incremental sync uses the same target database as initial dump
+		targetDatabase := getTargetDatabaseForVMSync(database)
+		streamName := fmt.Sprintf("%s.%s.incremental", targetDatabase, collection)
 		
+		log.Printf("📋 TCP INCREMENTAL ROUTING: Source='%s.%s' → Target='%s.%s.incremental'", database, collection, targetDatabase, collection)
 		log.Printf("🚀 TCP INCREMENTAL: Sending %d documents for %s via TCP", len(documents), streamName)
 		
 		if err := tcpSender.SendBatch(streamName, documents); err != nil {
 			log.Printf("⚠️  TCP INCREMENTAL FAILED: %v - Falling back to HTTP", err)
 			// Fall through to HTTP fallback
 		} else {
-			log.Printf("✅ TCP INCREMENTAL SUCCESS: Sent %d documents for %s.%s", len(documents), database, collection)
+			log.Printf("✅ TCP INCREMENTAL SUCCESS: Sent %d documents for %s.%s → %s.%s", len(documents), database, collection, targetDatabase, collection)
 			return nil
 		}
 	}
