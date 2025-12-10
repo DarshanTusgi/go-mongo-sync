@@ -792,13 +792,13 @@ func main() {
 	basePath := getBasePath()
 	log.Printf("API Base Path: %s", basePath)
 
-	// Check for CLOUD_DOMAIN environment variable for public URL
-	cloudDomain := os.Getenv("CLOUD_DOMAIN")
+	// Use TENANT_DNS for public URL (reusing existing tenant domain)
+	tenantDNS := os.Getenv("TENANT_DNS")
 	var baseURL string
 
-	if cloudDomain != "" {
-		// Use CLOUD_DOMAIN for public-facing URL
-		baseURL = fmt.Sprintf("https://%s%s", cloudDomain, basePath)
+	if tenantDNS != "" {
+		// Use TENANT_DNS for public-facing URL (Kubernetes/production)
+		baseURL = fmt.Sprintf("https://%s%s", tenantDNS, basePath)
 	} else {
 		// Fallback to config (for local development)
 		baseURL = fmt.Sprintf("http://%s:%d%s", config.Server.Host, config.Server.Port, basePath)
@@ -2767,15 +2767,15 @@ func handleSwaggerSpec(w http.ResponseWriter, r *http.Request) {
 	// Get base path and update the spec with dynamic server URL
 	basePath := getBasePath()
 
-	// CRITICAL FIX: Use CLOUD_DOMAIN for Kubernetes deployments
+	// CRITICAL FIX: Use TENANT_DNS for Kubernetes deployments
 	// This ensures Swagger shows the correct public URL instead of 0.0.0.0
-	cloudDomain := os.Getenv("CLOUD_DOMAIN")
+	tenantDNS := os.Getenv("TENANT_DNS")
 	var baseURL string
 
-	if cloudDomain != "" {
-		// Use CLOUD_DOMAIN for public-facing URL (Kubernetes/production)
-		baseURL = fmt.Sprintf("https://%s%s", cloudDomain, basePath)
-		log.Printf("📄 SWAGGER: Using CLOUD_DOMAIN for server URL: %s", baseURL)
+	if tenantDNS != "" {
+		// Use TENANT_DNS for public-facing URL (Kubernetes/production)
+		baseURL = fmt.Sprintf("https://%s%s", tenantDNS, basePath)
+		log.Printf("📄 SWAGGER: Using TENANT_DNS for server URL: %s", baseURL)
 	} else {
 		// Fallback to config (for local development)
 		baseURL = fmt.Sprintf("http://%s:%d%s", config.Server.Host, config.Server.Port, basePath)
@@ -2784,7 +2784,7 @@ func handleSwaggerSpec(w http.ResponseWriter, r *http.Request) {
 
 	// Replace placeholder server URL in the spec
 	specContent := string(specData)
-	if basePath != "" || cloudDomain != "" {
+	if basePath != "" || tenantDNS != "" {
 		// Update server URLs in the spec to use correct base URL
 		specContent = strings.ReplaceAll(specContent, "http://localhost:8080", baseURL)
 		log.Printf("📄 SWAGGER: Replaced server URLs with: %s", baseURL)
