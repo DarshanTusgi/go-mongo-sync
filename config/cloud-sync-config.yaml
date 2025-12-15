@@ -101,6 +101,7 @@ sync:
   realtime_sync: false  # DISABLED - incremental sync must use HTTP
   scheduler_sync: true  # ENABLED for HTTP-based incremental sync
   scheduler_interval: "30s"  # Quick interval for testing real-time feel
+  full_replacement_interval_minutes: 2  # Full database replacement scheduler (0=disabled, 2=every 2 minutes for testing)
   resumable_initial_sync: true  # Enable resumable initial sync to avoid full re-sync on restart
   batch_size: 1000
   parallel_collections: true

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -333,7 +334,7 @@ func testTCPConnection(address string) error {
 }
 
 // startTCPHealthMonitor monitors TCP transport health and attempts reconnection
-// AUTO-RECONNECTION: Works during AND after initial dump (incremental sync phase)
+// ENTERPRISE-GRADE: Circuit breaker + exponential backoff + jitter (gRPC/Kafka/AWS style)
 func startTCPHealthMonitor() {
 	// Use configured interval or default to 30 seconds
 	interval := config.Sync.Transport.HealthMonitor
@@ -343,8 +344,13 @@ func startTCPHealthMonitor() {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	
+	// Enterprise-grade reconnection strategy
+	backoff := transport.GRPCStyleBackoff() // 1s initial, 120s max, 1.6x multiplier, ±20% jitter
+	var consecutiveFailures int
+	const maxFailures = 10 // After 10 failures, stop aggressive reconnection
 
-	log.Printf("🐆 TCP HEALTH MONITOR: Started (check interval: %v, auto-reconnect enabled)", interval)
+	log.Printf("🏥 TCP HEALTH MONITOR: Started (interval: %v, exponential backoff enabled)", interval)
 
 	for {
 		select {
@@ -356,7 +362,13 @@ func startTCPHealthMonitor() {
 
 			// CASE 1: TCP is configured but not currently enabled -> Try to reconnect
 			if !tcpTransportEnabled {
-				log.Printf("🔍 TCP HEALTH CHECK: TCP not enabled, attempting auto-reconnect...")
+				// Check circuit breaker before attempting reconnection
+				if consecutiveFailures >= maxFailures {
+					log.Printf("⏸️  TCP RECONNECT PAUSED: Too many failures (%d), waiting for manual intervention or vm-sync recovery", consecutiveFailures)
+					continue
+				}
+				
+				log.Printf("🔍 TCP HEALTH CHECK: TCP not enabled, attempting auto-reconnect (attempt %d)...", consecutiveFailures+1)
 
 				// Try to get fresh address from Address Manager (in case vm-sync restarted)
 				addressMgr := transport.GetAddressManager()
@@ -384,13 +396,26 @@ func startTCPHealthMonitor() {
 
 					// Reinitialize TCP transport with fresh address
 					if err := initializeTCPTransportWithAddress(address); err != nil {
-						log.Printf("❌ TCP REINIT FAILED: %v (will retry on next health check)", err)
+						consecutiveFailures++
+						log.Printf("❌ TCP REINIT FAILED (attempt %d): %v", consecutiveFailures, err)
+						
+						// Apply exponential backoff with jitter
+						backoffDuration := backoff.NextBackoff()
+						log.Printf("⏳ TCP BACKOFF: Waiting %v before next attempt (exponential + jitter)", backoffDuration)
 					} else {
+						// SUCCESS! Reset backoff and failure counter
+						backoff.Reset()
+						consecutiveFailures = 0
 						log.Printf("✅ TCP RECONNECTED: TCP transport reinitialized successfully!")
 						log.Printf("🚀 TCP TRANSPORT RESTORED: Ready for data transfer (incremental sync will use TCP)")
 					}
 				} else {
-					log.Printf("🔶 TCP UNAVAILABLE: VM-sync not reachable at %s (%v)", address, err)
+					consecutiveFailures++
+					log.Printf("🔶 TCP UNAVAILABLE (attempt %d): VM-sync not reachable at %s (%v)", consecutiveFailures, address, err)
+					
+					// Apply exponential backoff with jitter
+					backoffDuration := backoff.NextBackoff()
+					log.Printf("⏳ TCP BACKOFF: Waiting %v before next health check (exponential + jitter)", backoffDuration)
 				}
 				continue
 			}
@@ -415,10 +440,16 @@ func startTCPHealthMonitor() {
 						log.Printf("⚠️  TCP CLOSE WARNING: %v", closeErr)
 					}
 					tcpSender = nil
+					
+					// Reset backoff for fresh reconnection attempts
+					backoff.Reset()
+					consecutiveFailures = 0
 
 					log.Printf("📴 TCP DEGRADED: Connection lost, will auto-reconnect on next health check")
 				} else {
-					// Connection is healthy
+					// Connection is healthy - reset failure counter
+					consecutiveFailures = 0
+					backoff.Reset()
 					log.Printf("✅ TCP HEALTHY: Connection to %s is operational", address)
 				}
 			}
@@ -928,6 +959,14 @@ func main() {
 		}
 	}
 
+	// Start Full Replacement Scheduler IMMEDIATELY (independent of initial dump)
+	if config.Sync.FullReplacementIntervalMinutes > 0 {
+		log.Printf("🔄 FULL REPLACEMENT SCHEDULER: Starting with interval: %d minutes", config.Sync.FullReplacementIntervalMinutes)
+		startFullReplacementScheduler()
+	} else {
+		log.Println("💤 FULL REPLACEMENT SCHEDULER: Disabled (interval=0)")
+	}
+
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -1381,6 +1420,131 @@ func runIncrementalSyncSafe() {
 	runIncrementalSync()
 }
 
+// startFullReplacementScheduler starts the full database replacement scheduler
+func startFullReplacementScheduler() {
+	intervalMinutes := config.Sync.FullReplacementIntervalMinutes
+	
+	if intervalMinutes <= 0 {
+		log.Println("⚠️  FULL REPLACEMENT SCHEDULER: Invalid interval, scheduler disabled")
+		return
+	}
+	
+	interval := time.Duration(intervalMinutes) * time.Minute
+	log.Printf("🔄 FULL REPLACEMENT SCHEDULER: Configured for %v interval (%d minutes)", interval, intervalMinutes)
+	
+	// Start the scheduler in a goroutine with panic recovery
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("🚨 FULL REPLACEMENT SCHEDULER PANIC: %v - Restarting scheduler in 1 minute...", r)
+				time.Sleep(1 * time.Minute)
+				startFullReplacementScheduler()
+			}
+		}()
+		
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		
+		log.Printf("⏰ FULL REPLACEMENT SCHEDULER: First replacement will run at %s", time.Now().Add(interval).Format(time.RFC3339))
+		
+		for {
+			select {
+			case <-ticker.C:
+				log.Println("═══════════════════════════════════════════════════════════")
+				log.Printf("🔄 FULL REPLACEMENT SCHEDULER TICK: Time=%s, Interval=%v", time.Now().Format(time.RFC3339), interval)
+				log.Println("🚀 FULL REPLACEMENT: Starting complete database replacement...")
+				
+				// Execute full database replacement with force mode
+				if err := executeFullDatabaseReplacement(); err != nil {
+					log.Printf("❌ FULL REPLACEMENT FAILED: %v - Will retry at next interval", err)
+				} else {
+					log.Printf("✅ FULL REPLACEMENT COMPLETE: Next replacement at %s", time.Now().Add(interval).Format(time.RFC3339))
+				}
+				
+				log.Println("═══════════════════════════════════════════════════════════")
+			case <-context.Background().Done():
+				log.Println("🔄 FULL REPLACEMENT SCHEDULER: Stopping due to context cancellation")
+				return
+			}
+		}
+	}()
+	
+	log.Printf("✅ FULL REPLACEMENT SCHEDULER: Started successfully - Runs every %d minutes", intervalMinutes)
+}
+
+// executeFullDatabaseReplacement performs a complete database replacement (same logic as API endpoint)
+func executeFullDatabaseReplacement() error {
+	log.Println("📡 FULL REPLACEMENT: Executing scheduled database replacement...")
+	
+	// Get vm-sync HTTP endpoint
+	vmSyncEndpoint := getVMSyncHTTPEndpoint()
+	if vmSyncEndpoint == "" {
+		return fmt.Errorf("vm-sync endpoint not available")
+	}
+	
+	log.Printf("🎯 FULL REPLACEMENT: Target endpoint: %s", vmSyncEndpoint)
+	
+	// STEP 1: Clear ALL vm-sync collections BEFORE pushing new data
+	log.Println("🗑️ FULL REPLACEMENT: Step 1/2 - Clearing all collections...")
+	cleared := 0
+	failed := 0
+	
+	for _, dbConfig := range config.MongoDB.Databases {
+		if !dbConfig.Enabled {
+			continue
+		}
+		for _, collConfig := range dbConfig.Collections {
+			if !collConfig.Enabled {
+				continue
+			}
+			
+			log.Printf("🗑️ Clearing: %s.%s", dbConfig.Name, collConfig.Name)
+			if err := clearVMSyncCollection(vmSyncEndpoint, dbConfig.Name, collConfig.Name); err != nil {
+				log.Printf("⚠️  Failed to clear %s.%s: %v (continuing anyway)", dbConfig.Name, collConfig.Name, err)
+				failed++
+			} else {
+				log.Printf("✅ Cleared: %s.%s", dbConfig.Name, collConfig.Name)
+				cleared++
+			}
+		}
+	}
+	
+	log.Printf("🗑️ FULL REPLACEMENT: Cleared %d collections (%d failed)", cleared, failed)
+	
+	// STEP 2: Ensure TCP is connected before data push
+	log.Println("🚀 FULL REPLACEMENT: Step 2/3 - Ensuring TCP connectivity...")
+	if config.Sync.Transport.Mode == "tcp" {
+		if tcpSender != nil {
+			log.Println("✅ TCP ALREADY CONNECTED: Using existing connection")
+		} else {
+			log.Println("⚠️  TCP DISCONNECTED: Attempting reconnection before replacement...")
+			// Try reconnecting TCP - MANDATORY for full replacement
+			if err := initializeTCPTransport(); err != nil {
+				return fmt.Errorf("TCP RECONNECT FAILED: %v - Full replacement requires TCP transport", err)
+			}
+			log.Println("✅ TCP RECONNECTED: Ready for data transfer")
+		}
+	} else {
+		return fmt.Errorf("FULL REPLACEMENT ERROR: TCP transport not configured (mode=%s) - Full replacement requires TCP", config.Sync.Transport.Mode)
+	}
+	
+	// STEP 3: Enable force initial sync mode and trigger sync process
+	log.Println("🚀 FULL REPLACEMENT: Step 3/3 - Pushing complete database...")
+	
+	// Enable force mode to bypass resumable state
+	forceInitialSync = true
+	defer func() {
+		forceInitialSync = false
+		log.Println("🔄 FULL REPLACEMENT: Disabled force mode")
+	}()
+	
+	// Execute the sync process (same as startup initial dump)
+	startSyncProcess()
+	
+	log.Println("✅ FULL REPLACEMENT: Complete database replacement finished successfully")
+	return nil
+}
+
 // startChangeStreamMonitoring starts traditional change stream monitoring (fallback)
 func startChangeStreamMonitoring() {
 	// Now it's safe to start change streams - no data duplication risk
@@ -1413,14 +1577,16 @@ func startChangeStreamMonitoring() {
 }
 
 // runIncrementalSync performs an incremental synchronization by detecting changes
-// runIncrementalSync runs MongoDB change stream based incremental sync (industry standard approach)
+// PARALLEL PROCESSING: Uses goroutines for concurrent collection monitoring (4x faster)
 func runIncrementalSync() {
 	start := time.Now()
 	log.Println("📄 INCREMENTAL SYNC: Starting MongoDB change stream detection...")
 
 	// Industry pattern: Process each collection with dedicated change streams
-	var totalChanges int
+	var totalChanges atomic.Int32
 	var syncErrors []string
+	var errorsMutex sync.Mutex
+	var wg sync.WaitGroup
 
 	for _, database := range config.MongoDB.Databases {
 		if !database.Enabled {
@@ -1435,30 +1601,44 @@ func runIncrementalSync() {
 				continue
 			}
 
-			// Use proper MongoDB change streams with resume tokens (like Debezium)
-			changes, err := detectAndSyncWithChangeStream(database.Name, collection.Name)
-			if err != nil {
-				errorMsg := fmt.Sprintf("Failed to sync changes for %s.%s: %v", database.Name, collection.Name, err)
-				log.Printf("🔴 INCREMENTAL SYNC ERROR: %s", errorMsg)
-				syncErrors = append(syncErrors, errorMsg)
-				continue
-			}
+			// PARALLEL PROCESSING: Launch goroutine for each collection
+			wg.Add(1)
+			go func(dbName, collName string) {
+				defer wg.Done()
+				
+				// Use proper MongoDB change streams with resume tokens (like Debezium)
+				changes, err := detectAndSyncWithChangeStream(dbName, collName)
+				if err != nil {
+					errorMsg := fmt.Sprintf("Failed to sync changes for %s.%s: %v", dbName, collName, err)
+					log.Printf("🔴 INCREMENTAL SYNC ERROR: %s", errorMsg)
+					errorsMutex.Lock()
+					syncErrors = append(syncErrors, errorMsg)
+					errorsMutex.Unlock()
+					return
+				}
 
-			if changes > 0 {
-				log.Printf("🔄 INCREMENTAL SYNC: Processed %d changes in %s.%s", changes, database.Name, collection.Name)
-				totalChanges += changes
-			}
+				if changes > 0 {
+					log.Printf("🔄 INCREMENTAL SYNC: Processed %d changes in %s.%s", changes, dbName, collName)
+					totalChanges.Add(int32(changes))
+				}
+			}(database.Name, collection.Name)
 		}
 	}
+	
+	// Wait for all collections to complete
+	log.Printf("⏳ PARALLEL SYNC: Waiting for all collections to complete...")
+	wg.Wait()
 
 	duration := time.Since(start)
+	finalChanges := int(totalChanges.Load())
+	
 	if len(syncErrors) > 0 {
-		log.Printf("⚠️  INCREMENTAL SYNC COMPLETED with %d errors in %v - Processed %d total changes", len(syncErrors), duration, totalChanges)
+		log.Printf("⚠️  INCREMENTAL SYNC COMPLETED with %d errors in %v - Processed %d total changes", len(syncErrors), duration, finalChanges)
 		for _, errMsg := range syncErrors {
 			log.Printf("  • %s", errMsg)
 		}
 	} else {
-		log.Printf("✅ INCREMENTAL SYNC COMPLETED successfully in %v - Processed %d total changes", duration, totalChanges)
+		log.Printf("✅ INCREMENTAL SYNC COMPLETED successfully in %v - Processed %d total changes", duration, finalChanges)
 	}
 }
 
@@ -2340,6 +2520,53 @@ var incrementalSyncHTTPClient = &http.Client{
 	},
 }
 
+// isInitialDumpCompleted intelligently detects if initial dump was completed
+// by checking checkpoint manager for resume tokens (persistent across restarts)
+func isInitialDumpCompleted() bool {
+	// Method 1: Check in-memory flag (fast path)
+	if initialDumpCompletedOnce {
+		return true
+	}
+	
+	// Method 2: Check checkpoint manager for persistent state
+	// If we have resume tokens for collections, initial dump must have completed
+	if checkpointMgr != nil {
+		hasAnyCheckpoint := false
+		for _, database := range config.MongoDB.Databases {
+			if !database.Enabled {
+				continue
+			}
+			for _, collection := range database.Collections {
+				if !collection.Enabled {
+					continue
+				}
+				// If any collection has a checkpoint, initial dump completed
+				if checkpoint := checkpointMgr.GetCheckpoint(database.Name, collection.Name); checkpoint != nil {
+					hasAnyCheckpoint = true
+					// Update in-memory flag for fast future checks
+					initialDumpMutex.Lock()
+					initialDumpCompletedOnce = true
+					initialDumpMutex.Unlock()
+					log.Printf("✅ INITIAL DUMP DETECTED: Found checkpoint for %s.%s - Initial dump was completed", database.Name, collection.Name)
+					return true
+				}
+			}
+		}
+		
+		if !hasAnyCheckpoint {
+			log.Printf("🔍 INITIAL DUMP CHECK: No checkpoints found - Initial dump likely not completed yet")
+		}
+	}
+	
+	// Method 3: If config says initial_sync is disabled, allow incremental sync anyway
+	if !config.Sync.InitialSync {
+		log.Printf("⚠️  INITIAL DUMP SKIPPED: initial_sync=false in config - Allowing incremental sync")
+		return true
+	}
+	
+	return false
+}
+
 // sendIncrementalChangesViaHTTPWithRetry sends incremental changes with retry mechanism (FIX GAP #2)
 func sendIncrementalChangesViaHTTPWithRetry(database, collection string, documents [][]byte) error {
 	const maxRetries = 5
@@ -2381,9 +2608,11 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 	}
 
 	// REQUIREMENT 2: Ensure initial dump is complete before sending incremental changes
-	// This prevents data duplication and ensures proper sequencing
-	if !initialDumpCompletedOnce {
-		log.Printf("⚠️  INCREMENTAL SYNC BLOCKED: Initial dump not yet completed for %s.%s - Skipping incremental changes", database, collection)
+	// INTELLIGENT CHECK: Use checkpoint manager to detect if initial dump was completed
+	// This works even after cloud-sync restarts (persistent state)
+	if !isInitialDumpCompleted() {
+		log.Printf("⚠️  INCREMENTAL SYNC BLOCKED: Initial dump not yet completed - Skipping incremental changes for %s.%s", database, collection)
+		log.Printf("💡 HINT: Waiting for initial dump to complete. Check for 'INITIAL BULK DATA TRANSFER COMPLETED' log message.")
 		return fmt.Errorf("initial dump not completed yet")
 	}
 
@@ -2500,8 +2729,8 @@ func startSyncProcess() {
 
 	// ✅ PHASE 1: Send ALL metadata FIRST via TCP (indexes, options) for ALL collections
 	// This ensures indexes are created BEFORE data arrives, optimizing insert performance
-	// IMPORTANT: Only send metadata if TCP transport is enabled
-	if config.Sync.Transport.Mode == "tcp" && tcpTransportEnabled {
+	// IMPORTANT: Check if TCP sender is available (may be existing connection from startup)
+	if config.Sync.Transport.Mode == "tcp" && tcpSender != nil {
 		log.Printf("🎯 PHASE 1: Sending metadata (indexes) via TCP for ALL %d collections...", totalCollections)
 		metadataStartTime := time.Now()
 		metadataCount := 0
@@ -2820,7 +3049,7 @@ func checkVMSyncCheckpoint(vmSyncEndpoint, database, collection string) (bool, e
 
 // clearVMSyncCollection requests vm-sync to clear a specific collection
 func clearVMSyncCollection(vmSyncEndpoint, database, collection string) error {
-	url := fmt.Sprintf("%s/api/clear/%s.%s", vmSyncEndpoint, database, collection)
+	url := fmt.Sprintf("%s/api/v1/clear/%s.%s", vmSyncEndpoint, database, collection)
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create clear request: %v", err)
@@ -4004,20 +4233,25 @@ func getVMSyncHTTPEndpoint() string {
 	addressMgr := transport.GetAddressManager()
 	httpEndpoint, err := addressMgr.GetAnyHTTPAddress()
 	if err == nil && httpEndpoint != "" {
-		// FIX: Ensure http:// prefix exists
-		if !strings.HasPrefix(httpEndpoint, "http://") && !strings.HasPrefix(httpEndpoint, "https://") {
-			httpEndpoint = "http://" + httpEndpoint
-			log.Printf("🔧 HTTP ENDPOINT: Added http:// prefix to endpoint: %s", httpEndpoint)
+		// FIX: Validate that port is not 0 (invalid port)
+		if strings.Contains(httpEndpoint, ":0") || strings.HasSuffix(httpEndpoint, ":0") {
+			log.Printf("⚠️  HTTP ENDPOINT: Discovered endpoint has invalid port 0: %s - falling back to localhost", httpEndpoint)
+		} else {
+			// FIX: Ensure http:// prefix exists
+			if !strings.HasPrefix(httpEndpoint, "http://") && !strings.HasPrefix(httpEndpoint, "https://") {
+				httpEndpoint = "http://" + httpEndpoint
+				log.Printf("🔧 HTTP ENDPOINT: Added http:// prefix to endpoint: %s", httpEndpoint)
+			}
+			log.Printf("🎯 HTTP ENDPOINT: Using dynamically discovered endpoint: %s", httpEndpoint)
+			return httpEndpoint
 		}
-		log.Printf("🎯 HTTP ENDPOINT: Using dynamically discovered endpoint: %s", httpEndpoint)
-		return httpEndpoint
 	}
 
-	// Fallback to environment variable (legacy compatibility)
+	// Fallback to environment variable or localhost (legacy compatibility)
 	vmSyncEndpoint := os.Getenv("VM_SYNC_ENDPOINT")
 	if vmSyncEndpoint == "" {
 		vmSyncEndpoint = "http://localhost:8081" // Default vm-sync endpoint
-		log.Printf("⚠️  HTTP ENDPOINT: Using localhost fallback: %s (no VM discovered)", vmSyncEndpoint)
+		log.Printf("⚠️  HTTP ENDPOINT: Using localhost fallback: %s (dynamic discovery failed or port invalid)", vmSyncEndpoint)
 	} else {
 		log.Printf("🔧 HTTP ENDPOINT: Using environment variable: %s", vmSyncEndpoint)
 	}

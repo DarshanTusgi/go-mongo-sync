@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// tcpSender implements the Sender interface using TCP connections
+// tcpSender implements the Sender interface using TCP connections with enterprise-grade reliability
 type tcpSender struct {
 	config       SenderConfig
 	connections  []*senderConnection
@@ -25,6 +25,10 @@ type tcpSender struct {
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 	closed       atomic.Bool
+	
+	// Enterprise-grade reliability components
+	circuitBreaker *CircuitBreaker
+	backoff        *BackoffStrategy
 }
 
 // streamState tracks the state of a specific stream
@@ -65,7 +69,7 @@ type senderStats struct {
 	compressedBytes atomic.Uint64
 }
 
-// newTCPSender creates a new TCP sender
+// newTCPSender creates a new TCP sender with enterprise-grade reliability
 func newTCPSender(config SenderConfig) (*tcpSender, error) {
 	compressor, err := GetCompressor(config.Compression)
 	if err != nil {
@@ -74,14 +78,32 @@ func newTCPSender(config SenderConfig) (*tcpSender, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Initialize circuit breaker (enterprise-grade fault tolerance)
+	circuitBreaker := NewCircuitBreaker(CircuitBreakerConfig{
+		FailureThreshold:       5,
+		SuccessThreshold:       2,
+		CooldownPeriod:         30 * time.Second,
+		MaxConsecutiveFailures: 3,
+	})
+	
+	// Initialize exponential backoff with jitter (gRPC-style)
+	backoff := GRPCStyleBackoff() // 1s initial, 120s max, 1.6 multiplier, ±20% jitter
+
 	sender := &tcpSender{
-		config:       config,
-		connections:  make([]*senderConnection, 0, config.ParallelConns),
-		streamStates: make(map[string]*streamState),
-		compressor:   compressor,
-		ctx:          ctx,
-		cancel:       cancel,
+		config:         config,
+		connections:    make([]*senderConnection, 0, config.ParallelConns),
+		streamStates:   make(map[string]*streamState),
+		compressor:     compressor,
+		ctx:            ctx,
+		cancel:         cancel,
+		circuitBreaker: circuitBreaker,
+		backoff:        backoff,
 	}
+	
+	// Register state change logging
+	circuitBreaker.OnStateChange(func(old, new ConnectionState) {
+		log.Printf("🔄 CIRCUIT BREAKER STATE CHANGE: %s → %s", old, new)
+	})
 
 	// Create parallel connections
 	log.Printf("🔌 TCP SENDER: Creating %d parallel connections to %s", config.ParallelConns, config.Address)
@@ -90,6 +112,8 @@ func newTCPSender(config SenderConfig) (*tcpSender, error) {
 		conn, err := sender.createConnection(i)
 		if err != nil {
 			log.Printf("❌ TCP SENDER: Failed to create connection %d: %v", i, err)
+			// Record failure in circuit breaker
+			sender.circuitBreaker.RecordFailure()
 			// Clean up existing connections
 			sender.Close()
 			return nil, fmt.Errorf("failed to create connection %d: %w", i, err)
@@ -97,6 +121,9 @@ func newTCPSender(config SenderConfig) (*tcpSender, error) {
 		log.Printf("✅ TCP SENDER: Connection %d created successfully", i+1)
 		sender.connections = append(sender.connections, conn)
 	}
+	
+	// All connections successful - mark circuit breaker as ready
+	sender.circuitBreaker.RecordSuccess()
 
 	return sender, nil
 }

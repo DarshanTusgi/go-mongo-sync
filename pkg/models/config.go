@@ -67,15 +67,16 @@ type CloudSyncSettings struct {
 
 // SyncConfig represents synchronization settings
 type SyncConfig struct {
-	InitialSync          bool            `yaml:"initial_sync"`
-	RealtimeSync         bool            `yaml:"realtime_sync"`
-	SchedulerSync        bool            `yaml:"scheduler_sync"`         // Enable scheduler-based synchronization
-	SchedulerInterval    time.Duration   `yaml:"scheduler_interval"`     // Configurable sync interval (e.g., "30m")
-	ResumableInitialSync bool            `yaml:"resumable_initial_sync"` // Enable resumable initial sync to avoid full re-sync on restart
-	BatchSize            int             `yaml:"batch_size"`
-	ParallelCollections  bool            `yaml:"parallel_collections"`
-	MaxWorkers           int             `yaml:"max_workers"`
-	Transport            TransportConfig `yaml:"transport"` // Transport configuration for initial data dump
+	InitialSync                      bool            `yaml:"initial_sync"`
+	RealtimeSync                     bool            `yaml:"realtime_sync"`
+	SchedulerSync                    bool            `yaml:"scheduler_sync"`                          // Enable scheduler-based synchronization
+	SchedulerInterval                time.Duration   `yaml:"scheduler_interval"`                      // Configurable sync interval (e.g., "30m")
+	FullReplacementIntervalMinutes   int             `yaml:"full_replacement_interval_minutes"`       // Full database replacement interval in minutes (0=disabled)
+	ResumableInitialSync             bool            `yaml:"resumable_initial_sync"`                  // Enable resumable initial sync to avoid full re-sync on restart
+	BatchSize                        int             `yaml:"batch_size"`
+	ParallelCollections              bool            `yaml:"parallel_collections"`
+	MaxWorkers                       int             `yaml:"max_workers"`
+	Transport                        TransportConfig `yaml:"transport"` // Transport configuration for initial data dump
 }
 
 // DatabaseConfig represents configuration for a specific database

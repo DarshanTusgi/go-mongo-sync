@@ -231,7 +231,9 @@ func (s *ClientCredentialsService) generateClientSecret() string {
 // generateJWT creates a JWT token with claims
 func (s *ClientCredentialsService) generateJWT(credentials ClientCredentials) (string, time.Time, error) {
 	now := time.Now()
-	expiresAt := now.Add(1 * time.Hour) // 1 hour token validity
+	// Service account tokens are long-lived (30 days) to prevent auth failures during automated testing
+	// For production, implement token refresh logic in vm-sync
+	expiresAt := now.Add(30 * 24 * time.Hour) // 30 days token validity
 
 	claims := TokenClaims{
 		// Standard JWT claims (RFC 7519)

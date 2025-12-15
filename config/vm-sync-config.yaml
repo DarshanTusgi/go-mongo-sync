@@ -7,8 +7,8 @@ cloud_sync:
   # OAuth2 authentication - using generated credentials
   oauth2:
     enabled: true
-    client_id: "vm_sync_c9bf87e373213c1e"
-    client_secret: "54c1493d9595b1f5d20bb7afc0c61e0019b929a2b62d86a236c564b1d7f6ef19"
+    client_id: "vm_sync_4af746d26eaab844"
+    client_secret: "030760539f960681c9312ed6d3866495d6c90a72198a2b0a77ca3e73614a3657"
     token_url: "http://localhost:8080/api/auth/token"
 
 mongodb:
