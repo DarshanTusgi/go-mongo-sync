@@ -95,7 +95,7 @@ var (
 	metricsCollector *metrics.MetricsCollector
 	alertManager     *metrics.AlertManager
 	metricsAPI       *metrics.MetricsAPI
-	connectionMonitor *alerting.ConnectionMonitor // Connection health monitoring and alerting
+	// connectionMonitor removed - using simple TCP port monitor instead
 	activeWatchers   = make(map[string]bool) // Track active change streams
 	watchersMutex    sync.RWMutex            // Protect activeWatchers map
 	// App logger variable
@@ -401,15 +401,7 @@ func startTCPHealthMonitor() {
 						consecutiveFailures++
 						log.Printf("❌ TCP REINIT FAILED (attempt %d): %v", consecutiveFailures, err)
 
-						// Record TCP failure in connection monitor
-						log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
-						if connectionMonitor != nil {
-							log.Printf("📊 ALERT: Recording TCP reinit failure for %s: %v", address, err)
-							connectionMonitor.RecordTCPFailure("cloud-sync", address, err)
-							log.Printf("✅ ALERT: TCP failure recorded successfully")
-						} else {
-							log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record failure")
-						}
+						// Connection monitoring removed - using simple TCP port monitor
 
 						// Apply exponential backoff with jitter
 						backoffDuration := backoff.NextBackoff()
@@ -421,29 +413,13 @@ func startTCPHealthMonitor() {
 						log.Printf("✅ TCP RECONNECTED: TCP transport reinitialized successfully!")
 						log.Printf("🚀 TCP TRANSPORT RESTORED: Ready for data transfer (incremental sync will use TCP)")
 
-						// Record TCP reconnection in connection monitor
-						log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
-						if connectionMonitor != nil {
-							log.Printf("📊 ALERT: Recording TCP reconnection for %s", address)
-							connectionMonitor.RecordTCPReconnected("cloud-sync", address)
-							log.Printf("✅ ALERT: TCP reconnection recorded successfully")
-						} else {
-							log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record reconnection")
-						}
+						// Connection monitoring removed - using simple TCP port monitor
 					}
 				} else {
 					consecutiveFailures++
 					log.Printf("🔶 TCP UNAVAILABLE (attempt %d): VM-sync not reachable at %s (%v)", consecutiveFailures, address, err)
 
-					// Record TCP failure in connection monitor
-					log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
-					if connectionMonitor != nil {
-						log.Printf("📊 ALERT: Recording TCP failure for %s: %v", address, err)
-						connectionMonitor.RecordTCPFailure("cloud-sync", address, err)
-						log.Printf("✅ ALERT: TCP failure recorded successfully")
-					} else {
-						log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record failure")
-					}
+					// Connection monitoring removed - using simple TCP port monitor
 
 					// Apply exponential backoff with jitter
 					backoffDuration := backoff.NextBackoff()
@@ -466,15 +442,7 @@ func startTCPHealthMonitor() {
 					log.Printf("⚠️  TCP CONNECTION LOST: %v", err)
 					log.Printf("🔧 TCP CLEANUP: Closing broken TCP connection...")
 
-					// Record TCP disconnection in connection monitor
-					log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
-					if connectionMonitor != nil {
-						log.Printf("📊 ALERT: Recording TCP disconnection for %s: %v", address, err)
-						connectionMonitor.RecordTCPDisconnected("cloud-sync", address, err)
-						log.Printf("✅ ALERT: TCP disconnection recorded successfully")
-					} else {
-						log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record disconnection")
-					}
+					// Connection monitoring removed - using simple TCP port monitor
 
 					// Clean up broken connection
 					tcpTransportEnabled = false
@@ -494,15 +462,7 @@ func startTCPHealthMonitor() {
 					backoff.Reset()
 					log.Printf("✅ TCP HEALTHY: Connection to %s is operational", address)
 
-					// Record TCP healthy status in connection monitor
-					log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
-					if connectionMonitor != nil {
-						log.Printf("📊 ALERT: Recording TCP healthy for %s", address)
-						connectionMonitor.RecordTCPHealthy("cloud-sync", address)
-						log.Printf("✅ ALERT: TCP healthy recorded successfully")
-					} else {
-						log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record healthy")
-					}
+					// Connection monitoring removed - using simple TCP port monitor
 				}
 			}
 		}
@@ -715,16 +675,7 @@ func main() {
 	go alertManager.Start(context.Background(), 30*time.Second) // Check every 30 seconds
 	log.Println("Metrics system initialized with default alert rules")
 
-	// Initialize connection health monitor for TCP and WebSocket
-	connectionMonitorConfig := alerting.DefaultConnectionMonitorConfig()
-	connectionMonitor = alerting.NewConnectionMonitor(connectionMonitorConfig)
-
-	// Register alert handlers for connection events
-	connectionMonitor.RegisterCallback(alerting.LogAlertHandler)
-	connectionMonitor.RegisterCallback(alerting.CriticalAlertHandler)
-
-	log.Printf("✅ Connection Monitor initialized (TCP failure threshold: %d, WS timeout: %v)",
-		connectionMonitorConfig.TCPFailureThreshold, connectionMonitorConfig.WSDisconnectTimeout)
+	// Connection monitor removed - now using simple TCP port monitor (see below)
 
 	// Logger already initialized earlier
 	appLogger.Info("cloud-sync", "startup", "Application logger initialized for dashboard", nil)
