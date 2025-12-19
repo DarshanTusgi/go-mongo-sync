@@ -32,6 +32,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"go-data-sync-http/pkg/adaptive"
+	"go-data-sync-http/pkg/alerting"
 	"go-data-sync-http/pkg/auth"
 	"go-data-sync-http/pkg/cluster"
 	"go-data-sync-http/pkg/crypto"
@@ -94,6 +95,7 @@ var (
 	metricsCollector *metrics.MetricsCollector
 	alertManager     *metrics.AlertManager
 	metricsAPI       *metrics.MetricsAPI
+	connectionMonitor *alerting.ConnectionMonitor // Connection health monitoring and alerting
 	activeWatchers   = make(map[string]bool) // Track active change streams
 	watchersMutex    sync.RWMutex            // Protect activeWatchers map
 	// App logger variable
@@ -344,7 +346,7 @@ func startTCPHealthMonitor() {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	
+
 	// Enterprise-grade reconnection strategy
 	backoff := transport.GRPCStyleBackoff() // 1s initial, 120s max, 1.6x multiplier, ±20% jitter
 	var consecutiveFailures int
@@ -367,7 +369,7 @@ func startTCPHealthMonitor() {
 					log.Printf("⏸️  TCP RECONNECT PAUSED: Too many failures (%d), waiting for manual intervention or vm-sync recovery", consecutiveFailures)
 					continue
 				}
-				
+
 				log.Printf("🔍 TCP HEALTH CHECK: TCP not enabled, attempting auto-reconnect (attempt %d)...", consecutiveFailures+1)
 
 				// Try to get fresh address from Address Manager (in case vm-sync restarted)
@@ -398,7 +400,17 @@ func startTCPHealthMonitor() {
 					if err := initializeTCPTransportWithAddress(address); err != nil {
 						consecutiveFailures++
 						log.Printf("❌ TCP REINIT FAILED (attempt %d): %v", consecutiveFailures, err)
-						
+
+						// Record TCP failure in connection monitor
+						log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
+						if connectionMonitor != nil {
+							log.Printf("📊 ALERT: Recording TCP reinit failure for %s: %v", address, err)
+							connectionMonitor.RecordTCPFailure("cloud-sync", address, err)
+							log.Printf("✅ ALERT: TCP failure recorded successfully")
+						} else {
+							log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record failure")
+						}
+
 						// Apply exponential backoff with jitter
 						backoffDuration := backoff.NextBackoff()
 						log.Printf("⏳ TCP BACKOFF: Waiting %v before next attempt (exponential + jitter)", backoffDuration)
@@ -408,11 +420,31 @@ func startTCPHealthMonitor() {
 						consecutiveFailures = 0
 						log.Printf("✅ TCP RECONNECTED: TCP transport reinitialized successfully!")
 						log.Printf("🚀 TCP TRANSPORT RESTORED: Ready for data transfer (incremental sync will use TCP)")
+
+						// Record TCP reconnection in connection monitor
+						log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
+						if connectionMonitor != nil {
+							log.Printf("📊 ALERT: Recording TCP reconnection for %s", address)
+							connectionMonitor.RecordTCPReconnected("cloud-sync", address)
+							log.Printf("✅ ALERT: TCP reconnection recorded successfully")
+						} else {
+							log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record reconnection")
+						}
 					}
 				} else {
 					consecutiveFailures++
 					log.Printf("🔶 TCP UNAVAILABLE (attempt %d): VM-sync not reachable at %s (%v)", consecutiveFailures, address, err)
-					
+
+					// Record TCP failure in connection monitor
+					log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
+					if connectionMonitor != nil {
+						log.Printf("📊 ALERT: Recording TCP failure for %s: %v", address, err)
+						connectionMonitor.RecordTCPFailure("cloud-sync", address, err)
+						log.Printf("✅ ALERT: TCP failure recorded successfully")
+					} else {
+						log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record failure")
+					}
+
 					// Apply exponential backoff with jitter
 					backoffDuration := backoff.NextBackoff()
 					log.Printf("⏳ TCP BACKOFF: Waiting %v before next health check (exponential + jitter)", backoffDuration)
@@ -434,13 +466,23 @@ func startTCPHealthMonitor() {
 					log.Printf("⚠️  TCP CONNECTION LOST: %v", err)
 					log.Printf("🔧 TCP CLEANUP: Closing broken TCP connection...")
 
+					// Record TCP disconnection in connection monitor
+					log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
+					if connectionMonitor != nil {
+						log.Printf("📊 ALERT: Recording TCP disconnection for %s: %v", address, err)
+						connectionMonitor.RecordTCPDisconnected("cloud-sync", address, err)
+						log.Printf("✅ ALERT: TCP disconnection recorded successfully")
+					} else {
+						log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record disconnection")
+					}
+
 					// Clean up broken connection
 					tcpTransportEnabled = false
 					if closeErr := tcpSender.Close(); closeErr != nil {
 						log.Printf("⚠️  TCP CLOSE WARNING: %v", closeErr)
 					}
 					tcpSender = nil
-					
+
 					// Reset backoff for fresh reconnection attempts
 					backoff.Reset()
 					consecutiveFailures = 0
@@ -451,6 +493,16 @@ func startTCPHealthMonitor() {
 					consecutiveFailures = 0
 					backoff.Reset()
 					log.Printf("✅ TCP HEALTHY: Connection to %s is operational", address)
+
+					// Record TCP healthy status in connection monitor
+					log.Printf("🔍 DEBUG: connectionMonitor != nil? %v", connectionMonitor != nil)
+					if connectionMonitor != nil {
+						log.Printf("📊 ALERT: Recording TCP healthy for %s", address)
+						connectionMonitor.RecordTCPHealthy("cloud-sync", address)
+						log.Printf("✅ ALERT: TCP healthy recorded successfully")
+					} else {
+						log.Printf("❌ DEBUG: connectionMonitor is nil, cannot record healthy")
+					}
 				}
 			}
 		}
@@ -662,6 +714,17 @@ func main() {
 	// Start alert manager
 	go alertManager.Start(context.Background(), 30*time.Second) // Check every 30 seconds
 	log.Println("Metrics system initialized with default alert rules")
+
+	// Initialize connection health monitor for TCP and WebSocket
+	connectionMonitorConfig := alerting.DefaultConnectionMonitorConfig()
+	connectionMonitor = alerting.NewConnectionMonitor(connectionMonitorConfig)
+
+	// Register alert handlers for connection events
+	connectionMonitor.RegisterCallback(alerting.LogAlertHandler)
+	connectionMonitor.RegisterCallback(alerting.CriticalAlertHandler)
+
+	log.Printf("✅ Connection Monitor initialized (TCP failure threshold: %d, WS timeout: %v)",
+		connectionMonitorConfig.TCPFailureThreshold, connectionMonitorConfig.WSDisconnectTimeout)
 
 	// Logger already initialized earlier
 	appLogger.Info("cloud-sync", "startup", "Application logger initialized for dashboard", nil)
@@ -957,6 +1020,17 @@ func main() {
 		if config.Sync.Transport.Mode == "tcp" {
 			go startTCPHealthMonitor()
 		}
+	}
+
+	// START SIMPLE TCP PORT MONITOR (separate from complex monitoring)
+	// Just checks if port is accessible and logs [ALERT] if not
+	if config.Sync.Transport.Mode == "tcp" && config.Sync.Transport.TCPSender.Address != "" {
+		simpleTCPMonitor := alerting.NewSimpleTCPPortMonitor(
+			config.Sync.Transport.TCPSender.Address,
+			30*time.Second, // Check every 30 seconds
+		)
+		go simpleTCPMonitor.Start()
+		log.Println("🔔 SIMPLE TCP PORT MONITOR: Started (checks vm-sync availability every 30s)")
 	}
 
 	// Start Full Replacement Scheduler IMMEDIATELY (independent of initial dump)
@@ -1423,15 +1497,15 @@ func runIncrementalSyncSafe() {
 // startFullReplacementScheduler starts the full database replacement scheduler
 func startFullReplacementScheduler() {
 	intervalMinutes := config.Sync.FullReplacementIntervalMinutes
-	
+
 	if intervalMinutes <= 0 {
 		log.Println("⚠️  FULL REPLACEMENT SCHEDULER: Invalid interval, scheduler disabled")
 		return
 	}
-	
+
 	interval := time.Duration(intervalMinutes) * time.Minute
 	log.Printf("🔄 FULL REPLACEMENT SCHEDULER: Configured for %v interval (%d minutes)", interval, intervalMinutes)
-	
+
 	// Start the scheduler in a goroutine with panic recovery
 	go func() {
 		defer func() {
@@ -1441,26 +1515,26 @@ func startFullReplacementScheduler() {
 				startFullReplacementScheduler()
 			}
 		}()
-		
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		
+
 		log.Printf("⏰ FULL REPLACEMENT SCHEDULER: First replacement will run at %s", time.Now().Add(interval).Format(time.RFC3339))
-		
+
 		for {
 			select {
 			case <-ticker.C:
 				log.Println("═══════════════════════════════════════════════════════════")
 				log.Printf("🔄 FULL REPLACEMENT SCHEDULER TICK: Time=%s, Interval=%v", time.Now().Format(time.RFC3339), interval)
 				log.Println("🚀 FULL REPLACEMENT: Starting complete database replacement...")
-				
+
 				// Execute full database replacement with force mode
 				if err := executeFullDatabaseReplacement(); err != nil {
 					log.Printf("❌ FULL REPLACEMENT FAILED: %v - Will retry at next interval", err)
 				} else {
 					log.Printf("✅ FULL REPLACEMENT COMPLETE: Next replacement at %s", time.Now().Add(interval).Format(time.RFC3339))
 				}
-				
+
 				log.Println("═══════════════════════════════════════════════════════════")
 			case <-context.Background().Done():
 				log.Println("🔄 FULL REPLACEMENT SCHEDULER: Stopping due to context cancellation")
@@ -1468,27 +1542,27 @@ func startFullReplacementScheduler() {
 			}
 		}
 	}()
-	
+
 	log.Printf("✅ FULL REPLACEMENT SCHEDULER: Started successfully - Runs every %d minutes", intervalMinutes)
 }
 
 // executeFullDatabaseReplacement performs a complete database replacement (same logic as API endpoint)
 func executeFullDatabaseReplacement() error {
 	log.Println("📡 FULL REPLACEMENT: Executing scheduled database replacement...")
-	
+
 	// Get vm-sync HTTP endpoint
 	vmSyncEndpoint := getVMSyncHTTPEndpoint()
 	if vmSyncEndpoint == "" {
 		return fmt.Errorf("vm-sync endpoint not available")
 	}
-	
+
 	log.Printf("🎯 FULL REPLACEMENT: Target endpoint: %s", vmSyncEndpoint)
-	
+
 	// STEP 1: Clear ALL vm-sync collections BEFORE pushing new data
 	log.Println("🗑️ FULL REPLACEMENT: Step 1/2 - Clearing all collections...")
 	cleared := 0
 	failed := 0
-	
+
 	for _, dbConfig := range config.MongoDB.Databases {
 		if !dbConfig.Enabled {
 			continue
@@ -1497,7 +1571,7 @@ func executeFullDatabaseReplacement() error {
 			if !collConfig.Enabled {
 				continue
 			}
-			
+
 			log.Printf("🗑️ Clearing: %s.%s", dbConfig.Name, collConfig.Name)
 			if err := clearVMSyncCollection(vmSyncEndpoint, dbConfig.Name, collConfig.Name); err != nil {
 				log.Printf("⚠️  Failed to clear %s.%s: %v (continuing anyway)", dbConfig.Name, collConfig.Name, err)
@@ -1508,9 +1582,9 @@ func executeFullDatabaseReplacement() error {
 			}
 		}
 	}
-	
+
 	log.Printf("🗑️ FULL REPLACEMENT: Cleared %d collections (%d failed)", cleared, failed)
-	
+
 	// STEP 2: Ensure TCP is connected before data push
 	log.Println("🚀 FULL REPLACEMENT: Step 2/3 - Ensuring TCP connectivity...")
 	if config.Sync.Transport.Mode == "tcp" {
@@ -1527,21 +1601,43 @@ func executeFullDatabaseReplacement() error {
 	} else {
 		return fmt.Errorf("FULL REPLACEMENT ERROR: TCP transport not configured (mode=%s) - Full replacement requires TCP", config.Sync.Transport.Mode)
 	}
-	
+
 	// STEP 3: Enable force initial sync mode and trigger sync process
 	log.Println("🚀 FULL REPLACEMENT: Step 3/3 - Pushing complete database...")
-	
+
 	// Enable force mode to bypass resumable state
 	forceInitialSync = true
 	defer func() {
 		forceInitialSync = false
 		log.Println("🔄 FULL REPLACEMENT: Disabled force mode")
 	}()
-	
+
 	// Execute the sync process (same as startup initial dump)
 	startSyncProcess()
-	
+
 	log.Println("✅ FULL REPLACEMENT: Complete database replacement finished successfully")
+	return nil
+}
+
+// handleOplogExpiration handles oplog window expiration by triggering full database replacement
+// This prevents data loss when vm-sync is down for extended periods (4+ days)
+func handleOplogExpiration(database, collection string) error {
+	log.Printf("═══════════════════════════════════════════════════════════")
+	log.Printf("🚨 OPLOG EXPIRED: Resume token invalid for %s.%s", database, collection)
+	log.Printf("⚠️  EXTENDED DOWNTIME DETECTED: Oplog window expired (typically 4+ days)")
+	log.Printf("⚠️  DATA LOSS RISK: Missed changes during downtime cannot be recovered via incremental sync")
+	log.Printf("🔄 RECOVERY: Triggering automatic full database replacement to prevent data loss...")
+	log.Printf("═══════════════════════════════════════════════════════════")
+	
+	// Execute full database replacement to recover from data loss
+	if err := executeFullDatabaseReplacement(); err != nil {
+		return fmt.Errorf("full database replacement failed during oplog recovery: %w", err)
+	}
+	
+	log.Printf("✅ OPLOG RECOVERY COMPLETE: Full database replacement finished successfully")
+	log.Printf("🎯 RESUMING: Normal incremental sync will continue from current point")
+	log.Printf("═══════════════════════════════════════════════════════════")
+	
 	return nil
 }
 
@@ -1605,7 +1701,7 @@ func runIncrementalSync() {
 			wg.Add(1)
 			go func(dbName, collName string) {
 				defer wg.Done()
-				
+
 				// Use proper MongoDB change streams with resume tokens (like Debezium)
 				changes, err := detectAndSyncWithChangeStream(dbName, collName)
 				if err != nil {
@@ -1624,14 +1720,14 @@ func runIncrementalSync() {
 			}(database.Name, collection.Name)
 		}
 	}
-	
+
 	// Wait for all collections to complete
 	log.Printf("⏳ PARALLEL SYNC: Waiting for all collections to complete...")
 	wg.Wait()
 
 	duration := time.Since(start)
 	finalChanges := int(totalChanges.Load())
-	
+
 	if len(syncErrors) > 0 {
 		log.Printf("⚠️  INCREMENTAL SYNC COMPLETED with %d errors in %v - Processed %d total changes", len(syncErrors), duration, finalChanges)
 		for _, errMsg := range syncErrors {
@@ -1677,15 +1773,24 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 		if isInvalidateResumeTokenError(err) && len(startFromToken) > 0 {
 			log.Printf("🔄 OPLOG EXPIRED: Resume token for %s.%s is no longer in oplog", database, collection)
 			log.Printf("⚠️  ERROR DETAIL: %v", err)
-			log.Printf("🆕 RECOVERY: Clearing stale checkpoint and starting fresh stream")
-			if checkpointMgr != nil {
-				// Clear invalid resume token
-				if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
-					log.Printf("⚠️  Failed to clear checkpoint: %v", err)
-				} else {
-					log.Printf("✅ CHECKPOINT CLEARED: Stale resume token removed")
+			
+			// Trigger full database replacement to recover all missed changes
+			if replaceErr := handleOplogExpiration(database, collection); replaceErr != nil {
+				log.Printf("❌ OPLOG RECOVERY FAILED: %v", replaceErr)
+				// Fall back to clearing checkpoint and starting fresh (old behavior with data loss)
+				log.Printf("⚠️  FALLBACK: Clearing checkpoint and starting fresh stream (DATA LOSS POSSIBLE)")
+				if checkpointMgr != nil {
+					if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+						log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+					} else {
+						log.Printf("✅ CHECKPOINT CLEARED: Stale resume token removed")
+					}
 				}
+			} else {
+				log.Printf("✅ OPLOG RECOVERY: Full database replacement successful, all checkpoints reset")
+				// Checkpoint already cleared by executeFullDatabaseReplacement
 			}
+			
 			// Retry with fresh stream
 			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
 			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
@@ -1779,23 +1884,21 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 		log.Printf("📦 CHANGES DETECTED: %s.%s - Total:%d, Operations:%v", database, collection, changeCount, operationCounts)
 	}
 
-	// CRITICAL FIX: Get resume token even if no changes occurred
-	// This ensures we don't miss changes between polling cycles
+	// CRITICAL DECISION: Do NOT update resume token when no changes detected
+	// WHY: If VM-sync is down for extended period (4+ days), we WANT the token to expire
+	// This triggers automatic oplog expiration recovery with full database replacement
+	// Updating token during idle periods prevents detection of extended downtime
 	if changeCount == 0 {
 		currentToken := changeStream.ResumeToken()
 		if len(currentToken) > 0 {
 			lastResumeToken = currentToken
-			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (no changes, but token saved for next cycle)", database, collection)
+			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (no changes detected, token NOT saved to allow expiration detection)", database, collection)
 		}
 
-		// FIX GAP #1: Save resume token immediately when no changes (safe operation)
-		if checkpointMgr != nil && len(lastResumeToken) > 0 {
-			if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
-				log.Printf("⚠️  Failed to update resume token: %v", err)
-			} else {
-				log.Printf("✅ RESUME TOKEN UPDATED: %s.%s (%d bytes) - no changes", database, collection, len(lastResumeToken))
-			}
-		}
+		// DO NOT save resume token when no changes
+		// This allows natural token expiration after 4+ days of downtime
+		// Oplog expiration will trigger automatic full database replacement
+		log.Printf("⏭️  RESUME TOKEN NOT SAVED: %s.%s - no changes, allowing natural expiration for downtime detection", database, collection)
 	}
 
 	if len(documents) == 0 {
@@ -2152,13 +2255,22 @@ func detectChangesWithChangeStream(database, collection string) (int, error) {
 	if err != nil {
 		// Handle resume token invalidation gracefully
 		if isInvalidateResumeTokenError(err) && len(startFromToken) > 0 {
-			log.Printf("🔄 RESUME TOKEN INVALID: Clearing checkpoint and starting fresh for %s.%s", database, collection)
-			if checkpointMgr != nil {
-				// Clear invalid resume token
-				if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
-					log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+			log.Printf("🔄 OPLOG EXPIRED: Resume token for %s.%s is no longer in oplog", database, collection)
+			log.Printf("⚠️  ERROR DETAIL: %v", err)
+			
+			// Trigger full database replacement to recover all missed changes
+			if replaceErr := handleOplogExpiration(database, collection); replaceErr != nil {
+				log.Printf("❌ OPLOG RECOVERY FAILED: %v", replaceErr)
+				log.Printf("⚠️  FALLBACK: Clearing checkpoint and starting fresh stream (DATA LOSS POSSIBLE)")
+				if checkpointMgr != nil {
+					if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+						log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+					}
 				}
+			} else {
+				log.Printf("✅ OPLOG RECOVERY: Full database replacement successful")
 			}
+			
 			// Retry with fresh stream
 			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
 			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
@@ -2212,28 +2324,21 @@ func detectChangesWithChangeStream(database, collection string) (int, error) {
 		}
 	}
 
-	// ALWAYS update checkpoint with resume token (even on timeout or no changes)
-	log.Printf("🔍 DEBUG CHECKPOINT: checkpointMgr != nil? %v, database=%s, collection=%s", checkpointMgr != nil, database, collection)
+	// CRITICAL DECISION: Do NOT update resume token when using detection-only mode
+	// WHY: This function only DETECTS changes, it doesn't sync them
+	// Resume token should only be updated by the sync function (detectAndSyncWithChangeStream)
+	// Updating token here would prevent oplog expiration detection during extended downtime
+	log.Printf("🔍 DETECTION ONLY: checkpointMgr != nil? %v, database=%s, collection=%s", checkpointMgr != nil, database, collection)
 	if checkpointMgr != nil {
-		// Use the latest resume token we have, or establish a new checkpoint
-		if len(lastResumeToken) > 0 {
-			log.Printf("🔍 DEBUG: About to call UpdateCheckpoint with resume token (%d bytes)", len(lastResumeToken))
-			if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
-				log.Printf("⚠️  Failed to update checkpoint: %v", err)
-			} else {
-				log.Printf("✅ CHECKPOINT UPDATED: %s.%s with resume token (%d bytes)", database, collection, len(lastResumeToken))
-			}
+		// DO NOT update resume token in detection-only mode
+		// Token will be updated by sync function after successful data delivery
+		if changeCount > 0 {
+			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (%d bytes) - will be updated by sync function", database, collection, len(lastResumeToken))
 		} else {
-			log.Printf("🔍 DEBUG: About to call UpdateCheckpoint without resume token (initial checkpoint)")
-			// Create initial checkpoint without resume token to establish tracking
-			if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
-				log.Printf("⚠️  Failed to create initial checkpoint: %v", err)
-			} else {
-				log.Printf("📋 CHECKPOINT CREATED: %s.%s (initial checkpoint without resume token)", database, collection)
-			}
+			log.Printf("⏭️  RESUME TOKEN NOT SAVED: %s.%s - no changes, detection-only mode", database, collection)
 		}
 	} else {
-		log.Printf("⚠️  DEBUG: checkpointMgr is nil - cannot update checkpoint for %s.%s", database, collection)
+			log.Printf("⚠️  DEBUG: checkpointMgr is nil - cannot track checkpoint for %s.%s", database, collection)
 	}
 
 	if changeCount > 0 {
@@ -2306,12 +2411,22 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 	if err != nil {
 		// Handle resume token invalidation
 		if isInvalidateResumeTokenError(err) && len(startFromToken) > 0 {
-			log.Printf("🔄 RESUME TOKEN INVALID: Clearing and restarting for %s.%s", database, collection)
-			if checkpointMgr != nil {
-				if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
-					log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+			log.Printf("🔄 OPLOG EXPIRED: Resume token for %s.%s is no longer in oplog", database, collection)
+			log.Printf("⚠️  ERROR DETAIL: %v", err)
+			
+			// Trigger full database replacement to recover all missed changes
+			if replaceErr := handleOplogExpiration(database, collection); replaceErr != nil {
+				log.Printf("❌ OPLOG RECOVERY FAILED: %v", replaceErr)
+				log.Printf("⚠️  FALLBACK: Clearing checkpoint and starting fresh stream (DATA LOSS POSSIBLE)")
+				if checkpointMgr != nil {
+					if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
+						log.Printf("⚠️  Failed to clear checkpoint: %v", err)
+					}
 				}
+			} else {
+				log.Printf("✅ OPLOG RECOVERY: Full database replacement successful")
 			}
+			
 			// Retry with fresh stream
 			watchOptions = options.ChangeStream().SetFullDocument(options.UpdateLookup)
 			changeStream, err = coll.Watch(ctx, mongo.Pipeline{}, watchOptions)
@@ -2450,27 +2565,18 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 		}
 	}
 
-	// ALWAYS update checkpoint with resume token (even on timeout or no changes)
-	if checkpointMgr != nil {
-		// Use the latest resume token we have, or establish a new checkpoint
-		if len(lastResumeToken) > 0 {
-			if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
-				log.Printf("⚠️  Failed to sync update checkpoint: %v", err)
-			} else {
-				log.Printf("✅ SYNC CHECKPOINT UPDATED: %s.%s with resume token (%d bytes)", database, collection, len(lastResumeToken))
-			}
-		} else {
-			// Create initial checkpoint without resume token to establish tracking
-			if err := checkpointMgr.UpdateCheckpoint(database, collection, nil, time.Now()); err != nil {
-				log.Printf("⚠️  Failed to create initial sync checkpoint: %v", err)
-			} else {
-				log.Printf("📋 SYNC CHECKPOINT CREATED: %s.%s (initial checkpoint without resume token)", database, collection)
-			}
-		}
-	}
-
+	// Check if we have any documents to send
 	if len(documents) == 0 {
 		log.Printf("📋 CHANGE STREAM SYNC: No document changes found for %s.%s", database, collection)
+		
+		// CRITICAL DECISION: Do NOT update resume token when no changes detected
+		// WHY: If VM-sync is down for 4+ days, we WANT the token to expire naturally
+		// This triggers automatic oplog expiration recovery with full database replacement
+		if len(lastResumeToken) > 0 {
+			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (%d bytes) - NOT saved (no changes)", database, collection, len(lastResumeToken))
+		}
+		log.Printf("⏭️  RESUME TOKEN NOT SAVED: %s.%s - no changes, allowing natural expiration", database, collection)
+		
 		// Return error only for real errors, not timeouts
 		if streamErr != nil && !isTimeoutError {
 			return fmt.Errorf("change stream error: %w", streamErr)
@@ -2489,7 +2595,17 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 		return fmt.Errorf("HTTP incremental sync failed: %w", err)
 	}
 
-	log.Printf("✅ CHANGE STREAM SYNC: Successfully sent %d docs for %s.%s (resume token updated)", len(documents), database, collection)
+	log.Printf("✅ CHANGE STREAM SYNC: Successfully sent %d docs for %s.%s", len(documents), database, collection)
+
+	// ONLY save resume token AFTER successful data delivery
+	// This prevents data loss if HTTP send fails
+	if checkpointMgr != nil && len(lastResumeToken) > 0 {
+		if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
+			log.Printf("⚠️  Failed to update resume token: %v", err)
+		} else {
+			log.Printf("✅ RESUME TOKEN SAVED: %s.%s (%d bytes) - AFTER successful HTTP delivery", database, collection, len(lastResumeToken))
+		}
+	}
 
 	// Return error only for real errors, not timeouts
 	if streamErr != nil && !isTimeoutError {
@@ -2527,7 +2643,7 @@ func isInitialDumpCompleted() bool {
 	if initialDumpCompletedOnce {
 		return true
 	}
-	
+
 	// Method 2: Check checkpoint manager for persistent state
 	// If we have resume tokens for collections, initial dump must have completed
 	if checkpointMgr != nil {
@@ -2552,18 +2668,18 @@ func isInitialDumpCompleted() bool {
 				}
 			}
 		}
-		
+
 		if !hasAnyCheckpoint {
 			log.Printf("🔍 INITIAL DUMP CHECK: No checkpoints found - Initial dump likely not completed yet")
 		}
 	}
-	
+
 	// Method 3: If config says initial_sync is disabled, allow incremental sync anyway
 	if !config.Sync.InitialSync {
 		log.Printf("⚠️  INITIAL DUMP SKIPPED: initial_sync=false in config - Allowing incremental sync")
 		return true
 	}
-	
+
 	return false
 }
 
@@ -2623,10 +2739,10 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 		// This ensures incremental sync uses the same target database as initial dump
 		targetDatabase := getTargetDatabaseForVMSync(database)
 		streamName := fmt.Sprintf("%s.%s.incremental", targetDatabase, collection)
-		
+
 		log.Printf("📋 TCP INCREMENTAL ROUTING: Source='%s.%s' → Target='%s.%s.incremental'", database, collection, targetDatabase, collection)
 		log.Printf("🚀 TCP INCREMENTAL: Sending %d documents for %s via TCP", len(documents), streamName)
-		
+
 		if err := tcpSender.SendBatch(streamName, documents); err != nil {
 			log.Printf("⚠️  TCP INCREMENTAL FAILED: %v - Falling back to HTTP", err)
 			// Fall through to HTTP fallback
@@ -2638,7 +2754,7 @@ func sendIncrementalChangesViaHTTP(database, collection string, documents [][]by
 
 	// HTTP FALLBACK: Use HTTP if TCP not available or failed
 	log.Printf("🌐 HTTP FALLBACK: Using HTTP for incremental sync %s.%s", database, collection)
-	
+
 	// Get vm-sync HTTP endpoint (uses dynamically discovered endpoint from VM auth)
 	vmSyncEndpoint := getVMSyncHTTPEndpoint()
 
@@ -5938,13 +6054,20 @@ func monitorChangeStreamsTraditional() {
 					if err := watchCollection(dbName, collName, collConfig); err != nil {
 						// Check if this is an InvalidResumeToken error due to invalidate event
 						if isInvalidateResumeTokenError(err) {
-							log.Printf("Invalidate resume token error for %s.%s - clearing checkpoint and starting fresh", dbName, collName)
-							// Clear the checkpoint to start fresh after invalidate
-							if checkpointMgr != nil {
-								if checkpoint := checkpointMgr.GetCheckpoint(dbName, collName); checkpoint != nil {
-									checkpoint.ResumeToken = nil // Clear resume token
-									log.Printf("Cleared resume token for %s.%s after invalidate event", dbName, collName)
+							log.Printf("🔄 OPLOG EXPIRED: Resume token error for %s.%s", dbName, collName)
+							
+							// Trigger full database replacement to recover all missed changes
+							if replaceErr := handleOplogExpiration(dbName, collName); replaceErr != nil {
+								log.Printf("❌ OPLOG RECOVERY FAILED: %v - Clearing checkpoint and retrying", replaceErr)
+								// Fall back to clearing the checkpoint to start fresh after invalidate
+								if checkpointMgr != nil {
+									if checkpoint := checkpointMgr.GetCheckpoint(dbName, collName); checkpoint != nil {
+										checkpoint.ResumeToken = nil // Clear resume token
+										log.Printf("✅ CHECKPOINT CLEARED: Resume token for %s.%s cleared after invalidate event", dbName, collName)
+									}
 								}
+							} else {
+								log.Printf("✅ OPLOG RECOVERY: Full database replacement successful for %s.%s", dbName, collName)
 							}
 						} else {
 							log.Printf("Change stream error for %s.%s: %v. Retrying in 5 seconds...", dbName, collName, err)
