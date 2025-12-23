@@ -4,22 +4,34 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
+
+// MonitorState tracks the state of a connection
+type MonitorState struct {
+	Connected     bool
+	LastChange    time.Time
+	DisconnectedSince *time.Time
+}
 
 // SimpleTCPPortMonitor monitors a TCP port and logs alerts
 type SimpleTCPPortMonitor struct {
 	address       string
 	checkInterval time.Duration
 	stopChan      chan struct{}
+	state         MonitorState
+	stateMu       sync.RWMutex
+	onStateChange func(connected bool, downtime time.Duration)
 }
 
 // NewSimpleTCPPortMonitor creates a new simple TCP port monitor
-func NewSimpleTCPPortMonitor(address string, checkInterval time.Duration) *SimpleTCPPortMonitor {
+func NewSimpleTCPPortMonitor(address string, checkInterval time.Duration, onStateChange func(connected bool, downtime time.Duration)) *SimpleTCPPortMonitor {
 	return &SimpleTCPPortMonitor{
 		address:       address,
 		checkInterval: checkInterval,
 		stopChan:      make(chan struct{}),
+		onStateChange: onStateChange,
 	}
 }
 
@@ -29,6 +41,14 @@ func (m *SimpleTCPPortMonitor) Start() {
 	defer ticker.Stop()
 
 	log.Printf("🏥 Simple TCP Port Monitor started: checking %s every %v", m.address, m.checkInterval)
+
+	// Initialize state
+	m.stateMu.Lock()
+	m.state = MonitorState{
+		Connected:  true,
+		LastChange: time.Now(),
+	}
+	m.stateMu.Unlock()
 
 	for {
 		select {
@@ -44,19 +64,74 @@ func (m *SimpleTCPPortMonitor) Start() {
 // checkPort checks if the TCP port is accessible
 func (m *SimpleTCPPortMonitor) checkPort() {
 	conn, err := net.DialTimeout("tcp", m.address, 3*time.Second)
-	if err != nil {
-		// PORT NOT ACCESSIBLE - LOG ALERT
-		log.Printf("[ALERT] TCP PORT NOT ACCESSIBLE: %s - Error: %v", m.address, err)
-		log.Printf("[ALERT] VM-SYNC MAY BE DOWN - Please check vm-sync service at %s", m.address)
-		log.Printf("[ALERT] Recommended Actions:")
-		log.Printf("[ALERT]   1. Check if vm-sync service is running")
-		log.Printf("[ALERT]   2. Verify network connectivity")
-		log.Printf("[ALERT]   3. Check firewall rules for port %s", m.address)
-		log.Printf("[ALERT]   4. Review vm-sync logs for errors")
-	} else {
-		// Port is accessible - silently close connection (no log spam)
+	
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	
+	currentConnected := err == nil
+	
+	if conn != nil {
 		conn.Close()
 	}
+	
+	// Check if state changed
+	if currentConnected != m.state.Connected {
+		previousTime := m.state.LastChange
+		
+		// Update state
+		m.state.Connected = currentConnected
+		m.state.LastChange = time.Now()
+		
+		if currentConnected {
+			// Connection re-established
+			var downtime time.Duration
+			if m.state.DisconnectedSince != nil {
+				downtime = time.Since(*m.state.DisconnectedSince)
+				m.state.DisconnectedSince = nil
+			} else {
+				downtime = time.Since(previousTime)
+			}
+			
+			log.Printf("✅ TCP CONNECTION RE-ESTABLISHED: %s after %v downtime", m.address, downtime)
+			
+			// Notify about state change
+			if m.onStateChange != nil {
+				m.onStateChange(true, downtime)
+			}
+		} else {
+			// Connection lost
+			disconnectedTime := time.Now()
+			m.state.DisconnectedSince = &disconnectedTime
+			
+			log.Printf("[ALERT] TCP CONNECTION LOST: %s", m.address)
+			
+			// Notify about state change
+			if m.onStateChange != nil {
+				m.onStateChange(false, 0) // downtime is 0 when just disconnected
+			}
+		}
+	} else {
+		// State hasn't changed, but if currently disconnected, log periodically
+		if !currentConnected {
+			log.Printf("[ALERT] TCP PORT STILL NOT ACCESSIBLE: %s", m.address)
+		}
+	}
+}
+
+// GetDowntime returns the current downtime duration if disconnected
+func (m *SimpleTCPPortMonitor) GetDowntime() (bool, time.Duration) {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	
+	if m.state.Connected {
+		return true, 0
+	}
+	
+	if m.state.DisconnectedSince != nil {
+		return false, time.Since(*m.state.DisconnectedSince)
+	}
+	
+	return false, time.Since(m.state.LastChange)
 }
 
 // Stop stops the monitor

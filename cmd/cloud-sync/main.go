@@ -975,10 +975,84 @@ func main() {
 
 	// START SIMPLE TCP PORT MONITOR (separate from complex monitoring)
 	// Just checks if port is accessible and logs [ALERT] if not
+	// Also triggers full replacement when disconnection exceeds oplog window
 	if config.Sync.Transport.Mode == "tcp" && config.Sync.Transport.TCPSender.Address != "" {
+		// Define callback to handle state changes
+		onStateChange := func(connected bool, downtime time.Duration) {
+			if connected {
+				// Connection re-established - check if downtime exceeded oplog window
+				// Use actual MongoDB oplog window instead of hardcoded value
+				// Get oplog window directly from MongoDB
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				
+				oplogColl := mongoClient.Database("local").Collection("oplog.rs")
+				
+				// Get oldest entry (start of oplog window)
+				oldestOpts := options.FindOne().SetSort(bson.D{primitive.E{Key: "ts", Value: 1}})
+				var oldestEntry bson.M
+				oldestErr := oplogColl.FindOne(ctx, bson.D{}, oldestOpts).Decode(&oldestEntry)
+				
+				// Get newest entry (end of oplog window)
+				newestOpts := options.FindOne().SetSort(bson.D{primitive.E{Key: "ts", Value: -1}})
+				var newestEntry bson.M
+				newestErr := oplogColl.FindOne(ctx, bson.D{}, newestOpts).Decode(&newestEntry)
+				
+				if oldestErr == nil && newestErr == nil {
+					// Extract timestamps
+					oldestTs := oldestEntry["ts"].(primitive.Timestamp)
+					newestTs := newestEntry["ts"].(primitive.Timestamp)
+					
+					// Calculate window size in seconds, then convert to hours
+					windowSeconds := newestTs.T - oldestTs.T
+					windowHours := float64(windowSeconds) / 3600.0 // Convert seconds to hours
+					
+					// Calculate safe window as 80% of actual oplog window to be safe
+					safeWindow := time.Duration(windowHours*0.8) * time.Hour
+					
+					log.Printf("📊 OPLOG WINDOW ANALYSIS: Actual=%.2f hours, Safe threshold=%v", 
+						windowHours, safeWindow)
+					
+					if downtime > safeWindow {
+						log.Printf("⚠️  LONG DISCONNECTION DETECTED: %v > %v (oplog safe window)", downtime, safeWindow)
+						log.Printf("🔄 TRIGGERING FULL DATABASE REPLACEMENT: To prevent data loss after extended downtime")
+						
+						// Execute full database replacement to catch up on missed changes
+						if err := executeFullDatabaseReplacement(); err != nil {
+							log.Printf("❌ FULL REPLACEMENT FAILED: %v", err)
+						} else {
+							log.Printf("✅ FULL REPLACEMENT TRIGGERED SUCCESSFULLY: Recovery from extended downtime")
+						}
+					} else {
+						log.Printf("✅ CONNECTION RECOVERED: Downtime %v within safe window (%v), resuming normal sync", 
+							downtime, safeWindow)
+					}
+				} else {
+					// Fallback to conservative 6-hour window if we can't get actual oplog window
+					log.Printf("⚠️  Cannot access oplog window, using conservative 6-hour fallback: oldestErr=%v, newestErr=%v", oldestErr, newestErr)
+					safeWindow := 6 * time.Hour
+					if downtime > safeWindow {
+						log.Printf("⚠️  LONG DISCONNECTION DETECTED: %v > %v (fallback window)", downtime, safeWindow)
+						log.Printf("🔄 TRIGGERING FULL DATABASE REPLACEMENT: To prevent data loss after extended downtime")
+						
+						// Execute full database replacement to catch up on missed changes
+						if err := executeFullDatabaseReplacement(); err != nil {
+							log.Printf("❌ FULL REPLACEMENT FAILED: %v", err)
+						} else {
+							log.Printf("✅ FULL REPLACEMENT TRIGGERED SUCCESSFULLY: Recovery from extended downtime")
+						}
+					} else {
+						log.Printf("✅ CONNECTION RECOVERED: Downtime %v within safe window (%v), resuming normal sync", 
+							downtime, safeWindow)
+					}
+				}
+			}
+		}
+		
 		simpleTCPMonitor := alerting.NewSimpleTCPPortMonitor(
 			config.Sync.Transport.TCPSender.Address,
 			30*time.Second, // Check every 30 seconds
+			onStateChange,  // Add the callback
 		)
 		go simpleTCPMonitor.Start()
 		log.Println("🔔 SIMPLE TCP PORT MONITOR: Started (checks vm-sync availability every 30s)")
@@ -1835,21 +1909,15 @@ func detectAndSyncWithChangeStream(database, collection string) (int, error) {
 		log.Printf("📦 CHANGES DETECTED: %s.%s - Total:%d, Operations:%v", database, collection, changeCount, operationCounts)
 	}
 
-	// CRITICAL DECISION: Do NOT update resume token when no changes detected
-	// WHY: If VM-sync is down for extended period (4+ days), we WANT the token to expire
-	// This triggers automatic oplog expiration recovery with full database replacement
-	// Updating token during idle periods prevents detection of extended downtime
+	// CRITICAL DECISION: Always update resume token when available (new approach)
+	// WHY: We're now using TCP port monitoring to detect extended downtime
+	// This removes the complex and unreliable resume token expiry mechanism
 	if changeCount == 0 {
 		currentToken := changeStream.ResumeToken()
 		if len(currentToken) > 0 {
 			lastResumeToken = currentToken
-			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (no changes detected, token NOT saved to allow expiration detection)", database, collection)
+			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (%d bytes) - will be saved for reliable resume", database, collection, len(currentToken))
 		}
-
-		// DO NOT save resume token when no changes
-		// This allows natural token expiration after 4+ days of downtime
-		// Oplog expiration will trigger automatic full database replacement
-		log.Printf("⏭️  RESUME TOKEN NOT SAVED: %s.%s - no changes, allowing natural expiration for downtime detection", database, collection)
 	}
 
 	if len(documents) == 0 {
@@ -2520,14 +2588,23 @@ func syncCollectionChangesWithChangeStream(database, collection string) error {
 	if len(documents) == 0 {
 		log.Printf("📋 CHANGE STREAM SYNC: No document changes found for %s.%s", database, collection)
 		
-		// CRITICAL DECISION: Do NOT update resume token when no changes detected
-		// WHY: If VM-sync is down for 4+ days, we WANT the token to expire naturally
-		// This triggers automatic oplog expiration recovery with full database replacement
+		// CRITICAL DECISION: Always update resume token when available (new approach)
+		// WHY: We're now using TCP port monitoring to detect extended downtime
+		// This removes the complex and unreliable resume token expiry mechanism
 		if len(lastResumeToken) > 0 {
-			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (%d bytes) - NOT saved (no changes)", database, collection, len(lastResumeToken))
+			log.Printf("📍 RESUME TOKEN CAPTURED: %s.%s (%d bytes) - will be saved for reliable resume", database, collection, len(lastResumeToken))
 		}
-		log.Printf("⏭️  RESUME TOKEN NOT SAVED: %s.%s - no changes, allowing natural expiration", database, collection)
 		
+		// ONLY save resume token AFTER successful data delivery
+		// This prevents data loss if HTTP send fails
+		if checkpointMgr != nil && len(lastResumeToken) > 0 {
+			if err := checkpointMgr.UpdateCheckpoint(database, collection, lastResumeToken, time.Now()); err != nil {
+				log.Printf("⚠️  Failed to update resume token: %v", err)
+			} else {
+				log.Printf("✅ RESUME TOKEN SAVED: %s.%s (%d bytes) - AFTER successful check (no changes)", database, collection, len(lastResumeToken))
+			}
+		}
+
 		// Return error only for real errors, not timeouts
 		if streamErr != nil && !isTimeoutError {
 			return fmt.Errorf("change stream error: %w", streamErr)

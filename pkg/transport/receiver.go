@@ -10,9 +10,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -28,16 +30,16 @@ type tcpReceiver struct {
 	compressors  map[int]Compressor
 	stats        receiverStats
 	checkpoints  map[string]uint64
-	
+
 	// KAFKA-STYLE: Buffered queue for decoupling TCP from MongoDB
-	batchQueue   *BufferedBatchQueue
-	workerCount  int
-	
-	mu           sync.RWMutex
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	running      atomic.Bool
+	batchQueue  *BufferedBatchQueue
+	workerCount int
+
+	mu      sync.RWMutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	running atomic.Bool
 }
 
 // receiverStreamState tracks the state of a stream on the receiver side
@@ -94,7 +96,7 @@ func newTCPReceiver(config ReceiverConfig) (*tcpReceiver, error) {
 		}
 	}
 	batchQueue := NewBufferedBatchQueue(bufferCapacity)
-	
+
 	// KAFKA-STYLE: Determine worker count for async processing
 	workerCount := 4 // Default: 4 MongoDB writer workers
 	if config.MaxConnections > 0 {
@@ -145,6 +147,9 @@ func (r *tcpReceiver) Start() error {
 		return fmt.Errorf("receiver is already running")
 	}
 
+	// Handle graceful shutdown signals
+	r.handleSignals()
+
 	var err error
 	if r.config.TLSConfig != nil {
 		r.listener, err = tls.Listen("tcp", r.config.ListenAddr, r.config.TLSConfig)
@@ -166,7 +171,7 @@ func (r *tcpReceiver) Start() error {
 	// Start heartbeat goroutine
 	r.wg.Add(1)
 	go r.heartbeatLoop()
-	
+
 	// KAFKA-STYLE: Start MongoDB writer workers (async batch processing)
 	for i := 0; i < r.workerCount; i++ {
 		r.wg.Add(1)
@@ -177,11 +182,25 @@ func (r *tcpReceiver) Start() error {
 	return nil
 }
 
+// handleSignals sets up signal handling for graceful shutdown
+func (r *tcpReceiver) handleSignals() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+
+	go func() {
+		sig := <-c
+		log.Printf("📥 SIGNAL RECEIVED: %v - initiating graceful shutdown", sig)
+		r.Stop()
+	}()
+}
+
 // Stop gracefully shuts down the receiver
 func (r *tcpReceiver) Stop() error {
 	if !r.running.Swap(false) {
 		return nil // Already stopped
 	}
+
+	log.Printf("🛑 INITIATING GRACEFUL SHUTDOWN: Saving checkpoints and closing connections")
 
 	// Cancel context to signal shutdown
 	r.cancel()
@@ -197,11 +216,13 @@ func (r *tcpReceiver) Stop() error {
 		conn.cancel()
 		conn.conn.Close()
 	}
+	// Clear connections map
+	r.connections = make(map[string]*receiverConnection)
 	r.mu.Unlock()
 
 	// Wait for goroutines to finish
 	r.wg.Wait()
-	
+
 	// KAFKA-STYLE: Close buffer queue
 	if r.batchQueue != nil {
 		log.Printf("📦 CLOSING BUFFER QUEUE: %d batches remaining", r.batchQueue.Size())
@@ -210,6 +231,7 @@ func (r *tcpReceiver) Stop() error {
 
 	// Save checkpoints if disk-based checkpointing is enabled
 	if r.config.DiskCheckpoint {
+		log.Printf("💾 SAVING CHECKPOINTS: Ensuring data persistence across restart")
 		if err := r.saveCheckpoints(); err != nil {
 			r.handleError(fmt.Errorf("failed to save checkpoints: %w", err))
 		}
@@ -221,6 +243,8 @@ func (r *tcpReceiver) Stop() error {
 			closer.Close()
 		}
 	}
+
+	log.Printf("✅ GRACEFUL SHUTDOWN COMPLETE: Receiver stopped cleanly")
 
 	return nil
 }
@@ -269,10 +293,20 @@ func (r *tcpReceiver) handleConnection(conn net.Conn) {
 	}
 
 	connID := conn.RemoteAddr().String()
-	
+
 	// CRITICAL FIX: Log connection immediately after accept
 	log.Printf("🔗 TCP CONNECTION ACCEPTED: %s (new sender connected)", connID)
-	
+
+	// Check if we already have a connection from this sender
+	// This helps prevent duplicate connections from the same sender
+	r.mu.Lock()
+	if existingConn, exists := r.connections[connID]; exists {
+		log.Printf("⚠️ DUPLICATE CONNECTION DETECTED: %s - closing existing connection", connID)
+		existingConn.cancel()
+		existingConn.conn.Close()
+	}
+	r.mu.Unlock()
+
 	ctx, cancel := context.WithCancel(r.ctx)
 
 	receiverConn := &receiverConnection{
@@ -288,7 +322,7 @@ func (r *tcpReceiver) handleConnection(conn net.Conn) {
 	r.connections[connID] = receiverConn
 	connCount := len(r.connections)
 	r.mu.Unlock()
-	
+
 	log.Printf("📊 TCP CONNECTION COUNT: %d active connection(s)", connCount)
 
 	// Start handling this connection
@@ -296,20 +330,57 @@ func (r *tcpReceiver) handleConnection(conn net.Conn) {
 	go receiverConn.handleLoop()
 }
 
-// heartbeatLoop sends periodic heartbeat messages
+// heartbeatLoop sends periodic heartbeat messages and prunes stale connections
 func (r *tcpReceiver) heartbeatLoop() {
 	defer r.wg.Done()
 
 	ticker := time.NewTicker(r.config.HeartbeatInterval)
+	pruneTicker := time.NewTicker(30 * time.Second) // Prune every 30 seconds
 	defer ticker.Stop()
+	defer pruneTicker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			r.sendHeartbeats()
+		case <-pruneTicker.C:
+			r.pruneStaleConnections()
 		case <-r.ctx.Done():
 			return
 		}
+	}
+}
+
+// pruneStaleConnections removes connections that are no longer responsive
+func (r *tcpReceiver) pruneStaleConnections() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Make a copy of connections to avoid holding lock during I/O
+	connections := make(map[string]*receiverConnection)
+	for id, conn := range r.connections {
+		connections[id] = conn
+	}
+
+	staleConnections := 0
+	for id, conn := range connections {
+		// Test connection health by sending a lightweight heartbeat
+		testFrame := NewHeartbeatFrame()
+		data := testFrame.EncodeFrame()
+
+		// Set a short timeout for the test
+		conn.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.conn.Write(data); err != nil {
+			log.Printf("🧹 PRUNING STALE CONNECTION: %s - %v", id, err)
+			conn.cancel()
+			conn.conn.Close()
+			delete(r.connections, id)
+			staleConnections++
+		}
+	}
+
+	if staleConnections > 0 {
+		log.Printf("🧹 PRUNED %d STALE CONNECTIONS - %d REMAINING", staleConnections, len(r.connections))
 	}
 }
 
@@ -336,7 +407,7 @@ func (r *tcpReceiver) sendHeartbeats() {
 func (r *tcpReceiver) batchWorker(workerID int) {
 	defer r.wg.Done()
 	log.Printf("👷 BATCH WORKER %d: Started", workerID)
-	
+
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -349,27 +420,27 @@ func (r *tcpReceiver) batchWorker(workerID int) {
 				// Timeout or empty queue, retry
 				continue
 			}
-			
+
 			// Process batch (call MongoDB handler)
 			if r.batchHandler != nil {
 				queueLatency := time.Since(item.ReceivedAt)
-				log.Printf("👷 WORKER %d PROCESSING: stream=%s seq=%d docs=%d latency=%v", 
+				log.Printf("👷 WORKER %d PROCESSING: stream=%s seq=%d docs=%d latency=%v",
 					workerID, item.StreamName, item.BatchSeq, len(item.Documents), queueLatency)
-				
+
 				processStart := time.Now()
 				if err := r.batchHandler(item.StreamName, item.BatchSeq, item.Documents); err != nil {
 					// MongoDB write failed - log error (batch already ACKed to sender)
-					log.Printf("🔴 WORKER %d FAILED: stream=%s seq=%d error=%v", 
+					log.Printf("🔴 WORKER %d FAILED: stream=%s seq=%d error=%v",
 						workerID, item.StreamName, item.BatchSeq, err)
-					r.handleError(fmt.Errorf("worker %d: batch handler error for stream %s seq %d: %w", 
+					r.handleError(fmt.Errorf("worker %d: batch handler error for stream %s seq %d: %w",
 						workerID, item.StreamName, item.BatchSeq, err))
 					r.stats.errorCount.Add(1)
 					// Continue processing (don't stop worker)
 				} else {
 					processTime := time.Since(processStart)
-					log.Printf("✅ WORKER %d SUCCESS: stream=%s seq=%d docs=%d time=%v", 
+					log.Printf("✅ WORKER %d SUCCESS: stream=%s seq=%d docs=%d time=%v",
 						workerID, item.StreamName, item.BatchSeq, len(item.Documents), processTime)
-					
+
 					// Update checkpoint after successful write
 					r.SetCheckpoint(item.StreamName, item.BatchSeq)
 				}
@@ -672,7 +743,7 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 		Documents:  docs,
 		ReceivedAt: time.Now(),
 	}
-	
+
 	enqueueStart := time.Now()
 	if err := rc.receiver.batchQueue.Enqueue(queueItem, 5*time.Second); err != nil {
 		// Buffer full or timeout - this is a critical error
@@ -683,12 +754,12 @@ func (rc *receiverConnection) handleDocBatch(frame *Frame) {
 		return
 	}
 	enqueueTime := time.Since(enqueueStart)
-	log.Printf("📦 ENQUEUED: stream=%s seq=%d docs=%d time=%v buffer_usage=%.1f%%", 
+	log.Printf("📦 ENQUEUED: stream=%s seq=%d docs=%d time=%v buffer_usage=%.1f%%",
 		actualStreamName, frame.Header.BatchSeq, len(docs), enqueueTime, rc.receiver.batchQueue.Usage()*100)
 
 	// KAFKA-STYLE: Send FAST ACK immediately after successful enqueue (not after MongoDB write)
 	// This decouples TCP layer from database performance
-	log.Printf("📤 FAST ACK: stream=%s StreamID=%d BatchSeq=%d (queued, not yet written to DB)", 
+	log.Printf("📤 FAST ACK: stream=%s StreamID=%d BatchSeq=%d (queued, not yet written to DB)",
 		actualStreamName, frame.Header.StreamID, frame.Header.BatchSeq)
 	rc.sendAck(frame.Header.StreamID, frame.Header.BatchSeq)
 }

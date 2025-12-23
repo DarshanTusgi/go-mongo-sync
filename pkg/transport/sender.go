@@ -468,14 +468,42 @@ func (sc *senderConnection) handleAckOptimized(payload []byte) {
 	}
 }
 
+// isReceiverReady checks if the receiver is truly ready to accept data
+// This prevents data loss by ensuring we only send when connections are active
+func (s *tcpSender) isReceiverReady() bool {
+	// Check 1: Circuit breaker must be in READY state
+	if s.circuitBreaker.GetState() != StateReady {
+		return false
+	}
+	
+	// Check 2: Must have active connections
+	s.mu.RLock()
+	hasConnections := len(s.connections) > 0
+	s.mu.RUnlock()
+	
+	return hasConnections
+}
+
 // SendBatch sends a batch of BSON documents
 func (s *tcpSender) SendBatch(stream string, batch [][]byte) error {
+	// CRITICAL: Prevent data loss by checking connection state
+	if !s.isReceiverReady() {
+		return fmt.Errorf("receiver not ready (state: %s, connections: %d) - refusing to send batch to prevent data loss", 
+			s.circuitBreaker.GetState(), len(s.connections))
+	}
+	
 	log.Printf("📤 TCP SEND: Sending batch for stream %s (%d documents)", stream, len(batch))
 	return s.sendBatch(stream, batch, false)
 }
 
 // SendBatchAsync sends a batch asynchronously
 func (s *tcpSender) SendBatchAsync(stream string, batch [][]byte) error {
+	// CRITICAL: Prevent data loss by checking connection state
+	if !s.isReceiverReady() {
+		return fmt.Errorf("receiver not ready (state: %s, connections: %d) - refusing to send batch to prevent data loss", 
+			s.circuitBreaker.GetState(), len(s.connections))
+	}
+	
 	return s.sendBatch(stream, batch, true)
 }
 
@@ -624,7 +652,11 @@ func (s *tcpSender) sendStandardBatch(stream string, batch [][]byte, async bool,
 	case <-s.ctx.Done():
 		return fmt.Errorf("sender is shutting down")
 	case <-time.After(s.config.BatchTimeout):
-		return fmt.Errorf("timeout sending batch")
+		// Enhanced error message to indicate connection issues
+		if !s.isReceiverReady() {
+			return fmt.Errorf("timeout sending batch - receiver disconnected (state: %s)", s.circuitBreaker.GetState())
+		}
+		return fmt.Errorf("timeout sending batch - receiver may be overloaded")
 	}
 }
 
